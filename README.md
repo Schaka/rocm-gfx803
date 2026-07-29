@@ -179,6 +179,60 @@ correctly.
 If it hangs or the process dies without a Python traceback, check `dmesg` on
 the host before suspecting the image -- see the kernel-version caveat below.
 
+## Known runtime issue: ROCMExecutionProvider crashes on fused conv (musicnn-class models)
+
+`ROCMExecutionProvider` (the plain kernel-based HIP EP, distinct from
+MIGraphX) is present in this image's ONNX Runtime build as a fallback for
+graphs MIGraphX can't compile -- see the [AudioMuse-AI ROCm
+plugin](https://github.com/Schaka/audiomuse-rocm-plugin)'s
+`plugin/rocm_accelerator/README.md` for the CLAP `keep_aspect_ratio_policy`
+parse failure that motivated it. On real gfx803 hardware (Sapphire RX 470
+8GB), that fallback is safe for transformer/attention-style models (CLAP: many
+hours of testing, zero crashes) but **intermittently SIGSEGVs on CNN-style
+models that use Conv+Bias+Activation** (musicnn's embedding/prediction heads).
+
+Root cause, isolated via `MIOPEN_ENABLE_LOGGING=1 MIOPEN_LOG_LEVEL=6`: ORT's
+graph optimizer fuses Conv+Bias+Activation into one node, which ONNX
+Runtime's ROCM EP hands to MIOpen's Fusion Plan API rather than three
+separate conv/bias/activation calls. On gfx803 that Fusion Plan path --
+whether it lands on a fused Winograd solver (`ConvBinWinogradRxSFused`) or
+falls through to "No supported fusion solvers found" and a plain-conv
+fallback -- corrupts GPU state and eventually faults
+(`Memory access fault ... Page not present or supervisor privilege`).
+
+What was ruled out, each confirmed on real hardware, not assumed:
+
+- **Not a stale/mismatched find-db.** `/opt/rocm/share/miopen/db/gfx803_*.fdb.txt`
+  ships in 36-CU and 64-CU variants; the RX 470 is 32-CU and correctly falls
+  through to its own per-run user db (`gfx803_32...ufdb.txt`) instead of a
+  mismatched file -- deleting the shipped fdb files entirely made no
+  difference to the crash.
+- **Not a single bad solver.** `MIOPEN_DEBUG_CONV_WINOGRAD=0` (disables the
+  non-fused Winograd solver) didn't help; `MIOPEN_DEBUG_AMD_FUSED_WINOGRAD=0`
+  (disables the fused variant specifically) reduced but did not eliminate the
+  crash -- it still faults on the "no fusion solver found" fallback path for
+  some shapes.
+- **Not a simple async race.** `HIP_LAUNCH_BLOCKING=1` (forces synchronous
+  kernel launches) did not prevent the crash.
+- **Not deterministic.** The exact same command, same audio sample, same
+  shape, same run count crashes on one invocation and completes cleanly on
+  the next. This is consistent with a genuine memory-corruption bug in
+  MIOpen's Fusion Plan create/compile/destroy cycle on gfx803, not a
+  reliably-triggerable single code path -- there is no known env var or
+  session option that closes it off with confidence.
+- **Not unstable VRAM.** Tried non-mining BIOS, 1750 Mhz VRAM clock, added tons
+  of extra cooling for stability and saw no difference.
+
+**Practical conclusion: don't route CNN/conv-heavy models (musicnn) through
+`ROCMExecutionProvider` on gfx803 at all.** MIGraphX is both faster (~22ms
+vs ~26-30ms mean per inference, when ROCM doesn't crash) and, as far as
+testing here shows, stable for these models. Route only
+attention/transformer-style models (CLAP) through the ROCM EP fallback,
+which is what the AudioMuse-AI ROCm plugin does. This is a MIOpen/ROCm bug on
+unsupported-generation hardware, not something fixable from an image build --
+worth an upstream report against ROCm/MIOpen if anyone has cycles, but no
+open issue is known to track it yet.
+
 ## Host-side caveats
 
 Neither of these can be fixed inside the image:
