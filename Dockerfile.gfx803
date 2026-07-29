@@ -188,6 +188,20 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     # itself first.
     && echo "Copying rocBLAS gfx803 install output into /opt/rocm..." \
     && cp -a /rocblas-src/build/release/rocblas-install/. /opt/rocm/ \
+    # rmake's own install produces librocblas.so.4.4 (rocBLAS's own SOVERSION,
+    # gfx803-agnostic) -- but the base image's pre-existing librocblas.so.4
+    # symlink points at librocblas.so.4.4.60404: AMD's own downstream
+    # packaging appends a ROCm-release patch suffix beyond rocBLAS's own
+    # versioning, in the deterministic form major*10000+minor*100+patch (e.g.
+    # ROCm 6.4.4 -> 60404). Without landing our build at that exact filename,
+    # the copy above just adds an unused file alongside the untouched stock
+    # one, and every real load still resolves through the symlink to the
+    # gfx900+ stock build with no gfx803 code objects at all. Deriving the
+    # suffix from ROCM_VERSION rather than hardcoding "60404" keeps this
+    # correct if the base image ever moves to a different 6.4.x patch level.
+    && rocblas_suffix=$(echo "${ROCM_VERSION}" | awk -F. '{printf "%d%02d%02d", $1, $2, $3}') \
+    && echo "Landing rocBLAS gfx803 build at librocblas.so.4.4.${rocblas_suffix} so the existing librocblas.so.4 symlink resolves to it instead of the stock build" \
+    && cp -a /opt/rocm/lib/librocblas.so.4.4 "/opt/rocm/lib/librocblas.so.4.4.${rocblas_suffix}" \
     && rm -rf /rocblas-src/build \
     # Verify the copy actually landed gfx803 Tensile kernels in /opt/rocm
     # before letting this stage be considered a success. Without this check,
@@ -217,7 +231,35 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
         find /opt/rocm/lib/rocblas/library -maxdepth 1 2>&1 >&2 || true; \
         exit 1; \
     fi \
-    && echo "OK: gfx803 Tensile library confirmed present in /opt/rocm."
+    && echo "OK: gfx803 Tensile library confirmed present in /opt/rocm." \
+    # Verify librocblas.so.4 (the symlink everything actually loads through)
+    # now resolves to OUR build, not the stock one left over from the base
+    # image -- this is exactly the bug that motivated the rocblas_suffix step
+    # above (a correct build that just never got loaded at runtime because
+    # the symlink still pointed at the untouched stock file). Comparing sizes
+    # rather than paths, since `cp -a` above made them the same file's
+    # content under two names, not a symlink to compare against.
+    && echo "Verifying librocblas.so.4 resolves to the gfx803 build, not the stock one..." \
+    && resolved="$(readlink -f /opt/rocm/lib/librocblas.so.4)" \
+    && if [ "$(stat -c%s "$resolved")" != "$(stat -c%s /opt/rocm/lib/librocblas.so.4.4)" ]; then \
+        echo "FATAL: librocblas.so.4 resolves to ${resolved}, which is not our freshly-built librocblas.so.4.4 (size mismatch)." >&2; \
+        echo "The stock base-image rocBLAS is still what actually gets loaded at runtime." >&2; \
+        exit 1; \
+    fi \
+    # Verify the resolved library actually embeds gfx803 device code, not an
+    # empty .hip_fatbin -- catches a broken/incomplete compile even when the
+    # symlink and Tensile checks above both pass (a real failure mode seen
+    # during debugging: link succeeded, Tensile was fine, but the plain
+    # non-Tensile kernels' device code silently never got embedded).
+    && echo "Verifying librocblas.so.4 embeds real gfx803 device code..." \
+    && objcopy -O binary --only-section=.hip_fatbin "$resolved" /tmp/rocblas_fatbin_check.bin \
+    && fatbin_size="$(stat -c%s /tmp/rocblas_fatbin_check.bin)" \
+    && rm -f /tmp/rocblas_fatbin_check.bin \
+    && if [ "$fatbin_size" -lt 1000000 ]; then \
+        echo "FATAL: librocblas.so.4's .hip_fatbin is only ${fatbin_size} bytes -- too small to contain real gfx803 device code (expect several MB)." >&2; \
+        exit 1; \
+    fi \
+    && echo "OK: librocblas.so.4 resolves to a gfx803 build with a ${fatbin_size}-byte .hip_fatbin."
 
 # Indirection alias (BuildKit rejects a variable in COPY --from, so resolve the
 # ARG through a FROM with a static name first).
