@@ -193,9 +193,11 @@ graphs MIGraphX can't compile -- see the [AudioMuse-AI ROCm
 plugin](https://github.com/Schaka/audiomuse-rocm-plugin)'s
 `plugin/rocm_accelerator/README.md` for the CLAP `keep_aspect_ratio_policy`
 parse failure that motivated it. On real gfx803 hardware (Sapphire RX 470
-8GB), that fallback is safe for transformer/attention-style models (CLAP: many
-hours of testing, zero crashes) but **intermittently SIGSEGVs on CNN-style
-models that use Conv+Bias+Activation** (musicnn's embedding/prediction heads).
+8GB), that fallback **intermittently SIGSEGVs on any graph where ORT's
+optimizer fuses Conv+Bias+Activation into a FusedConv node** -- constantly on
+CNN-style models (musicnn's embedding/prediction heads), and rarely but
+reproducibly on CLAP, whose conv stem is small next to its transformer body
+but still enough to reach the fused path.
 
 Root cause, isolated via `MIOPEN_ENABLE_LOGGING=1 MIOPEN_LOG_LEVEL=6`: ORT's
 graph optimizer fuses Conv+Bias+Activation into one node, which ONNX
@@ -222,22 +224,36 @@ What was ruled out, each confirmed on real hardware, not assumed:
   kernel launches) did not prevent the crash.
 - **Not deterministic.** The exact same command, same audio sample, same
   shape, same run count crashes on one invocation and completes cleanly on
-  the next. This is consistent with a genuine memory-corruption bug in
-  MIOpen's Fusion Plan create/compile/destroy cycle on gfx803, not a
-  reliably-triggerable single code path -- there is no known env var or
-  session option that closes it off with confidence.
+  the next. Session churn amplifies it heavily (creating and destroying
+  sessions reshuffles ORT's arena layout), but a first-session crash in a
+  fresh process has been observed too.
 - **Not unstable VRAM.** Tried non-mining BIOS, 1750 Mhz VRAM clock, added tons
   of extra cooling for stability and saw no difference.
+- **Not SDMA and not an async race** (from the later CLAP investigation):
+  `HSA_ENABLE_SDMA=0` and `AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3` both
+  still crash, and the serialized `AMD_LOG_LEVEL=4` trace pins the fault on
+  the fused kernels themselves (`miopenSp3AsmConvRxSU_CBA`,
+  `MIOpenConvUniBatchNormActiv`) reading past the end of the arena chunk
+  holding their weights -- the HSA fault address lands exactly on the chunk's
+  end boundary, and dmesg shows `read from 'TC'` (a compute kernel, not a
+  copy engine). Whether the over-read faults depends on whether the
+  neighbouring page happens to be mapped, which is where the non-determinism
+  comes from.
 
-**Practical conclusion: don't route CNN/conv-heavy models (musicnn) through
-`ROCMExecutionProvider` on gfx803 at all.** MIGraphX is both faster (~22ms
-vs ~26-30ms mean per inference, when ROCM doesn't crash) and, as far as
-testing here shows, stable for these models. Route only
-attention/transformer-style models (CLAP) through the ROCM EP fallback,
-which is what the AudioMuse-AI ROCm plugin does. This is a MIOpen/ROCm bug on
-unsupported-generation hardware, not something fixable from an image build --
-worth an upstream report against ROCm/MIOpen if anyone has cycles, but no
-open issue is known to track it yet.
+**Practical conclusion: keep MIOpen's Fusion Plan API out of the picture
+entirely.** Two complementary measures, both in the AudioMuse-AI ROCm plugin:
+don't route CNN/conv-heavy models (musicnn) through `ROCMExecutionProvider`
+at all -- MIGraphX is both faster for them (~22ms vs ~26-30ms mean per
+inference, when ROCM doesn't crash) and stable -- and for graphs that must
+use the ROCM EP (CLAP, which MIGraphX refuses to parse), disable ORT's
+`ConvActivationFusion` graph optimizer per session via the
+`optimization.disable_specified_optimizers` session config entry, so no
+FusedConv nodes exist and every conv runs unfused (verified stable over a
+200-iteration session-churn loop that kills an unpatched session within a
+couple of iterations). This is a MIOpen/ROCm bug on unsupported-generation
+hardware, not something fixable from an image build -- worth an upstream
+report against ROCm/MIOpen if anyone has cycles, but no open issue is known
+to track it yet.
 
 ## Host-side caveats
 
