@@ -98,21 +98,27 @@ for anything large, measure before believing.
 
 ## Packages
 
-All namespaced `rocm-gfx803-*` so they can't be confused with the
-supported-GPU packages:
+The same packages the main pipeline publishes to, with `gfx803` as just another
+arch tag:
 
-- `rocm-gfx803-rocblas-builder:gfx803` -- ROCm with rocBLAS rebuilt for gfx803
-- `rocm-gfx803-migraphx-builder:gfx803` -- the above plus from-source MIGraphX
-- `rocm-gfx803-torch-builder:gfx803` -- torch, torchvision, torchaudio wheels
-- `rocm-gfx803-ort-builder:gfx803` -- ONNX Runtime wheel
-- `rocm-gfx803-ort-torch-builder:latest` / `:<YYYYMMDD>` -- the combined image
+- `rocm-rocblas-builder:gfx803` -- ROCm with rocBLAS rebuilt for gfx803
+- `rocm-migraphx-builder:gfx803` -- the above plus from-source MIGraphX
+- `rocm-migraphx-torch-builder:gfx803` -- torch, torchvision, torchaudio wheels
+- `rocm-migraphx-ort-builder:gfx803` -- ONNX Runtime wheel
+- `rocm-migraphx-ort-torch-builder:latest-gfx803` / `:<YYYYMMDD>-gfx803` -- the
+  combined image
+
+Mind that these tags are the only ones in those packages built from
+`Dockerfile.gfx803` against ROCm 6.4.4 -- every other arch tag is the ROCm 7.x
+main pipeline. The versions pinned here have nothing to do with the ones the
+nightly builds.
 
 The first four are build plumbing. Downstream consumers want the last one,
 which is the same layout as the main image (`/opt/venv` on `PATH`, `/opt/rocm`
 with from-source MIGraphX) plus torchvision and torchaudio.
 
 ```dockerfile
-ARG BASE_IMAGE=ghcr.io/<owner>/rocm-gfx803-ort-torch-builder:latest
+ARG BASE_IMAGE=ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803
 FROM ${BASE_IMAGE}
 RUN python3 -c "import onnxruntime as ort; print(ort.get_available_providers())"
 ```
@@ -149,7 +155,7 @@ Needs `/dev/kfd` and `/dev/dri` passed through, as any ROCm container does:
 
 ```
 docker run --device=/dev/kfd --device=/dev/dri --group-add video \
-    ghcr.io/<owner>/rocm-gfx803-ort-torch-builder:latest \
+    ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803 \
     python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
@@ -168,7 +174,7 @@ against expected output:
 ```
 docker run --device=/dev/kfd --device=/dev/dri --group-add video \
     -v "$(pwd)/gfx803/verify_gfx803.py:/verify_gfx803.py" \
-    ghcr.io/<owner>/rocm-gfx803-ort-torch-builder:latest \
+    ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803 \
     python3 /verify_gfx803.py
 ```
 
