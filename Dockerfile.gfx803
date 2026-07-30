@@ -298,8 +298,25 @@ RUN python3 -m venv /rbuild-venv \
     && /rbuild-venv/bin/pip install --no-cache-dir \
         https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz
 
+# Fixes to MIGRAPHX_REF's pinned commit that upstream merged to develop but
+# never backported to this release branch. One directory per arch (this file
+# is gfx803-exclusive, but the layout matches the same docker/patches/<arch>/
+# convention used in the AudioMuse-AI ROCm plugin repo). Each patch documents
+# its own why/what in its header; applied right after the clone so a patch
+# that stops applying (e.g. MIGRAPHX_REF moves) fails the build loudly
+# instead of silently shipping unpatched code.
+COPY patches/ /migraphx-patches/
+# No SHELL ["/bin/bash", ...] override in this file (default /bin/sh), so
+# this loop uses the POSIX-portable "does the glob match anything" idiom
+# instead of bash's compgen: an unmatched glob falls through as its own
+# literal string, and `[ -e ... ]` on that fails, skipping it.
 RUN git clone --branch "${MIGRAPHX_REF}" --depth 1 \
-        https://github.com/ROCm/AMDMIGraphX.git /migraphx-src
+        https://github.com/ROCm/AMDMIGraphX.git /migraphx-src; \
+    for p in "/migraphx-patches/${ROCM_ARCH}"/*.patch; do \
+        [ -e "$p" ] || continue; \
+        echo "applying ${p}"; \
+        git -C /migraphx-src apply --verbose "${p}"; \
+    done
 
 WORKDIR /migraphx-src
 # Drop composable_kernel and rocMLIR from requirements.txt before rbuild runs.

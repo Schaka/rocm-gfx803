@@ -1,0 +1,97 @@
+AMDMIGraphX (release/rocm-rel-6.4, pinned commit 7466a4cd2fa39ae2d0f89f747262cd962a22cfc4):
+two correctness/compatibility fixes to src/onnx/parse_resize.cpp, discovered
+while getting AudioMuse-AI's CLAP audio encoder to compile under
+MIGraphXExecutionProvider on gfx803. Both are backports of fixes already
+merged to upstream `develop` but never cherry-picked onto this release
+branch.
+
+--- Fix 1: accept keep_aspect_ratio_policy="stretch" -------------------------
+
+Why: MIGraphX's Resize parser unconditionally throws
+"PARSE_Resize: keep_aspect_ratio_policy is not supported!" the moment that
+attribute is present on a node at all - regardless of its value. ONNX
+Runtime's own graph loader materializes schema-declared default attribute
+values for every node during Graph::Resolve() (confirmed by dumping ORT's
+post-transform graph: a Resize node with the attribute stripped from the
+source .onnx file came back with keep_aspect_ratio_policy="stretch" anyway,
+which is opset-18's spec default), so any Resize node built by a
+reasonably-recent exporter trips this, even though "stretch" changes nothing
+about the op's actual semantics (it is the default, no-op policy).
+
+What: only throw when the policy is present AND not "stretch". Exact upstream
+fix: github.com/ROCm/AMDMIGraphX PR #4875, "Accept keep_aspect_ratio_policy=
+stretch in Resize parser" (merged to develop 2026-05-13, never backported to
+release/rocm-rel-6.4).
+
+--- Fix 2: use standard strides when computing gather indices ----------------
+
+Why: this branch's linear-mode lowering (a from-scratch, pre-native-kernel
+implementation carried on this release branch - upstream `develop` has since
+replaced the whole approach with a JIT-backed resize op, PR #4553, too large
+a change to backport here) unrolls bilinear interpolation into reshape +
+gather + slice/sub/mul/add at parse time. calc_neighbor_points() converts a
+multi-dimensional neighbor index into a flat buffer offset via
+`in_s.index(...)`, which assumes in_s has standard (contiguous, row-major)
+strides. in_s is whatever shape the Resize node's input instruction actually
+carries at that point in the graph, which is not guaranteed to be standard
+once earlier graph-optimizer passes (e.g. a Transpose folded into a
+non-default-stride view) have run on it - producing a silently wrong flat
+offset with no error of any kind.
+
+What: call `.as_standard()` before computing indices, forcing a
+canonical-strides view. Exact upstream fix: github.com/ROCm/AMDMIGraphX PR
+#4444, "Fix bug in parse_resize with nonstandard input shapes" (merged to
+develop 2025-12-12, commit bb32124, never backported to release/rocm-rel-6.4).
+
+--- What this patch does NOT fix ---------------------------------------------
+
+These two fixes make MIGraphX successfully parse and run CLAP's audio
+encoder (previously: hard parse failure). They do NOT make the output
+correct: isolated Resize-only tests (both single-axis and CLAP's real
+128x1001->256x256 two-axis geometry) confirm the Resize computation itself
+is correct post-patch (cosine similarity 1.0 against a numpy reference and
+against onnxruntime's CPU EP). But comparing MIGraphX's own "ref" (CPU,
+no GPU codegen/fusion) target against its "gpu" target - same parsed
+program, same IR, only the target-specific compile pass differs - showed a
+cosine similarity of ~0.075 between them: the actual remaining divergence is
+in MIGraphX's GPU-target codegen/fusion for this network, not the ONNX
+parser. That is a substantially deeper issue (comparable in kind to the
+MIOpen GPU-codegen correctness bugs already documented for this arch in the
+AudioMuse-AI ROCm plugin's docs/ARCH_NOTES.md) and is not addressed here.
+Applying this patch alone is not sufficient to make MIGraphXExecutionProvider
+safe to use for CLAP on gfx803 - see that plugin's docs for the current
+recommended path (ROCMExecutionProvider with ConvActivationFusion disabled).
+
+Applies to: AMDMIGraphX @ release/rocm-rel-6.4, gfx803 only (this Dockerfile
+is gfx803-exclusive; other arches build from upstream's develop branch,
+which already has both fixes).
+
+diff --git a/src/onnx/parse_resize.cpp b/src/onnx/parse_resize.cpp
+index 307e1e4..6ba44f7 100644
+--- a/src/onnx/parse_resize.cpp
++++ b/src/onnx/parse_resize.cpp
+@@ -288,10 +288,12 @@ struct parse_resize : op_parser<parse_resize>
+             MIGRAPHX_THROW("PARSE_" + opd.onnx_name + ": exclude_outside 1 is not supported!");
+         }
+
+-        if(contains(info.attributes, "keep_aspect_ratio_policy"))
++        if(contains(info.attributes, "keep_aspect_ratio_policy") and
++           info.attributes.at("keep_aspect_ratio_policy").s() != "stretch")
+         {
+-            MIGRAPHX_THROW("PARSE_" + opd.onnx_name +
+-                           ": keep_aspect_ratio_policy is not supported!");
++            MIGRAPHX_THROW("PARSE_" + opd.onnx_name + ": keep_aspect_ratio_policy=\"" +
++                           info.attributes.at("keep_aspect_ratio_policy").s() +
++                           "\" is not supported (only \"stretch\" is accepted)");
+         }
+
+         // input data shape info
+@@ -417,7 +419,7 @@ struct parse_resize : op_parser<parse_resize>
+                 }
+             });
+
+-            auto ind = calc_neighbor_points(vvv_ind, in_s, out_s, resized_m);
++            auto ind = calc_neighbor_points(vvv_ind, in_s.as_standard(), out_s, resized_m);
+
+             auto dim_lens = out_lens;
+             // indices matrix size grows 2x per resized-axis:
