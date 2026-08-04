@@ -47,13 +47,13 @@
 # Expect this to be slow: untuned MIOpen, no packed-fp16, no dot instructions.
 # It is meant to make a 20-euro card usable, not competitive.
 #
-# Build: docker build -f gfx803/Dockerfile.gfx803 -t <tag> gfx803
+# Build: docker build -f gfx803/Dockerfile -t <tag> gfx803
 ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete
 
 # Component-image references, same indirection as the main Dockerfile: in CI
 # each component builds as its own job/image and the next stage COPYs the
 # prebuilt result instead of recompiling. Defaults point at the local stage
-# names so a plain one-shot `docker build -f gfx803/Dockerfile.gfx803 gfx803`
+# names so a plain one-shot `docker build -f gfx803/Dockerfile gfx803`
 # still works.
 ARG ROCBLAS_IMAGE=rocblas-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
@@ -131,6 +131,13 @@ RUN pip3 install pyyaml joblib
 
 RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
         https://github.com/ROCm/rocBLAS.git /rocblas-src
+
+# gfx803's Tensile kernels miscompute whenever WorkGroupMapping != 1 -- silently,
+# with rocblas_status_success. This rewrites the solution logic before Tensile
+# generates any assembly from it; the script header carries the measurements and
+# the reasoning, and it fails the build if it ever stops matching upstream.
+COPY patches/rocblas/ /rocblas-patches/
+RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 
 WORKDIR /rocblas-src
 # rmake.py directly rather than install.sh: as of 6.4, install.sh's own getopt
@@ -299,20 +306,21 @@ RUN python3 -m venv /rbuild-venv \
         https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz
 
 # Fixes to MIGRAPHX_REF's pinned commit that upstream merged to develop but
-# never backported to this release branch. One directory per arch (this file
-# is gfx803-exclusive, but the layout matches the same docker/patches/<arch>/
-# convention used in the AudioMuse-AI ROCm plugin repo). Each patch documents
-# its own why/what in its header; applied right after the clone so a patch
-# that stops applying (e.g. MIGRAPHX_REF moves) fails the build loudly
-# instead of silently shipping unpatched code.
-COPY patches/ /migraphx-patches/
+# never backported to this release branch. patches/ is grouped by what gets
+# patched (migraphx/, rocblas/) rather than by arch: this whole directory is
+# gfx803-exclusive, so a patches/<arch>/ level underneath it only repeated the
+# name of its own parent. Each patch documents its own why/what in its header;
+# applied right after the clone so a patch that stops applying (e.g.
+# MIGRAPHX_REF moves) fails the build loudly instead of silently shipping
+# unpatched code.
+COPY patches/migraphx/ /migraphx-patches/
 # No SHELL ["/bin/bash", ...] override in this file (default /bin/sh), so
 # this loop uses the POSIX-portable "does the glob match anything" idiom
 # instead of bash's compgen: an unmatched glob falls through as its own
 # literal string, and `[ -e ... ]` on that fails, skipping it.
 RUN git clone --branch "${MIGRAPHX_REF}" --depth 1 \
         https://github.com/ROCm/AMDMIGraphX.git /migraphx-src; \
-    for p in "/migraphx-patches/${ROCM_ARCH}"/*.patch; do \
+    for p in /migraphx-patches/*.patch; do \
         [ -e "$p" ] || continue; \
         echo "applying ${p}"; \
         git -C /migraphx-src apply --verbose "${p}"; \

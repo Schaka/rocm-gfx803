@@ -2,14 +2,14 @@
 
 Experimental image for Polaris cards -- RX 460, 470, 480, 550, 560, 570, 580,
 590, plus the R9 Fury/Nano generation that shares the gfx803 ISA. Built from
-`Dockerfile.gfx803` by the manual `gfx803.yml` workflow, entirely separate from
+`Dockerfile` by the manual `gfx803.yml` workflow, entirely separate from
 the nightly matrix in the [main README](../README.md).
 
 > **This is not a supported configuration.** Officially supported is gfx900 and
 > above, i.e. what AMD lists in the ROCm supported-GPU matrix. gfx803 is
 > best-effort and slow by construction (see [Expectations](#expectations)).
 > It has been verified on real hardware (Sapphire RX 470 8GB Mining UEFI) with
-> [`verify_gfx803.py`](#verifying-on-hardware) -- MIGraphX EP inference,
+> [`verify.py`](#verifying-on-hardware) -- MIGraphX EP inference,
 > rocBLAS GEMM, and MIOpen convolution all ran correctly. Issues against it
 > are welcome as reports, not as regressions.
 
@@ -109,7 +109,7 @@ arch tag:
   combined image
 
 Mind that these tags are the only ones in those packages built from
-`Dockerfile.gfx803` against ROCm 6.4.4 -- every other arch tag is the ROCm 7.x
+`Dockerfile` against ROCm 6.4.4 -- every other arch tag is the ROCm 7.x
 main pipeline. The versions pinned here have nothing to do with the ones the
 nightly builds.
 
@@ -146,7 +146,7 @@ fallback, and `debug` for a tmate session.
 Locally:
 
 ```
-docker build -f gfx803/Dockerfile.gfx803 -t rocm-gfx803-builder gfx803
+docker build -f gfx803/Dockerfile -t rocm-gfx803-builder gfx803
 ```
 
 ## Running
@@ -165,17 +165,17 @@ The image already sets the Polaris runtime environment
 
 ## Verifying on hardware
 
-The build-time import check in the final stage of `Dockerfile.gfx803` only
+The build-time import check in the final stage of `Dockerfile` only
 proves the wheels import -- not that MIGraphX, rocBLAS, and MIOpen actually
-dispatch to the card correctly. `verify_gfx803.py` in this repo runs a real
+dispatch to the card correctly. `verify.py` in this repo runs a real
 MIGraphX EP inference, a rocBLAS GEMM, and a MIOpen convolution, each checked
 against expected output:
 
 ```
 docker run --device=/dev/kfd --device=/dev/dri --group-add video \
-    -v "$(pwd)/gfx803/verify_gfx803.py:/verify_gfx803.py" \
+    -v "$(pwd)/gfx803/verify.py:/verify.py" \
     ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803 \
-    python3 /verify_gfx803.py
+    python3 /verify.py
 ```
 
 Confirmed passing on a Sapphire RX 470 8GB Mining UEFI: all four checks
@@ -279,4 +279,4 @@ knobs Polaris needs, comes from two community projects:
 
 Neither builds MIGraphX or ONNX Runtime; that part is new here, and has since
 been verified on real hardware (a Sapphire RX 470 8GB Mining UEFI) with
-[`verify_gfx803.py`](#verifying-on-hardware).
+[`verify.py`](#verifying-on-hardware).
