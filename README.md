@@ -9,9 +9,15 @@ the nightly matrix in the [main README](../README.md).
 > above, i.e. what AMD lists in the ROCm supported-GPU matrix. gfx803 is
 > best-effort and slow by construction (see [Expectations](#expectations)).
 > It has been verified on real hardware (Sapphire RX 470 8GB Mining UEFI) with
-> [`verify.py`](#verifying-on-hardware) -- MIGraphX EP inference,
-> rocBLAS GEMM, and MIOpen convolution all ran correctly. Issues against it
-> are welcome as reports, not as regressions.
+> [`verify.py`](#verifying-on-hardware) -- MIGraphX EP inference, rocBLAS GEMM,
+> and MIOpen convolution all ran correctly. Two kernel-level bugs (a pervasive
+> rocBLAS fp32 GEMM miscompute, and a MIOpen out-of-bounds read in
+> `ConvOclDirectFwd` for grouped convolutions) were found and fixed by
+> patching around them -- see [`KERNEL_BUGS.md`](KERNEL_BUGS.md) for the full
+> investigation and the [known runtime
+> issue](#known-runtime-issue-rocmexecutionprovider-crashes-on-fused-conv-musicnn-class-models)
+> section for what that means in practice. Issues against it are welcome as
+> reports, not as regressions.
 
 ## Why it's a separate image, not another arch in the matrix
 
@@ -240,20 +246,37 @@ What was ruled out, each confirmed on real hardware, not assumed:
   neighbouring page happens to be mapped, which is where the non-determinism
   comes from.
 
-**Practical conclusion: keep MIOpen's Fusion Plan API out of the picture
-entirely.** Two complementary measures, both in the AudioMuse-AI ROCm plugin:
-don't route CNN/conv-heavy models (musicnn) through `ROCMExecutionProvider`
-at all -- MIGraphX is both faster for them (~22ms vs ~26-30ms mean per
-inference, when ROCM doesn't crash) and stable -- and for graphs that must
-use the ROCM EP (CLAP, which MIGraphX refuses to parse), disable ORT's
-`ConvActivationFusion` graph optimizer per session via the
-`optimization.disable_specified_optimizers` session config entry, so no
-FusedConv nodes exist and every conv runs unfused (verified stable over a
-200-iteration session-churn loop that kills an unpatched session within a
-couple of iterations). This is a MIOpen/ROCm bug on unsupported-generation
-hardware, not something fixable from an image build -- worth an upstream
-report against ROCm/MIOpen if anyone has cycles, but no open issue is known
-to track it yet.
+**Update: fixed.** This was not one bug but two, both now fixed and both
+documented in full in [`KERNEL_BUGS.md`](KERNEL_BUGS.md):
+
+1. A pervasive rocBLAS/Tensile fp32 GEMM miscompute, fixed via
+   [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/) -- confirmed
+   to fix CT2's float32 crash outright, but only measurably *delayed* (not
+   eliminated) the ConvActivationFusion crash above, which is what confirmed
+   it as a second, separate bug.
+2. The actual ConvActivationFusion crash: MIOpen's `ConvOclDirectFwd` solver
+   (behind the `MIOpenConvUniBatchNormActiv` kernel this section's own
+   investigation already correctly pointed at) has a genuine out-of-bounds
+   weights-buffer read for grouped/depthwise convolutions specifically --
+   confirmed via a minimal, deterministic, standalone repro with nothing but
+   MIOpen involved. Fixed by rebuilding MIOpen from source with
+   [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](patches/miopen/conv-direct-fwd-grouped-oob.sh),
+   which makes MIOpen's own solver-applicability check reject grouped convs
+   outright instead of ever reaching the broken kernel. Confirmed clean over
+   40 session churns with `ConvActivationFusion` left fully enabled -- no
+   workaround needed anymore; the `optimization.disable_specified_optimizers`
+   plugin-side workaround and MIGraphX-instead-of-ROCM routing described
+   above are no longer necessary; that also fixed the non-determinism this
+   section spent a lot of words on: it was never a "sometimes the neighboring
+   page happens to be mapped" thing, it was every grouped-conv dispatch
+   reading out of bounds, with the neighboring memory's contents (whatever
+   happened to be there) determining whether that particular read actually
+   crossed an unmapped page or not.
+
+gfx803 is abandoned upstream with no realistic path to a fix landing there,
+so we are not filing upstream reports for either bug -- `KERNEL_BUGS.md`
+documents the investigation methodology in full so any future bug in this
+class can be chased and patched the same way, in this repo.
 
 ## Host-side caveats
 
