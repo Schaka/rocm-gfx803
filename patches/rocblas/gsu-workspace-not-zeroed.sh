@@ -1,165 +1,33 @@
 #!/bin/sh
-# Fix the gfx803 GSU (GlobalSplitU / split-K) workspace staleness miscompute,
-# by zeroing the GSU workspace immediately after rocBLAS allocates/reuses it,
-# before the reduction kernel that accumulates into it ever launches.
-#
-# WHY
-# ---
-# gfx803 (Polaris/GCN3) has no native float atomic-add instruction, so
-# Tensile emulates GlobalSplitU (split-K) reduction on this architecture via
-# a software compare-and-swap retry loop: each of the GSU groups reads
-# whatever is currently at the target address, adds its own partial sum, and
-# attempts to swap the result in, retrying on contention
-# (KernelWriterAssembly.py's globalWriteBatch atomic path, the `else`
-# branch taken when `self.useAtomicAdd` is false). This design is only
-# correct if the target memory already holds the correct starting value (0,
-# or beta-scaled C) before any of the N independent, concurrently-running
-# GSU groups begin their first CAS attempt -- there is no "first" group in a
-# symmetric, concurrent design, so the kernel cannot self-initialize; zeroing
-# is necessarily the caller's responsibility, done once, before the kernel
-# launches.
-#
-# rocBLAS's own device memory pool (library/src/include/handle.hpp,
-# gsu_malloc_by_size()) hands out this workspace as reused memory across
-# successive GEMM calls WITHOUT re-zeroing it. Confirmed via direct
-# hipMalloc/hipFree tracing on an RX 470 (gfx803) against ROCm 6.4.4: the
-# pool is allocated once, not per call, and the same physical memory backs
-# every GSU-using GEMM call in a process. The first call after a fresh
-# allocation is correct (untouched, OS-zeroed memory); every call after
-# inherits whatever the previous call's CAS loop left behind, silently
-# corrupting the result with rocblas_status_success returned. Confirmed via
-# a controlled dose-response test: reusing a workspace without re-zeroing it
-# between calls reproduces the corruption at roughly the same rate as
-# stock rocBLAS; re-zeroing it before every call eliminates it completely
-# (0/N mismatches across every shape tested, including every shape an
-# overnight solution-matrix sweep found broken).
-#
-# WHAT
-# ----
-# Insert one hipMemsetAsync of the GSU workspace, sized to exactly what
-# Tensile itself computed as required (solution->requiredWorkspaceSize),
-# immediately after rocBLAS's tensile_host.cpp obtains the workspace pointer
-# via gsu_malloc_by_size() and before the kernel launch that follows.
-# Bandwidth-bound, proportional to output size, not to full GEMM compute
-# cost. Runs on the same stream as the GEMM call, so no extra
-# synchronization is introduced -- ordering is already correct by
-# construction.
-#
-# SECOND BUG, found while verifying the above: library/src/include/handle.hpp's
-# gsu_malloc_by_size() has its own pre-existing correctness bug, independent
-# of the missing zero-init --
-#
-#   auto gsu_malloc_by_size(size_t requested_Workspace_Size)
-#   {
-#       if(this->gsu_workspace) // Added to accomodate quant, remove comment after testing
-#           return _gsu_malloc_by_size(this);
-#       return _gsu_malloc_by_size(this, requested_Workspace_Size);
-#   };
-#
-# The fast path reuses whatever workspace the handle already has WITHOUT
-# checking it's actually big enough for the current request -- if an earlier
-# call on the same handle needed less GSU workspace than the current call
-# does, this hands back an undersized buffer. Confirmed on real hardware:
-# applying only the zero-init fix above made a small shape (40x72x800) go
-# from ~99% corrupted to ~100% corrupted with LARGER error magnitudes
-# (max_abs up to ~4.5 vs ~1.4-2.2 before) -- consistent with an actual heap
-# buffer overflow, not just stale data, once our memset (sized to the
-# *requested* size) started writing past a too-small *reused* buffer.
-# A large shape (768x768x3072, which apparently never hit the undersized-
-# reuse path) came back 0/50 clean with the zero-init fix alone, which is
-# what pointed at a second, size-tracking-specific bug rather than a flaw in
-# the zero-init idea itself.
-#
-# Fixed by only taking the fast/reuse path when the existing workspace is
-# already large enough; otherwise falls through to a fresh, correctly-sized
-# allocation exactly as the non-reuse path already does.
+# Apply gsu-workspace-not-zeroed.patch (see that file for the full WHY/WHAT)
+# via `git apply`, then verify both hunks actually landed. `git apply` on a
+# tag that will never move again (rocm-6.4.4, gfx803 is abandoned upstream)
+# either matches exactly or fails loud -- this wrapper exists to catch
+# operator error (wrong clone, already-patched tree, patch/source mismatch),
+# not upstream drift.
 set -eu
 
 SRC="${1:-/rocblas-src}"
-FILE="$SRC/library/src/tensile_host.cpp"
-HANDLE_FILE="$SRC/library/src/include/handle.hpp"
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PATCH="$SELF_DIR/gsu-workspace-not-zeroed.patch"
 
-[ -f "$FILE" ] || { echo "FATAL: no tensile_host.cpp at $FILE" >&2; exit 1; }
-[ -f "$HANDLE_FILE" ] || { echo "FATAL: no handle.hpp at $HANDLE_FILE" >&2; exit 1; }
+[ -f "$PATCH" ] || { echo "FATAL: no patch file at $PATCH" >&2; exit 1; }
+[ -d "$SRC/.git" ] || { echo "FATAL: $SRC is not a git checkout" >&2; exit 1; }
 
-before=$(grep -c 'auto   gsu_malloc    = prob.handle->gsu_malloc_by_size(WorkspaceSize);' "$FILE" || true)
-if [ "$before" -ne 1 ]; then
-    echo "FATAL: expected exactly 1 match for the gsu_malloc_by_size call site in $FILE," >&2
-    echo "       found $before -- upstream layout changed, re-check before patching." >&2
-    exit 1
-fi
-
-already=$(grep -c 'GSU_WORKSPACE_ZERO_PATCH' "$FILE" || true)
-if [ "$already" -ne 0 ]; then
+if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
     echo "already patched, skipping"
     exit 0
 fi
 
-python3 - "$FILE" <<'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
+git -C "$SRC" apply --verbose "$PATCH"
 
-needle = """                if(!gsu_malloc)
-                {
-                    return rocblas_status_memory_error;
-                }
-"""
-replacement = needle + """
-                // GSU_WORKSPACE_ZERO_PATCH: gfx803 has no native float
-                // atomic-add, so GSU reduction here uses a software CAS
-                // loop that assumes a pre-zeroed workspace -- rocBLAS's
-                // memory pool reuses this buffer across calls without
-                // re-zeroing it, corrupting every call after the first.
-                // See patches/rocblas/gsu-workspace-not-zeroed.sh.
-                if(WorkspaceSize > 0)
-                {
-                    hipError_t memset_status = hipMemsetAsync(
-                        prob.handle->gsu_workspace, 0, WorkspaceSize, handle->get_stream());
-                    if(memset_status != hipSuccess)
-                        return rocblas_internal_convert_hip_to_rocblas_status(memset_status);
-                }
-"""
-
-if needle not in text:
-    print("FATAL: exact insertion point not found", file=sys.stderr)
-    sys.exit(1)
-
-text = text.replace(needle, replacement, 1)
-with open(path, "w") as f:
-    f.write(text)
-print("patched")
-PYEOF
-
-after=$(grep -c 'GSU_WORKSPACE_ZERO_PATCH' "$FILE" || true)
-if [ "$after" -ne 1 ]; then
-    echo "FATAL: patch marker not found after rewrite" >&2
-    exit 1
-fi
-echo "GSU workspace zero-init patch applied to $FILE"
-
-# Second patch: handle.hpp's unsafe reuse-without-size-check fast path.
-already_guard=$(grep -c 'GSU_WORKSPACE_SIZE_GUARD_PATCH' "$HANDLE_FILE" || true)
-if [ "$already_guard" -ne 0 ]; then
-    echo "handle.hpp size-guard already patched, skipping"
-    exit 0
-fi
-
-guard_before=$(grep -c 'if(this->gsu_workspace) // Added to accomodate quant, remove comment after testing' "$HANDLE_FILE" || true)
-if [ "$guard_before" -ne 1 ]; then
-    echo "FATAL: expected exactly 1 match for the unguarded gsu_workspace reuse check in $HANDLE_FILE," >&2
-    echo "       found $guard_before -- upstream layout changed, re-check before patching." >&2
-    exit 1
-fi
-
-sed -i \
-    's/if(this->gsu_workspace) \/\/ Added to accomodate quant, remove comment after testing/if(this->gsu_workspace \&\& this->gsu_workspace_size >= requested_Workspace_Size) \/\/ GSU_WORKSPACE_SIZE_GUARD_PATCH: only reuse if big enough/' \
-    "$HANDLE_FILE"
-
-guard_after=$(grep -c 'GSU_WORKSPACE_SIZE_GUARD_PATCH' "$HANDLE_FILE" || true)
-if [ "$guard_after" -ne 1 ]; then
-    echo "FATAL: size-guard patch marker not found after rewrite" >&2
-    exit 1
-fi
-echo "GSU workspace size-guard patch applied to $HANDLE_FILE"
+for marker in GSU_WORKSPACE_ZERO_PATCH GSU_WORKSPACE_SIZE_GUARD_PATCH; do
+    count=$(grep -rc "$marker" "$SRC/library/src/tensile_host.cpp" \
+                              "$SRC/library/src/include/handle.hpp" 2>/dev/null \
+            | awk -F: '{s+=$2} END{print s+0}')
+    if [ "$count" -lt 1 ]; then
+        echo "FATAL: marker $marker not found after git apply reported success" >&2
+        exit 1
+    fi
+done
+echo "GSU workspace patches applied and verified in $SRC"
