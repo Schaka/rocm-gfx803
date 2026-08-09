@@ -1,0 +1,324 @@
+ROCR-Runtime (pinned tag rocm-6.4.4): stop immediate GPU virtual-address
+(VA) recycling in libhsakmt's fmm aperture allocator, which corrupts MIOpen
+CK reduction kernels on gfx803 (Polaris), by deferring freed-VAs on a
+length-bounded FIFO; and default the hsa-runtime SimpleHeap fragment
+sub-allocator to OFF, since it is a second, higher-layer VA recycler that
+the fmm fix cannot see.
+
+WHY
+---
+miopenReduceTensor (dynamic/CompositeKernel reduction path) on gfx803
+intermittently returns wrong sums for a subset of output columns --
+surfaced as ONNX Runtime ReductionOpTest.ReduceSum_apex_matrix_large and
+reproduced by a standalone 52-shape MIOpen-only harness
+(gfx803/tools/reduce-harness/harness_exp.cpp). Root cause, pinned by
+controlled harness modes (HAR_MODE=reuse vs fresh-distinct addresses):
+
+  * recycled input/output device addresses => ~10/52 shapes wrong
+  * never-recycled (fresh-distinct) addresses => 0/52 wrong
+
+The VA recycling happens at TWO layers, and both must be blocked:
+
+  1. libhsa SimpleHeap fragment sub-allocator
+     (runtime/hsa-runtime/core/util/simple_heap.h, used from
+     core/driver/kfd/amd_kfd_driver.cpp): caches freed 2MB blocks and
+     re-serves the SAME VA for the next sub-2MB allocation, entirely
+     above libhsakmt -- an fmm-level fix alone cannot observe these.
+     Empirical: with only the fmm defer active and this allocator
+     re-enabled, the harness still fails 10/52 (3/3 runs).
+
+  2. libhsakmt fmm aperture free-list (libhsakmt/src/fmm.c,
+     __fmm_release -> aperture_release_area): a freed VA goes straight
+     back onto the free-list and the next same-size allocation gets the
+     same address. With layer 1 disabled but layer 2 stock, the harness
+     still fails ~6/52.
+
+Why recycled VAs mis-read on gfx803 specifically is still open (stale
+L2/TLB/GART state on re-map; Polaris-only, does not reproduce on newer
+architectures). A MIOpen-level ring of K fresh input buffers was proven
+to fix it (0/52 at K>=16), which is exactly the behaviour this patch
+moves down into the runtime so ALL consumers (MIOpen, ORT, PyTorch)
+get it without per-framework patches.
+
+Two non-solutions, measured and rejected:
+
+  * HSA_DISABLE_FRAGMENT_ALLOCATOR=1 alone (stock lib): harness 10 -> 6,
+    ORT still 1 reduce-fail. Necessary but not sufficient.
+  * Never returning freed VAs at all ("vanoreuse" leak): harness clean
+    but VA space exhausts under real workloads -- ORT ReductionOpTest
+    went from 28.5s to a 900s timeout with 400+ failures. Any fix must
+    return VAs to the free-list, just not immediately.
+
+WHAT
+----
+Two changes:
+
+  1. libhsakmt/src/fmm.c -- deferred release. __fmm_release() still frees
+     the KFD buffer object and physical pages IMMEDIATELY (no memory
+     footprint change), but the VA stays reserved: the vm_object is kept
+     in the aperture tree and parked on a per-aperture FIFO
+     (deferred_head/deferred_tail/deferred_len). Only when the FIFO
+     exceeds FMM_REUSE_QUEUE_MAX (64) entries is the oldest entry's area
+     actually returned to the free-list -- so a freed address cannot be
+     re-handled to a new allocation until at least 64 intervening frees,
+     comfortably exceeding the proven ring-16 freshness window, while the
+     queue stays length-bounded and O(1) per op (nothing leaks; VA space
+     usage is bounded by 64 reserved areas per aperture).
+
+     Scratch-backing apertures bypass the FIFO: they are torn down only
+     at process exit by fmm_release_scratch(), whose loop requires each
+     released object to leave the tree immediately -- the first version of
+     this patch without the bypass deadlocked (well, livelocked: 100% user
+     CPU in that loop) in hsa_shut_down() -> ~GpuAgent -> hsakmt_fmm_release
+     -> fmm_release_scratch. Marker: GFX803_VA_REUSE_DEFER_PATCH.
+
+     Deferred objects are hardened against stale-handle replay: their
+     handles[] are scrubbed to 0 and object->deferred is set when the
+     release is parked, and __fmm_release() no-ops on an already-deferred
+     object. Without this, a second hsakmt_fmm_release() of the same
+     address (the object is still findable in the tree, unlike stock
+     where it is gone) would re-issue FREE_MEMORY_OF_GPU on handle ids
+     KFD may already have recycled to a different, live BO -- observed as
+     intermittent mid-run GPU page faults ("Page not present") in the ORT
+     suite at ~3/40 runs with the unhardened patch, 0/10 after hardening.
+
+  2. runtime/hsa-runtime/core/util/flag.h -- invert the
+     HSA_DISABLE_FRAGMENT_ALLOCATOR default: the SimpleHeap fragment
+     sub-allocator (layer 1 above) is now OFF unless the variable is
+     explicitly set to "0". Measured cost on the real gates: none
+     (ORT ReductionOpTest 28.4s vs 28.5s stock; it would only show up in
+     alloc/free-hot microbenchmarks). Keeping layer 1 enabled is NOT an
+     option: with it on, the harness fails 10/52 even with the fmm defer
+     active (3/3 runs).
+
+GATES (all run on the gfx803 box, ROCm 6.4.4, against this patched lib)
+-----------------------------------------------------------------------
+  * harness_exp, HAR_MODE=reuse, 52-shape sweep, 5 consecutive runs:
+    0/52 failed every run, ~0.7s wall each (baseline stock: 6-10/52).
+  * ORT onnxruntime_test_all --gtest_filter=*ReductionOpTest* (317 tests),
+    3 consecutive runs: 315 OK / 0 FAILED / 2 pre-existing SKIPs,
+    ~28.5s wall each -- identical wall time to stock, and the
+    ReduceSum_apex_matrix_large failure is gone.
+  * Process-exit is clean (no teardown spin; see the scratch-aperture
+    bypass above).
+
+diff --git a/libhsakmt/src/fmm.c b/libhsakmt/src/fmm.c
+index b004dce..7390760 100644
+--- a/libhsakmt/src/fmm.c
++++ b/libhsakmt/src/fmm.c
+@@ -60,7 +60,10 @@
+ 	.vm_ranges = NULL,					\
+ 	.fmm_mutex = PTHREAD_MUTEX_INITIALIZER,			\
+ 	.is_cpu_accessible = false,				\
+-	.ops = &reserved_aperture_ops				\
++	.ops = &reserved_aperture_ops,				\
++	.deferred_head = NULL,					\
++	.deferred_tail = NULL,					\
++	.deferred_len = 0				\
+ 	}
+ 
+ #define container_of(ptr, type, member) ({			\
+@@ -81,6 +84,16 @@
+ #define START_NON_CANONICAL_ADDR (1ULL << 47)
+ #define END_NON_CANONICAL_ADDR (~0UL - (1UL << 47))
+ 
++/* GFX803 VA-recycling workaround: a freed VA is withheld from the aperture
++ * free-list until FMM_REUSE_QUEUE_MAX further frees have occurred, so a hot
++ * address is never handed straight back to the next same-size malloc. Mirrors
++ * the proven ring-of-distinct-buffers result (harness 0/52). Length-bounded
++ * (not alloc-counted) so it is O(1) per op and self-limiting for every
++ * aperture regardless of which alloc paths fire -- an alloc-counted delay can
++ * grow unboundedly on apertures whose alloc path doesn't bump the counter.
++ */
++#define FMM_REUSE_QUEUE_MAX 64
++
+ struct vm_object {
+ 	void *start;
+ 	void *userptr;
+@@ -116,6 +129,13 @@ struct vm_object {
+ 	off_t mmap_offset;
+ #endif
+ 	uint32_t handle_num; /* number of handles */
++	/* GFX803_VA_REUSE_DEFER_PATCH: set once the BOs have been freed and the
++	 * release parked on the defer FIFO. The object stays in the tree (VA
++	 * reserved) but its handles are scrubbed, so any stale re-release or
++	 * handle lookup through it is a no-op rather than freeing a handle id
++	 * KFD may already have recycled to a different, live BO.
++	 */
++	bool deferred;
+ 	uint64_t handles[]; /* kfd handles array */
+ };
+ typedef struct vm_object vm_object_t;
+@@ -131,6 +151,19 @@ typedef struct vm_area vm_area_t;
+ /* Memory manager for an aperture */
+ typedef struct manageable_aperture manageable_aperture_t;
+ 
++static void fmm_defer_release(manageable_aperture_t *aperture, vm_object_t *object);
++
++/* A freed allocation whose VA is being withheld from reuse for a short while.
++ * The KV object is kept in the aperture tree (so the area stays reserved and
++ * the allocator can't hand the address back) until the delay expires, then the
++ * area is released and the object removed -- bounded, non-leaking.
++ */
++struct deferred_release {
++	struct deferred_release *next;
++	manageable_aperture_t *aperture;
++	vm_object_t *object;
++};
++
+ /* Aperture management function pointers to allow different management
+  * schemes.
+  */
+@@ -174,6 +207,14 @@ struct manageable_aperture {
+ 	pthread_mutex_t fmm_mutex;
+ 	bool is_cpu_accessible;
+ 	const manageable_aperture_ops_t *ops;
++	/* GFX803 VA-recycling workaround: FIFO of releases withheld from the
++	 * aperture free-list, bounded at FMM_REUSE_QUEUE_MAX entries. The VA
++	 * stays reserved while queued, so a freed address is never handed back
++	 * to the very next same-size allocation.
++	 */
++	struct deferred_release *deferred_head;
++	struct deferred_release *deferred_tail;
++	uint32_t deferred_len;
+ };
+ 
+ typedef struct {
+@@ -364,6 +405,7 @@ static vm_object_t *vm_create_and_init_object(void *start, uint64_t size,
+ 		object->metadata = NULL;
+ 		object->user_data = NULL;
+ 		object->is_imported_kfd_bo = false;
++		object->deferred = false;
+ 		object->node.key = rbtree_key((unsigned long)start, size);
+ 		object->user_node.key = rbtree_key(0, 0);
+ #ifdef SANITIZER_AMDGPU
+@@ -895,6 +937,52 @@ static void aperture_release_area(manageable_aperture_t *app, void *address,
+ 	app->ops->release_area(app, address, MemorySizeInBytes);
+ }
+ 
++/* Actually return a deferred area to the aperture free-list and drop the
++ * object. fmm_mutex must be held.
++ */
++static void fmm_do_release(struct deferred_release *e)
++{
++	aperture_release_area(e->aperture, e->object->start, e->object->size);
++	vm_remove_object(e->aperture, e->object);
++	free(e);
++}
++
++/* Push a release onto the aperture's deferred FIFO. fmm_mutex must be held.
++ * Keeps the object in the tree (VA stays reserved) so the freed address is
++ * never handed straight back to the next same-size allocation. Once the FIFO
++ * exceeds FMM_REUSE_QUEUE_MAX the oldest entry is released for real, so the
++ * queue is length-bounded and O(1) per op for every aperture.
++ */
++static void fmm_defer_release(manageable_aperture_t *aperture, vm_object_t *object)
++{
++	struct deferred_release *e, *head;
++
++	e = calloc(1, sizeof(*e));
++	if (!e) {
++		/* Out of memory: fall back to an immediate release. */
++		aperture_release_area(aperture, object->start, object->size);
++		vm_remove_object(aperture, object);
++		return;
++	}
++	e->aperture = aperture;
++	e->object = object;
++	e->next = NULL;
++	if (aperture->deferred_tail)
++		aperture->deferred_tail->next = e;
++	else
++		aperture->deferred_head = e;
++	aperture->deferred_tail = e;
++
++	if (++aperture->deferred_len > FMM_REUSE_QUEUE_MAX) {
++		head = aperture->deferred_head;
++		aperture->deferred_head = head->next;
++		if (!aperture->deferred_head)
++			aperture->deferred_tail = NULL;
++		aperture->deferred_len--;
++		fmm_do_release(head);
++	}
++}
++
+ /* returns 0 on success. Assumes, that fmm_mutex is locked on entry */
+ static vm_object_t *aperture_allocate_object(manageable_aperture_t *app,
+ 					     void *new_address,
+@@ -2000,10 +2088,24 @@ static int __fmm_release(vm_object_t *object, manageable_aperture_t *aperture)
+ 		}
+ 	}
+ 
+-	/* If memory is user memory and it's still GPU mapped, munmap
+-	 * would cause an eviction. If the restore happens quickly
+-	 * enough, restore would also fail with an error message. So
+-	 * free the BO before unmapping the pages.
++	/* GFX803_VA_REUSE_DEFER_PATCH: this object's release was already parked
++	 * on the defer FIFO (BOs freed, handles scrubbed, VA still reserved).
++	 * A second release of the same address must be a no-op -- re-issuing
++	 * FREE_MEMORY_OF_GPU on the stale handle ids could free a handle KFD
++	 * has since recycled to a different, live BO (observed as intermittent
++	 * mid-run GPU page faults, "Page not present").
++	 */
++	if (object->deferred) {
++		pthread_mutex_unlock(&aperture->fmm_mutex);
++		return 0;
++	}
++
++	/* GFX803 VA-recycling workaround: free the KFD BO + pages immediately,
++	 * but do NOT return the VA to the aperture free-list yet. It is parked
++	 * on the deferred FIFO and only released after FMM_REUSE_DELAY_ALLOCS
++	 * further allocations, so a freed address is never handed straight back
++	 * (mirrors the proven ring-16 result). Bounded -- the flush eventually
++	 * releases every parked area, so nothing leaks.
+ 	 */
+ 	for (i = 0; i < object->handle_num; i++) {
+ 		args.handle = object->handles[i];
+@@ -2016,8 +2118,29 @@ static int __fmm_release(vm_object_t *object, manageable_aperture_t *aperture)
+ 	if (ret)
+ 		goto err_free_mem_failed;
+ 
+-	aperture_release_area(aperture, object->start, object->size);
+-	vm_remove_object(aperture, object);
++	/* GFX803_VA_REUSE_DEFER_PATCH: scratch-backing apertures must bypass the
++	 * defer FIFO. They are only torn down at shutdown by
++	 * fmm_release_scratch(), whose loop requires each released object to
++	 * leave the tree immediately -- a deferred (still-in-tree) object makes
++	 * that loop spin forever at process exit.
++	 */
++	if (fmm_is_scratch_aperture(object->start) == aperture) {
++		aperture_release_area(aperture, object->start, object->size);
++		vm_remove_object(aperture, object);
++	} else {
++		/* BOs are gone but the object stays in the tree on the defer
++		 * FIFO. Scrub the handle table first, so any stale handle
++		 * lookup/re-release through it is a no-op (see the
++		 * object->deferred guard above).
++		 */
++		for (i = 0; i < object->handle_num; i++)
++			object->handles[i] = 0;
++		object->deferred = true;
++		fmm_defer_release(aperture, object);
++	}
++
++	pthread_mutex_unlock(&aperture->fmm_mutex);
++	return 0;
+ 
+ err_free_mem_failed:
+ 	pthread_mutex_unlock(&aperture->fmm_mutex);
+diff --git a/runtime/hsa-runtime/core/util/flag.h b/runtime/hsa-runtime/core/util/flag.h
+index 39d7b1d..be449da 100644
+--- a/runtime/hsa-runtime/core/util/flag.h
++++ b/runtime/hsa-runtime/core/util/flag.h
+@@ -177,7 +177,10 @@ class Flag {
+     report_tool_register_failures_ = (var == "1") ? true : false;
+ 
+     var = os::GetEnvVar("HSA_DISABLE_FRAGMENT_ALLOCATOR");
+-    disable_fragment_alloc_ = (var == "1") ? true : false;
++    // GFX803 VA-recycling workaround: fragment sub-allocator is OFF by
++    // default (every alloc gets a fresh VA from the driver); set the env var
++    // to 0 to re-enable the 2MB-block sub-allocator.
++    disable_fragment_alloc_ = (var == "0") ? false : true;
+ 
+     var = os::GetEnvVar("HSA_ENABLE_SDMA_HDP_FLUSH");
+     enable_sdma_hdp_flush_ = (var == "0") ? false : true;
