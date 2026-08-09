@@ -1,0 +1,7 @@
+# ConvDirectNaiveConvFwd: generic HIP fallback, near-arbitrary shapes.
+16 32 32 16 3 3 1 1 1
+16 32 32 16 1 1 1 1 0
+16 32 32 16 5 5 2 1 2
+32 32 100 24 1 1 1 1 0
+16 32 32 16 3 3 4 1 1
+64 16 16 64 3 3 1 2 1

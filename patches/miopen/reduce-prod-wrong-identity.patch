@@ -1,0 +1,95 @@
+MIOpen (pinned tag rocm-6.4.4): fix ReduceCalculation's Prod (multiply)
+kernel to seed its accumulator with the multiplicative identity (1)
+instead of the additive identity (0).
+
+WHY
+---
+src/kernels/MIOpenReduceCalculation.cpp implements both SumForward and
+ProdForward (miopenReduceCalculationForward with
+MIOPEN_REDUCE_CALCULATION_SUM / _PROD) via one shared kernel template,
+parameterized by op. Both variants of the reduction loop
+(calculationfwdcontiguous and its parallel-split counterpart,
+calculationparallelfwdcontiguous) unconditionally start from:
+
+    FLOAT_ACCUM calculation = static_cast<FLOAT_ACCUM>(0);
+
+then repeatedly apply reduce_func<T, op>::calculate(calculation, val),
+which for Sum does `a += b` (correct, 0 is the additive identity) and
+for Prod does `a *= b`. Starting Prod's accumulator at 0 means the very
+first multiply already yields 0, and every subsequent multiply keeps it
+at 0 -- so ProdForward returns an all-zero output for any non-empty
+reduction, regardless of the input values.
+
+Confirmed via a standalone MIOpen-only repro (no ORT/model involved):
+miopenReduceCalculationForward with MIOPEN_REDUCE_CALCULATION_SUM over a
+3D tensor (contiguous, reducing a non-last axis, matching
+IsValidLength/IsNotLastDim) returns the correct sum (cos(host_ref,
+gpu)=1.0000) across several shapes; the identical harness with
+MIOPEN_REDUCE_CALCULATION_PROD instead of SUM returns all zeros
+(cos=0.0000) for every shape tested, including a trivial single-element
+reduction (a "reduction" over one element should just return that
+element unchanged -- it returns 0 instead). Checked upstream: the
+identical unfixed code (same accumulator init, same reduce_func) is
+still present verbatim as of the newest available MIOpen tag,
+rocm-7.2.4 -- this is not something already fixed post-6.4.4.
+
+Likely why it went uncaught despite being this blatant: the whole
+ReduceCalculation entry point is gated behind MIOPEN_BETA_API. That
+macro is unconditionally defined for every MIOpen build (see
+CMakeLists.txt: `add_definitions("-DMIOPEN_BETA_API=1")`), so the
+broken code ships in every release, including 6.4.4 and 7.2.4 -- but
+"beta" here means the API is new (2023-2024) and Sum is the entry
+point real callers actually reach (e.g. ONNX ReduceSum lowering); Prod
+looks like a much rarer callsite that few if any inference stacks
+(ONNX Runtime's ROCM EP / MIGraphX included) route through this
+specific MIOpen function for, so an all-zero-output bug this obvious
+could survive unexercised in practice.
+
+This is a plain logic bug in shared, architecture-generic kernel source
+(src/kernels/MIOpenReduceCalculation.cpp) with no device-name gating at
+all -- it reproduces identically on every ROCm architecture MIOpen
+supports, not just gfx803. It's included in this repo's patch set
+because we build MIOpen from source here anyway and ship it in the same
+image; it is also a legitimate candidate to report upstream to AMD.
+
+WHAT
+----
+Seed the accumulator with the correct identity element for the
+selected op at compile time (op is already a template parameter, so
+this resolves via `if constexpr` with no runtime cost): 1 for Prod, 0
+for Sum. Applied to both the single-pass and parallel-split reduction
+kernels since both duplicate the same accumulator-init line.
+
+Applies to: MIOpen @ rocm-6.4.4, all architectures -- this is not
+gated to gfx803 in any way; see reduce-prod-wrong-identity.sh for how
+this patch is applied and verified at build time.
+
+diff --git a/src/kernels/MIOpenReduceCalculation.cpp b/src/kernels/MIOpenReduceCalculation.cpp
+index d21ae3d..c1105cc 100644
+--- a/src/kernels/MIOpenReduceCalculation.cpp
++++ b/src/kernels/MIOpenReduceCalculation.cpp
+@@ -53,7 +53,12 @@ __device__ void calculationparallelfwdcontiguous(const TI* __restrict__ x,
+
+     uint64_t parallel_id = slice_local_id / inner_size;
+
+-    FLOAT_ACCUM calculation = static_cast<FLOAT_ACCUM>(0);
++    // REDUCE_PROD_WRONG_IDENTITY_PATCH: seed with this op's identity element,
++    // not unconditionally 0 -- 0 is wrong for Prod (a *= b starting from 0
++    // stays 0 forever) and was making ProdForward always return all zeros.
++    // See reduce-prod-wrong-identity.patch.
++    FLOAT_ACCUM calculation =
++        static_cast<FLOAT_ACCUM>(op == ReduceCalculationOp_t::Prod ? 1 : 0);
+     for(uint64_t k = parallel_id; k < reduce_size; k += parallelism_size)
+     {
+         FLOAT_ACCUM val = CVT_FLOAT2ACCUM(x[input_idx]);
+@@ -95,7 +100,9 @@ __device__ void calculationfwdcontiguous(const TI* __restrict__ x,
+
+     uint64_t input_idx = (gid / inner_size) * inner_size * reduce_size + gid % inner_size;
+
+-    FLOAT_ACCUM calculation = static_cast<FLOAT_ACCUM>(0);
++    // REDUCE_PROD_WRONG_IDENTITY_PATCH: see above.
++    FLOAT_ACCUM calculation =
++        static_cast<FLOAT_ACCUM>(op == ReduceCalculationOp_t::Prod ? 1 : 0);
+     for(uint64_t k = 0; k < reduce_size; ++k)
+     {
+         FLOAT_ACCUM val = CVT_FLOAT2ACCUM(x[input_idx]);

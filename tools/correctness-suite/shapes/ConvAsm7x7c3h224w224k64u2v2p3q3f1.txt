@@ -1,0 +1,2 @@
+# ConvAsm7x7c3h224w224k64u2v2p3q3f1: everything hardcoded, only one valid shape exists.
+3 224 224 64 7 7 1 2 3

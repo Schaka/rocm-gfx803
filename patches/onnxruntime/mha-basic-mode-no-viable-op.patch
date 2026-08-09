@@ -1,0 +1,197 @@
+ONNX Runtime (pinned ORT_VERSION): fix MultiHeadAttention's ROCm "Generic"
+(non-Composable-Kernel) fallback pipeline to transpose Q/K/V into the layout
+its own GEMMs require, instead of refusing to run whenever query
+sequence_length > 1.
+
+WHY
+---
+onnxruntime/contrib_ops/rocm/bert/batched_gemm_softmax_gemm_permute_pipelines.cuh
+implements the Q*K'->softmax->*V computation behind MultiHeadAttention two
+ways: a Composable Kernel (CK) path, and a "Generic" fallback built from plain
+rocBLAS GEMMs plus a custom softmax kernel. This image builds ORT with
+`onnxruntime_USE_COMPOSABLE_KERNEL=OFF` (gfx803 has no matrix-core hardware
+for CK to target), so Generic is the *only* path available here.
+
+Generic's own doc comment at the top of the file says its GEMMs expect Q, K, V
+already permuted to BNSH ("In QKV projection (prior to this pipeline): Q
+[B,S,N*H] ->Reshape-> [B,S,N,H] ->Permute0213-> [B,N,S,H]"). That permute
+happens upstream, inside a fused QKV-projection kernel -- but MultiHeadAttention
+called with three separate, raw Q/K/V tensors (mode BSNH_BLNH_BLNH_NONE_NONE_
+NONE_NONE in this file's own mode table, documented there as "MHA basic", the
+single most ordinary self/cross-attention call shape) has no such projection
+step. Nothing ever transposes Q, K, V for that mode. GetSupportedStatus()
+knows this and rejects it outright:
+
+    case BSNH_BLNH_BLNH_NONE_NONE_NONE_NONE:
+      return TUNABLE_OP_UNSUPPORTED("GenericPipeline only supports qkv_format
+      as Q_K_V_BNSH but k, v are BLNH");
+
+-- with one exception: when sequence_length == 1, a [1,H] slice per head is
+byte-identical whether you call it BSNH or BNSH, so the check is skipped.
+Real multi-token attention has no such luck, and since CK is compiled out on
+this image, there is no other registered op left to try. The observable
+symptom, from onnxruntime_test_all:
+
+    Could not find viable op
+
+for MultiHeadAttentionTest.CrossAttention_Batch1_HeadSize8 (batch=1,
+num_heads=2, head_size=8, sequence_length=2, kv_sequence_length=3 -- an
+entirely ordinary shape). head_size=8 is incidental (it's just ROCm MHA's
+documented minimum head_size); the real trigger is query sequence_length > 1
+under this mode, which any real cross- or self-attention call with more than
+one query token will hit.
+
+This is not a rocBLAS or MIOpen bug: rocBLAS is never even called for this
+case -- the rejection happens in ORT's own C++ dispatch, one layer above any
+GPU kernel invocation. That's why the fix lives here rather than in a
+rocBLAS/MIOpen patch.
+
+Confirmed via isolating the exact failing test and reading the real error
+(not just "verifier shows no mismatch" -- there was no GEMM call to verify):
+`rocblasGemmBatchedHelper`/`TunableOp::FindFastestImpl` both fail identically
+because GetSupportedStatus rejects the call before any kernel launches.
+
+WHAT
+----
+ORT already has a utility for exactly this transpose, `LaunchTransQkv`
+(onnxruntime/contrib_ops/rocm/bert/attention_impl.h), used elsewhere for the
+plain fused `Attention` op's own QKV-projection permute. With `matrix_num=1`
+it degenerates to a plain BSNH -> BNSH copy per tensor, which is exactly what's
+missing here. Added:
+
+- `GetQkvTransposeExtraBytes` / extended `GetWorkspaceNumBytes`: reserve extra
+  workspace for three transposed (BNSH) copies of Q, K, V, appended after the
+  existing gemm1_out/softmax_out/gemm2_out region so it can never alias it.
+- `TransposeQkvForBasicMha`: runs the three `LaunchTransQkv` calls (V uses
+  `v_head_size`, not `head_size` -- they can differ) and returns a shallow
+  copy of the params struct pointing at the transposed buffers.
+  `GemmSoftmaxGemmPermuteParams` owns no resources, so the copy is safe.
+- `Run()`: for this one mode, transpose first and use the transposed params
+  for the rest of the pipeline; every other mode is untouched.
+- `GetSupportedStatus()`: the case now returns `Status::OK()` instead of
+  rejecting -- Run() handles the transpose it used to be missing.
+
+Verified: MultiHeadAttentionTest.CrossAttention_Batch1_HeadSize8 passes (fp16
+output matches the CPU reference). Full MultiHeadAttentionTest/AttentionTest/
+DecoderAttentionTest families: 53 passed, 0 failed, 13 pre-existing explicit
+ROCM_GTEST_SKIP skips, no regressions. onnxruntime_test_all: 12 -> 3 failures.
+
+Applies to: ORT's ROCm EP with USE_COMPOSABLE_KERNEL=OFF -- not gfx803-specific
+in principle (any ROCm target building without CK hits the same gap), but only
+verified on gfx803 here. See mha-basic-mode-no-viable-op.sh for how this patch
+is applied and verified at build time.
+
+--- a/onnxruntime/contrib_ops/rocm/bert/batched_gemm_softmax_gemm_permute_pipelines.cuh
++++ b/onnxruntime/contrib_ops/rocm/bert/batched_gemm_softmax_gemm_permute_pipelines.cuh
+@@ -444,13 +444,84 @@
+   }
+ 
+   inline static size_t GetWorkspaceNumBytes(const RocmAttentionParameters* attn) {
+-    return GetAttentionWorkspaceSize(
++    size_t bytes = GetAttentionWorkspaceSize(
+         sizeof(T),
+         attn->batch_size,
+         attn->num_heads,
+         attn->head_size,
+         attn->sequence_length,
+         attn->total_sequence_length);
++    // MHA_BASIC_MODE_TRANSPOSE_PATCH
++    // BSNH_BLNH_BLNH_NONE_NONE_NONE_NONE ("MHA basic", see the mode table at the
++    // top of this file) is the plain three-separate-tensor MultiHeadAttention
++    // call: Q, K, V arrive unpermuted (BSNH/BLNH), exactly as documented for
++    // "In QKV projection (prior to this pipeline)" above -- except here nothing
++    // upstream did that projection/permute, because there's no fused QKV
++    // projection to do it. GemmSoftmaxGemmPermuteGenericPipeline::Gemm1/Gemm2
++    // assume BNSH-strided buffers, so this mode needs its own permute step
++    // before those GEMMs run. Reserve room for three transposed (BNSH) copies
++    // of Q, K, V, appended after the existing gemm1_out/softmax_out/gemm2_out
++    // region so it can never alias it.
++    if (attn->mode == BSNH_BLNH_BLNH_NONE_NONE_NONE_NONE) {
++      bytes += GetQkvTransposeExtraBytes(attn);
++    }
++    return bytes;
++  }
++
++  inline static size_t GetQkvTransposeExtraBytes(const RocmAttentionParameters* attn) {
++    size_t elems = static_cast<size_t>(attn->batch_size) * attn->num_heads *
++                   (static_cast<size_t>(attn->sequence_length) * attn->head_size +
++                    static_cast<size_t>(attn->total_sequence_length) * attn->head_size +
++                    static_cast<size_t>(attn->total_sequence_length) * attn->v_head_size);
++    return sizeof(T) * elems;
++  }
++
++  // Transposes Q, K, V from BSNH/BLNH (unpermuted, as delivered by the plain
++  // MultiHeadAttention op) into BNSH, writing into the tail of workspace_buffer
++  // reserved by GetQkvTransposeExtraBytes above. Returns a params copy pointing
++  // at the transposed buffers; all other fields are identical to the input.
++  // GemmSoftmaxGemmPermuteParams has no owned resources, so this shallow copy
++  // is safe -- see its definition above.
++  static Status TransposeQkvForBasicMha(const GemmSoftmaxGemmPermuteParams<T>* params,
++                                        GemmSoftmaxGemmPermuteParams<T>& out_params) {
++    const auto* attn = params->attention;
++    size_t base_bytes = GetAttentionWorkspaceSize(
++        sizeof(T), attn->batch_size, attn->num_heads, attn->head_size,
++        attn->sequence_length, attn->total_sequence_length);
++    T* transpose_region = reinterpret_cast<T*>(
++        reinterpret_cast<char*>(params->workspace_buffer) + base_bytes);
++
++    size_t q_elems = static_cast<size_t>(attn->batch_size) * attn->num_heads *
++                     attn->sequence_length * attn->head_size;
++    size_t k_elems = static_cast<size_t>(attn->batch_size) * attn->num_heads *
++                     attn->total_sequence_length * attn->head_size;
++
++    T* q_bnsh = transpose_region;
++    T* k_bnsh = q_bnsh + q_elems;
++    T* v_bnsh = k_bnsh + k_elems;
++
++    int max_threads = params->device_prop->maxThreadsPerBlock;
++    hipStream_t stream = params->StreamHandle();
++
++    // matrix_num=1: no packed-QKV chunking, just a plain BSNH -> BNSH permute.
++    ORT_RETURN_IF_ERROR(LaunchTransQkv(
++        stream, /*matrix_num=*/1, attn->sequence_length, attn->batch_size,
++        attn->head_size, attn->num_heads, max_threads, /*reversed_bs=*/false,
++        params->q_buffer, q_bnsh));
++    ORT_RETURN_IF_ERROR(LaunchTransQkv(
++        stream, /*matrix_num=*/1, attn->total_sequence_length, attn->batch_size,
++        attn->head_size, attn->num_heads, max_threads, /*reversed_bs=*/false,
++        params->k_buffer, k_bnsh));
++    ORT_RETURN_IF_ERROR(LaunchTransQkv(
++        stream, /*matrix_num=*/1, attn->total_sequence_length, attn->batch_size,
++        attn->v_head_size, attn->num_heads, max_threads, /*reversed_bs=*/false,
++        params->v_buffer, v_bnsh));
++
++    out_params = *params;
++    out_params.q_buffer = q_bnsh;
++    out_params.k_buffer = k_bnsh;
++    out_params.v_buffer = v_bnsh;
++    return Status::OK();
+   }
+ 
+   inline static Status Gemm1(const GemmSoftmaxGemmPermuteParams<T>* params) {
+@@ -562,7 +633,10 @@
+                                         attn->qkv_format);
+         }
+       case BSNH_BLNH_BLNH_NONE_NONE_NONE_NONE:
+-        return TUNABLE_OP_UNSUPPORTED("GenericPipeline only supports qkv_format as Q_K_V_BNSH but k, v are BLNH");
++        // "MHA basic" (see the mode table above): Q/K/V arrive unpermuted and
++        // Run() transposes them into BNSH before Gemm1/Gemm2 -- see
++        // TransposeQkvForBasicMha.
++        return Status::OK();
+       case BSNH_BNLH_BNLH_NONE_NONE_NONE_NONE:
+       case BSNH_BLNH_BLNH_NONE_NONE_BNTH_BNTH:
+       case BSNH_BNLH_BNLH_NONE_NONE_BNTH_BNTH:
+@@ -593,6 +667,13 @@
+     if (!supported_status.IsOK()) {
+       return supported_status;
+     }
++
++    GemmSoftmaxGemmPermuteParams<T> transposed_params;
++    if (params->attention->mode == BSNH_BLNH_BLNH_NONE_NONE_NONE_NONE) {
++      ORT_RETURN_IF_ERROR(TransposeQkvForBasicMha(params, transposed_params));
++      params = &transposed_params;
++    }
++
+     ORT_RETURN_IF_ERROR(Gemm1(params));
+ 
+     if (UseRawAttentionMask(params)) {

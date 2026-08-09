@@ -1,0 +1,14 @@
+# ConvAsm1x1UV2: hard R=S=1, pad=0, group=1, stride=2 only (stride=1 path
+# self-disabled in IsApplicable). fp32 only.
+# Format: C H W K R S group stride pad
+16 32 32 16 1 1 1 2 0
+32 32 100 24 1 1 1 2 0
+64 32 100 24 1 1 1 2 0
+1 32 32 1 1 1 1 2 0
+4 4 4 4 1 1 1 2 0
+128 64 64 128 1 1 1 2 0
+16 2 2 16 1 1 1 2 0
+16 3 5 16 1 1 1 2 0
+16 33 33 16 1 1 1 2 0
+16 32 32 1 1 1 1 2 0
+16 32 32 512 1 1 1 2 0

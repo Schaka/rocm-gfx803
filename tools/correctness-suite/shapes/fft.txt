@@ -1,0 +1,5 @@
+# fft solver: group=1, fp32, 5x5 kernel, pad=2, stride=1, in HxW in {28x28,27x27,14x14,7x7}, C*N and K*N %16==0
+16 28 28 16 5 5 1 1 2
+32 14 14 32 5 5 1 1 2
+16 7 7 16 5 5 1 1 2
+16 27 27 16 5 5 1 1 2

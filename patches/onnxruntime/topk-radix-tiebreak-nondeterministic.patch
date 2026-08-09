@@ -1,0 +1,263 @@
+ONNX Runtime (pinned ORT_VERSION): replace ROCm's small-K TopK dispatch with
+a self-contained kernel, avoiding a hipCUB block-primitive tie-breaking defect
+that picks a different winner among exactly-tied candidates from run to run
+on bit-identical input.
+
+WHY
+---
+onnxruntime/core/providers/cuda/math/topk_impl.cuh implements the generic
+ONNX TopK kernel three ways depending on shape: BitonicTopK (small enough to
+fit one block, no external dependency), RadixTopK (moderate K, built on
+hipCUB's BlockScan/BlockReduce/BlockRadixSort -- rocPRIM-backed on ROCm), and
+a cub::DeviceRadixSort-based fallback for large K. This file is hipified
+verbatim from the CUDA provider (no ROCm-specific source exists), so ROCm
+gets NVIDIA's algorithm running on AMD's own reimplementation of the cub API
+surface.
+
+BeamSearchTest.GptBeamSearchFp32_DisableFastTopK (which forces ORT's generic
+TopK fallback via ORT_BEAM_SEARCH_USE_FAST_TOPK=0, bypassing the specialized
+beam-search topk kernel) failed roughly half of isolated single-test runs --
+not under load, alone, fresh process each time. Traced to RadixTopK: this
+test's toy GPT2 model outputs literal 0.0 logits at several decode steps,
+producing heavy exact ties among top-K candidates. RadixTopK's own tie
+handling (an `equal_quota` scheme built from BlockReduce/BlockScan exclusive
+prefix sums, meant to deterministically allocate tied slots by thread index)
+picked a different winner among tied candidates across runs on the same
+input. Confirmed via a non-invasive host-side dump (deliberately added no new
+synchronization or device-to-host copy beyond what already existed in the
+calling code, since an earlier, more invasive dump masked the failure
+entirely by changing kernel launch timing -- the same observer effect already
+documented for the gfx803 small-GEMM race): printed values were exact `0`
+at 9 significant digits, not near-zero floating-point noise, ruling out
+upstream numeric nondeterminism as the cause.
+
+Two more targeted fixes were tried and rejected:
+
+- Routing to cub::DeviceRadixSort (this file's own fallback for large K, a
+  different hipCUB code path -- device-wide, not block-level primitives)
+  segfaults. Confirmed via backtrace: it crashes in
+  RocmKernel::GetScratchBuffer, because the beam-search call site
+  (onnxruntime/contrib_ops/cuda/transformers/generation_device_helper.cc)
+  deliberately passes `kernel=nullptr` to TopKImpl, with an inline comment
+  explaining why: "We limit number of beams in BeamSearchParameters, so
+  K <= 256 and use NULL here" -- banking on always landing in RadixTopK,
+  never the kernel-dependent DeviceRadixSort path.
+- Extending BitonicTopK's applicability (no hipCUB dependency at all) beyond
+  its current `aligned_dimension <= blockDim` gate isn't a safe drop-in: its
+  sort/merge phases index via tid/(tid<<1) pairs that only cover positions
+  reachable within one block's thread count in a single pass. Making it work
+  for this test's dimension (4000) would mean rewriting the compare-exchange
+  network to handle multiple elements per thread throughout -- a much larger,
+  correctness-sensitive change than scoped here.
+
+WHAT
+----
+Added SafeSmallKTopK: K sequential block-wide argmax passes, entirely
+hand-written (no hipCUB block primitives at all, so no dependency on
+rocPRIM's BlockScan/BlockReduce/BlockRadixSort), no CudaKernel dependency (so
+it works with kernel=nullptr), and no O(dimension) shared memory -- the
+"already selected" check scans the K selected indices found so far each pass
+(K is small by construction; this kernel only replaces RadixTopK, gated the
+same way the original code already gated it: K <= BT*16 or unsorted output),
+not a dimension-sized flag array. Shared memory scales with block size and K
+only, so it stays cheap for the vocab sizes real beam search sees, unlike a
+naive "mark every taken index" approach would.
+
+Ties are broken by lowest index, matching this file's existing
+IS_SMALLER/BIGGER macros' tie-break convention (see their `.val` clause) --
+deterministic and reproducible given identical input, unlike RadixTopK's.
+
+Scoped to ROCm only via #ifdef USE_ROCM (the standard guard already used
+throughout ORT's shared cuda/ provider files for exactly this kind of
+ROCm-only behavior difference) -- CUDA is untouched, since RadixTopK isn't
+broken there.
+
+Verified: BeamSearchTest.GptBeamSearchFp32_DisableFastTopK, 18 isolated runs,
+17 passed (the one residual failure showed the identical symptom -- likely a
+separate, deeper source, not chased further here; see
+gfx803/KERNEL_BUGS.md). Full TopKOperator suite (53 tests, including
+Top3AllSame -- an explicit tie-handling test -- and large-array cases) plus
+BeamSearchTest/SamplingTest: 62 passed, 0 regressions.
+
+Applies to: ORT's ROCm EP generally (the hipCUB block-primitive tie-break
+issue isn't gfx803-specific -- AMD's 64-wide wavefront vs NVIDIA's 32-wide
+warp is uniform across ROCm architectures), though only verified on gfx803
+here. See topk-radix-tiebreak-nondeterministic.sh for how this patch is
+applied and verified at build time.
+
+--- a/onnxruntime/core/providers/cuda/math/topk_impl.cuh
++++ b/onnxruntime/core/providers/cuda/math/topk_impl.cuh
+@@ -397,6 +397,141 @@
+   }
+ }
+ 
++#ifdef USE_ROCM
++// SAFE_SMALL_K_TOPK_PATCH
++//
++// RadixTopK below uses hipCUB's block-level BlockScan/BlockReduce/
++// BlockRadixSort (rocPRIM-backed) to allocate "equal-value" tie slots
++// deterministically by thread index. Observed on ROCm: with heavy exact
++// ties in the input (BeamSearchTest.GptBeamSearchFp32_DisableFastTopK's
++// toy GPT2 model outputs literal 0.0 logits at several decode steps), it
++// picks a different winner among tied candidates from run to run on
++// bit-identical input -- confirmed via a non-invasive host-side dump (no
++// extra sync/copy, so it doesn't perturb timing the way instrumentation
++// did earlier): BeamSearchTest.GptBeamSearchFp32_DisableFastTopK failed
++// ~50% of isolated single-test runs, always on an exact-tie decode step.
++// Not upstream floating-point noise -- the differing values printed were
++// literal 0 at %.9g precision, not near-zero.
++//
++// cub::DeviceRadixSort (this file's other fallback, for K > BT*16) is a
++// different hipCUB code path (device-wide, not block-level primitives) and
++// would sidestep the same defect, but it requires a real CudaKernel* for
++// scratch allocation via kernel->GetScratchBuffer -- and the beam search
++// caller (generation_device_helper.cc) deliberately passes kernel=nullptr,
++// documented inline: "We limit number of beams in BeamSearchParameters, so
++// K <= 256 and use NULL here", banking on always landing in RadixTopK.
++// Confirmed by crash: forcing that path with kernel=nullptr segfaults in
++// GetScratchBuffer.
++//
++// BitonicTopK (this file's other alternative, no hipCUB dependency) only
++// works when aligned_dimension <= blockDim -- its sort/merge phases index
++// via tid/(tid<<1) pairs that don't cover positions beyond what blockDim
++// threads can reach in one pass. Not safely extensible to large dimension
++// (e.g. this test's 4000) without rewriting the compare-exchange network to
++// handle multiple elements per thread throughout -- out of scope here.
++//
++// This kernel avoids all three problems: K sequential block-wide argmax
++// passes, entirely hand-written (no hipCUB block primitives at all), no
++// CudaKernel dependency, and no O(dimension) shared memory -- the "already
++// selected" check scans the K selected indices found so far (K is small by
++// construction: this replaces RadixTopK, gated the same way, K <= BT*16),
++// not a dimension-sized flag array. Safe for the vocab sizes real beam
++// search sees (shared memory scales with blockDim and K only).
++//
++// Ties are broken by lowest index, matching IS_SMALLER/BIGGER's existing
++// convention elsewhere in this file (see their `.val` tie-break clause) --
++// deterministic and reproducible given identical input, unlike the kernel
++// this replaces.
++template <typename T>
++__global__ void SafeSmallKTopK(const T* X, T* V, int64_t* I, const TArray<int64_t> elem_nums, size_t size,
++                               int32_t axis, int64_t K, int64_t largest, int64_t sorted, int64_t dimension,
++                               T type_min, T type_max) {
++  extern __shared__ char shared_mem[];
++  auto best_val = (T*)shared_mem;
++  auto best_idx = (int64_t*)(best_val + blockDim.x);
++  auto selected = (int64_t*)(best_idx + blockDim.x);
++
++  auto tid = threadIdx.x;
++  auto bid = blockIdx.x;
++  auto bdim = static_cast<int64_t>(blockDim.x);
++  auto mid_dim = axis == size - 1 ? 1 : elem_nums[axis + 1];
++  auto left_dim = bid / mid_dim * elem_nums[axis];
++  auto right_dim = axis == size - 1 ? 0 : bid % elem_nums[axis + 1];
++
++  for (int64_t k = 0; k < K; ++k) {
++    T local_best_val = 1 == largest ? type_min : type_max;
++    int64_t local_best_idx = -1;
++    for (int64_t i = tid; i < dimension; i += bdim) {
++      bool already_selected = false;
++      for (int64_t s = 0; s < k; ++s) {
++        if (selected[s] == i) {
++          already_selected = true;
++          break;
++        }
++      }
++      if (already_selected) continue;
++      T x = X[FROM(i)];
++      bool better = local_best_idx < 0 ||
++                    (1 == largest ? (x > local_best_val || (x == local_best_val && i < local_best_idx))
++                                  : (x < local_best_val || (x == local_best_val && i < local_best_idx)));
++      if (better) {
++        local_best_val = x;
++        local_best_idx = i;
++      }
++    }
++    best_val[tid] = local_best_val;
++    best_idx[tid] = local_best_idx;
++    __syncthreads();
++    for (int64_t stride = bdim / 2; stride > 0; stride >>= 1) {
++      if (tid < stride) {
++        auto other_val = best_val[tid + stride];
++        auto other_idx = best_idx[tid + stride];
++        bool other_better;
++        if (best_idx[tid] < 0) {
++          other_better = other_idx >= 0;
++        } else if (other_idx < 0) {
++          other_better = false;
++        } else if (1 == largest) {
++          other_better = other_val > best_val[tid] || (other_val == best_val[tid] && other_idx < best_idx[tid]);
++        } else {
++          other_better = other_val < best_val[tid] || (other_val == best_val[tid] && other_idx < best_idx[tid]);
++        }
++        if (other_better) {
++          best_val[tid] = other_val;
++          best_idx[tid] = other_idx;
++        }
++      }
++      __syncthreads();
++    }
++    if (0 == tid) {
++      selected[k] = best_idx[0];
++      auto to = TO(k);
++      V[to] = best_val[0];
++      I[to] = best_idx[0];
++    }
++    __syncthreads();
++  }
++
++  if (0 == sorted && 0 == tid) {
++    // K is small (this replaces RadixTopK, same K <= BT*16 gate) -- a plain
++    // insertion sort by ascending index, done by one thread, is cheap enough.
++    for (int64_t a = 1; a < K; ++a) {
++      auto to_a = TO(a);
++      T val_a = V[to_a];
++      int64_t idx_a = I[to_a];
++      int64_t b = a - 1;
++      while (b >= 0 && I[TO(b)] > idx_a) {
++        V[TO(b + 1)] = V[TO(b)];
++        I[TO(b + 1)] = I[TO(b)];
++        --b;
++      }
++      V[TO(b + 1)] = val_a;
++      I[TO(b + 1)] = idx_a;
++    }
++  }
++}
++#endif
++
+ template <typename T>
+ Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
+                 Stream* ort_stream, const T* input_x, T* output_v, int64_t* output_i,
+@@ -414,13 +549,22 @@
+         input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, aligned_K, largest, sorted, dimension,
+         aligned_dimension, NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
+   } else if (K <= BT * 16 || 0 == sorted) {
++#ifndef USE_ROCM
+     if (use_deterministic_compute) {
+       static std::once_flag log_warning;
+       std::call_once(log_warning, []() {
+         LOGS_DEFAULT(WARNING) << "Non-deterministic TopKImpl kernel is called, its outputs may still be nondeterministic.";
+       });
+     }
+-
++#endif
++
++#ifdef USE_ROCM
++    // SAFE_SMALL_K_TOPK_PATCH: see the kernel's own comment above for why.
++    size_t smem_bytes = GridDim::maxThreadsPerBlock * (sizeof(CudaT) + sizeof(int64_t)) + K * sizeof(int64_t);
++    SafeSmallKTopK<CudaT><<<N, GridDim::maxThreadsPerBlock, smem_bytes, stream>>>(
++        input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, largest, sorted, dimension,
++        NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
++#else
+     auto XPT = static_cast<int64_t>(ceil(static_cast<double>(dimension) / GridDim::maxThreadsPerBlock));
+     if (BT * 2 >= K || 0 == sorted) {
+       RadixTopK<CudaT, BT, 2><<<N, BT, 256 * sizeof(uint32_t), stream>>>(
+@@ -439,6 +583,7 @@
+           input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, largest, sorted, dimension, XPT,
+           NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
+     }
++#endif
+   } else {
+     auto input_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, ort_stream);
+     auto output_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, ort_stream);

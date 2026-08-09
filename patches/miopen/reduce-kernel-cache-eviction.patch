@@ -1,0 +1,310 @@
+*** ABANDONED -- NOT applied by the Dockerfile, NOT shipped. Kept only as a
+*** record of a failed fix attempt; do not wire this back in without reading
+*** the "WHY THIS WAS ABANDONED" note below first.
+***
+*** DIRTY WORKAROUND -- NOT a root-cause fix, unlike every other patch in
+*** this directory. Read the WHY section fully before touching or reusing
+*** this pattern elsewhere in the repo.
+
+WHY THIS WAS ABANDONED
+-----------------------
+This patch (both the version below and a v2 that added handle.Finish()
+before every eviction, to close a suspected use-after-eviction race) passed
+every standalone MIOpen-only repro thrown at it -- including a 200-iteration
+repeat of the identical shape, and a repro mixing MIOPEN_REDUCE_TENSOR_ADD/
+MAX/MIN calls across many shapes on one handle to mimic ORT's real usage
+pattern -- 0 failures, every time. It nonetheless failed ORT's real test
+suite (onnxruntime_test_all --gtest_filter=*ReductionOpTest*)
+non-deterministically: sometimes clean, sometimes
+ReductionOpTest.ReduceSum_apex_matrix_large returns small integer sequences
+(1, 2, 3, 4...) instead of sums -- a WORSE, less-understood failure
+signature than the original bug's numerically-off-but-plausible-looking
+wrong sums. No standalone repro, however elaborate, reproduced this ORT-only
+failure, which means there was no fast, reliable way left to iterate on a
+fix -- every test cycle meant a multi-minute, sometimes-inconclusive full
+ORT suite run. Rather than ship a patch that trades one characterized bug
+for a worse, uncharacterized one, this was abandoned and ReduceSum was left
+on the unpatched baseline. See gfx803/KERNEL_BUGS.md, "The ReduceSum
+kernel-cache mystery", for the full investigation.
+
+MIOpen (pinned tag rocm-6.4.4): after every miopenReduceTensor() dynamic-CK
+dispatch, evict that call's own kernel-cache and program-cache entries from
+the Handle, forcing the next call that would have reused them to
+recompile+reload from scratch instead.
+
+WHY (and why this is NOT a clean fix)
+--------------------------------------
+This does not identify or fix the actual defect. It works around a real,
+reproducible, gfx803-specific correctness bug in MIOpen's dynamic-reduction
+kernel dispatch by making that dispatch avoid ever reusing a cached compiled
+kernel across shapes on the same handle -- the one condition every
+experiment below found eliminates the bug, without ever pinning down why.
+
+THE BUG: miopenReduceTensor's dynamic-reduction path launches two kernels
+per call (a "prepare" kernel that writes a tensor descriptor into a scratch
+workspace, and a "main" kernel that reads it back and does the reduction).
+A standalone, ORT-independent MIOpen-only repro -- one miopenHandle_t, a
+sweep of ReduceTensor ADD calls over many (m,n) shapes, matching
+ReductionOpTest.ReduceSum_apex_matrix_large's exact call pattern -- shows
+about 15% of shapes in the sweep return wrong sums. The same shapes always
+pass 100% of the time when run alone (fresh handle, nothing else compiled
+or cached yet). Reversing the shape iteration order changes WHICH shapes
+fail and makes it worse (16/52 wrong instead of 8/52) -- proof this is
+about accumulated handle state, not a property of any individual shape.
+
+EVERY ONE of the following was tested and ruled out as the mechanism, each
+with a targeted, isolated experiment (not just "seemed to not matter"):
+  - GPU dispatch-order race between separate kernel launches:
+    AMD_SERIALIZE_KERNEL=3 (forces fully synchronous kernel execution) has
+    zero effect -- same shapes fail, same mismatch counts.
+  - Workspace visibility between the prepare and main kernel specifically:
+    an earlier attempt at this exact patch inserted handle.Finish() between
+    the two dispatches (confirmed active via HIP API tracing -- an explicit
+    hipEventSynchronize genuinely occurs) with zero effect.
+  - MIOpen's on-disk JIT kernel-binary cache: identical failures whether
+    that disk cache starts cold or warm.
+  - GPU device-memory address reuse / cache coherency on a freed-then-
+    reallocated address: identical failures even with hipMalloc replaced by
+    one static, never-freed buffer pool for the entire sweep.
+  - Kernel launch occupancy: adding __launch_bounds__(BlockSize, 1) to both
+    the prepare and main kernels (forcing minBlocksPerMultiprocessor=1) has
+    zero effect.
+  - Host-side memory corruption in reducetensor.cpp's own C++ logic:
+    running the repro under valgrind --track-origins=yes reproduces the
+    exact same failures with ZERO memcheck errors reported.
+  - Insufficiently-specific compile-time cache keys (two different tunables
+    colliding on the same compiled binary): ruled out by inspection --
+    get_definition_string_from_tunable/get_network_config_string_from_tunable
+    both fully encode BlockSize/GredThreadBufferLength/etc, so different
+    tunables never share a cache key.
+
+What DOES reliably eliminate every failure, confirmed repeatedly:
+  - A genuinely fresh miopenHandle_t for every single call (nothing has
+    ever been compiled/cached on it before) -- not usable as a real fix,
+    since ORT and PyTorch both hold one handle for a whole session/stream,
+    calling this for many different shapes over that handle's lifetime.
+  - Adding ANY extra per-thread device memory write inside the kernel
+    (tried as a debugging aid, to dump internal state) -- this is NOT
+    something we can ship; it doesn't explain the mechanism, and shipping
+    dead instrumentation code as a "fix" would be its own kind of dishonest
+    patch.
+
+A parallel attempt to route around this entirely by forcing MIOpen's older,
+non-CK "static" reduction implementation (MIOPEN_DEBUG_DYNAMIC_REDUCTION=0)
+was abandoned: that path has its own independent, pre-existing compile-time
+template bug (an Array<int,N> size mismatch inside
+CalculateLowerIndexDiff/to_array in the old composable_kernel template
+library) and does not currently build at all for this shape family. Fixing
+that would be its own open-ended investigation into unmaintained template
+metaprogramming, with no guarantee the result is even correct once it
+compiles -- rejected as a bigger, riskier, and no more principled rabbit
+hole than this one.
+
+The true root cause remains unidentified. It is very likely something at
+or below the ROCm driver/runtime level (GPU code-object loading/placement
+across multiple JIT-compiled kernels sharing a process, on a codebase and
+architecture generation -- gfx803/GCN3 -- long past upstream support) that
+is not visible to or fixable from MIOpen's own source.
+
+WHAT
+----
+Call handle.ClearKernels(algorithm, network_config) and
+handle.ClearProgram(program_name, params) -- both existing public Handle
+methods, already used elsewhere in MIOpen for cache invalidation -- for
+every kernel this function just dispatched, immediately after dispatching
+it. Scoped narrowly: only miopenReduceTensor's own dynamic-CK kernel cache
+entries are evicted, nothing else in MIOpen's handle-wide kernel cache is
+touched, so this cannot affect conv/gemm/or any other operation's cached
+kernels.
+
+A handle.Finish() is required immediately before every eviction call. The
+first version of this patch omitted it and shipped a NEW, worse bug:
+ClearProgram can release the underlying GPU code object, and without
+waiting for the just-launched kernel to actually finish first, eviction
+raced the kernel's own asynchronous execution. Caught by ORT's real test
+suite (onnxruntime_test_all --gtest_filter=*ReductionOpTest*), not by the
+standalone MIOpen-only repro -- the repro never interleaves ReduceSum with
+other reduction-family ops (ArgMax, ReduceMax, etc.) on the same handle the
+way a real ORT process does, and evidently that interleaving matters for
+hitting this race. Symptom was ReduceSum_apex_matrix_large returning small
+integer sequences (1, 2, 3, 4...) instead of sums -- consistent with the
+GPU executing from unloaded/reused code memory, not a numerically-off
+result. Lesson for whoever touches this again: the standalone repro is
+necessary but not sufficient for validating changes here -- always also
+run the real ORT test suite (see the verification note below) before
+trusting a build.
+
+COST: every miopenReduceTensor() call using the dynamic-CK path now pays a
+full JIT recompile + GPU reload instead of reusing a cached kernel binary,
+even when called repeatedly with the exact same shape. This is a real,
+measurable per-call performance regression for this one operation --
+accepted here because a silently wrong reduction is worse than a slow
+correct one, and reduction ops are not typically the hot path relative to
+conv/gemm in the model classes this repo cares about. If reduction
+performance turns out to matter for a real workload, this patch should be
+the first thing revisited, not tuned around.
+
+Applies to: MIOpen @ rocm-6.4.4, gfx803 only -- not upstreamed, this
+platform is abandoned; see reduce-kernel-cache-eviction.sh for how this
+patch is applied and verified at build time.
+
+
+FOR WHOEVER PICKS THIS UP TO ROOT-CAUSE PROPERLY
+-------------------------------------------------
+The real defect is still unknown. Everything mechanistically "obvious" has
+been ruled out (see the ruled-out list above). What's confirmed, as a
+starting point for going deeper than this investigation had tools for:
+
+  - The failure is deterministic given a fixed handle + fixed call
+    sequence, but changes with call order/history -- it is a function of
+    which OTHER dynamic-CK reduction kernels have been compiled and cached
+    on this SAME Handle before the failing call, not a property of the
+    failing shape alone. m=8,9,11,13 at n=128 all share the identical
+    compiled kernel (same reduceImpl/tunable/padding bucket) yet only
+    m=13, the last of that group dispatched in the default shape-sweep
+    order, produced a wrong result -- m=9 and m=11 (also needing padding)
+    were fine.
+  - Failing output columns are NOT scattered randomly across the output --
+    for the m=13,n=128 case a whole valgrind run reproduced the exact
+    failure as a single CONTIGUOUS run of wrong columns (j=32..41 out of
+    128), which smells like a specific wavefront/SIMD-lane-group boundary,
+    not generic memory corruption.
+  - What's never been directly observed: an actual wrong byte inside the
+    workspace descriptor or the compiled kernel's machine code for a
+    failing call. All per-thread/device-side debug instrumentation tried
+    (buffer-writes stashing decoded descriptor fields, a sentinel proving
+    the prepare kernel's writes are visible to the main kernel) itself
+    masks the bug by the mere act of adding an extra memory operation to
+    the kernel -- so every attempt to look directly at "what's wrong"
+    perturbed the system enough to hide it. This includes at least one
+    wasted round where the WRONG source file was instrumented (the
+    "_all_dims" wrapper instead of the actually-live "_partial_dims" one
+    for this repro's shape family -- confirmed via HIP API tracing,
+    AMD_LOG_LEVEL=4, showing the true kernel argument count) before the
+    masking-by-any-instrumentation pattern was confirmed even against the
+    correct file.
+  - Tools not yet tried, roughly in order of likely payoff for cheap
+    incremental progress:
+      1. Compare the actual compiled ISA (disassemble via `roc-obj-ls` /
+         `roc-obj` or similar against the code object MIOpen loads) for the
+         SAME kernel_name+params compiled fresh (isolated) vs compiled as
+         the Nth kernel in a long sweep, to check whether the generated
+         machine code genuinely differs byte-for-byte -- if it does, this
+         is a COMGR/LLVM codegen nondeterminism or state-leakage bug
+         between separate in-process JIT compiles, not a runtime defect.
+      2. If (1) shows identical machine code every time, the defect is at
+         GPU code-object LOADING/placement (HSA runtime / kernel driver),
+         not compilation -- would need HSA-level tracing (rocprofiler's
+         HSA API trace, not just the HIP-level trace already used here) to
+         see actual GPU-visible code-object addresses across a session and
+         check for overlap between DIFFERENT loaded modules.
+      3. rocgdb was not usable in the last environment this was attempted
+         in (older ROCm + container combo); this may be worth retrying in
+         a bare-metal or newer-ROCm-tooling environment, or with a
+         from-source rocgdb build, since a real hardware breakpoint on the
+         main kernel with register/memory inspection at the exact point of
+         divergence would settle this quickly if it can be made to work.
+      4. The static (non-CK) reduction path's own independent compile bug
+         (Array<int,N> size mismatch in
+         CalculateLowerIndexDiff/to_array, see the abandoned-detour note
+         above) is a separate, self-contained yes/no question that doesn't
+         require understanding the dynamic-path bug at all -- fixing it
+         would at minimum unblock testing whether static reduction is
+         actually correct for these shapes, which would make "route
+         dynamic-CK's broken cases to static reduction" (the clean,
+         Winograd-precedent-style fix this patch deliberately avoided
+         because of that compile error) viable.
+
+--- a/src/reducetensor.cpp
++++ b/src/reducetensor.cpp
+@@ -1037,6 +1037,10 @@
+         std::string network_config_1 = network_config + "_1_P" + std::to_string(reduceImpl) +
+                                        std::to_string(static_cast<int>(use_padding.first)) +
+                                        std::to_string(static_cast<int>(use_padding.second));
++        // REDUCE_CACHE_EVICT_PATCH: captured before network_config_1 is
++        // reassigned below for the main-kernel dispatch. See WHY note at the
++        // main-kernel eviction site further down.
++        const std::string prepare_network_config_1 = network_config_1;
+ 
+         if(nullptr == std::align(workspaceAlignRequirementBytes,
+                                  ws_sizeInBytes - workspaceAlignRequirementBytes,
+@@ -1116,6 +1120,53 @@
+         if(handle.IsProfilingEnabled())
+             time_reduce += handle.GetKernelTime();
+ 
++        // REDUCE_CACHE_EVICT_PATCH: gridwise_generic_reduce_1_prepare writes a
++        // tensor-descriptor into `workspace`; gridwise_generic_reduce_1 (just
++        // launched above) reads it back. On gfx803, when this handle's kernel
++        // cache accumulates several DIFFERENT compiled reduction kernels
++        // across a sequence of ReduceTensor() calls (a shared handle is used
++        // for a whole ORT/PyTorch session, calling this for many shapes over
++        // time), later calls sharing this handle intermittently produce wrong
++        // sums -- confirmed via a standalone MIOpen-only repro sweeping many
++        // (m,n) shapes on one handle matching
++        // ReductionOpTest.ReduceSum_apex_matrix_large's exact call pattern:
++        // ~15% of shapes wrong when run as part of the sweep, but every
++        // individual shape passes 100% of the time run alone (fresh handle,
++        // nothing else cached). Ruled out via targeted experiments: GPU
++        // dispatch-order race (AMD_SERIALIZE_KERNEL=3 has no effect), on-disk
++        // JIT cache warmth (identical failures cold vs warm), GPU memory
++        // address reuse (identical failures with a static, never-freed buffer
++        // pool for the whole sweep), workspace visibility between the prepare
++        // and main kernel (an explicit handle.Finish() here has no effect),
++        // kernel-launch occupancy (__launch_bounds__(BlockSize, 1) on both
++        // kernels has no effect), and host-side memory corruption (valgrind
++        // memcheck reproduces the exact same failures with zero errors
++        // reported). What does reliably eliminate every failure: a genuinely
++        // fresh miopenHandle_t per call (nothing accumulates to collide with)
++        // -- not usable directly since ORT/PyTorch hold one handle for a
++        // whole session -- or any extra per-thread device memory write added
++        // to the kernel (which we can't ship, and doesn't explain WHY it
++        // works). Evicting this call's own kernel-cache and program-cache
++        // entries here forces the NEXT call that would have reused them to
++        // recompile+reload from scratch instead, reproducing the same
++        // "nothing accumulated" state that makes isolated/fresh-handle calls
++        // reliable -- at the cost of a JIT recompile on every dynamic
++        // reduction call. Scoped to only this operation's own cache keys, not
++        // a blanket MIOpen cache clear; see
++        // patches/miopen/reduce-kernel-cache-eviction.sh.
++        //
++        // handle.Finish() here is NOT optional: ClearProgram can release the
++        // underlying GPU code object, and without waiting for the
++        // just-launched kernel to actually finish first, eviction can race
++        // the kernel's own asynchronous execution -- observed in practice as
++        // ORT's ReduceSum_apex_matrix_large returning small integer sequences
++        // (1, 2, 3, 4...) instead of sums, consistent with the GPU executing
++        // from unloaded/reused code memory.
++        handle.Finish();
++        handle.ClearKernels(algo_name, prepare_network_config_1);
++        handle.ClearKernels(algo_name, network_config_1);
++        handle.ClearProgram(program_name1, param1);
++
+         if(useTwoCalls)
+         {
+             const auto toReduceLength_2 = blkGroupSize;
+@@ -1144,6 +1195,9 @@
+             std::string network_config_2 = network_config + "_2_P" + std::to_string(reduceImpl2) +
+                                            std::to_string(static_cast<int>(use_padding2.first)) +
+                                            std::to_string(static_cast<int>(use_padding2.second));
++            // REDUCE_CACHE_EVICT_PATCH: captured before network_config_2 is
++            // reassigned below for the second (main) kernel of this pass.
++            const std::string prepare_network_config_2 = network_config_2;
+ 
+             if(!reduceAllDims)
+             {
+@@ -1186,6 +1240,15 @@
+ 
+             if(handle.IsProfilingEnabled())
+                 time_reduce += handle.GetKernelTime();
++
++            // REDUCE_CACHE_EVICT_PATCH: same handle-scoped kernel-cache
++            // eviction as the call-1 dispatch above, for the second pass of
++            // two-call (MultiBlock) reductions. See the WHY note there --
++            // including why handle.Finish() must come first.
++            handle.Finish();
++            handle.ClearKernels(algo_name, prepare_network_config_2);
++            handle.ClearKernels(algo_name, network_config_2);
++            handle.ClearProgram(program_name2, param2);
+         };
+ 
+         if(handle.IsProfilingEnabled())

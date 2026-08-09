@@ -1,0 +1,21 @@
+# ConvAsm3x3U: hard R=S=3, stride=1, pad=1, dilation=1, fp32, InWidth in
+# (3,1000], (InChannels/group)%4==0. No explicit GroupCount==1 gate --
+# unlike its sibling solvers, this one claims to support grouped conv via
+# hand asm indexing. Grouped conv is exactly the shape class that broke a
+# *different* gfx803 solver (conv_ocl_dir2Dfwd OOB, already fixed) so this
+# is the priority case to hammer here.
+# Format: C H W K R S group stride pad
+16 32 32 16 3 3 1 1 1
+16 32 32 16 3 3 2 1 1
+32 32 32 16 3 3 2 1 1
+64 32 32 32 3 3 4 1 1
+128 32 32 64 3 3 8 1 1
+16 32 32 16 3 3 4 1 1
+16 4 4 16 3 3 1 1 1
+16 1000 4 16 3 3 1 1 1
+16 3 4 16 3 3 1 1 1
+16 1001 4 16 3 3 1 1 1
+16 32 100 24 3 3 2 1 1
+64 32 100 24 3 3 4 1 1
+4 32 32 4 3 3 1 1 1
+8 32 32 8 3 3 2 1 1

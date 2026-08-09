@@ -20,6 +20,16 @@
 #
 # What still has to be rebuilt from source, and why:
 #
+#   ROCR      -- libhsa-runtime64 (libhsakmt is statically linked into it).
+#                On gfx803, immediate recycling of freed GPU virtual addresses
+#                -- in both libhsakmt's fmm aperture free-list and the
+#                SimpleHeap fragment sub-allocator above it -- makes MIOpen's
+#                CK reduction kernels intermittently mis-read data (ORT
+#                ReductionOpTest.ReduceSum_apex_matrix_large). Rebuilt with
+#                patches/rocr/va-reuse-defer.sh, which defers freed-VAs on a
+#                length-bounded FIFO and defaults the fragment allocator to
+#                off. See KERNEL_BUGS.md and the patch header.
+#
 #   rocBLAS   -- dropped gfx803 from its default TARGET_LIST at ROCm 6.0, but
 #                the gfx803 Tensile logic (Logic/asm_full/r9nano/*.yaml) is
 #                still in the tree, so `rmake.py -a gfx803` builds it back.
@@ -66,6 +76,7 @@ ARG MIOPEN_IMAGE=miopen-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
 ARG ORT_IMAGE=ort-builder
+ARG ROCR_IMAGE=rocr-builder
 
 # Everything below is pinned. Unlike the main image there is no develop-tracking
 # ref and so no SOURCE_DATE cache-bust: each of these refs is immutable, so its
@@ -94,11 +105,23 @@ ARG PYTORCH_REF=release/2.8
 ARG TORCHVISION_REF=v0.23.0
 ARG TORCHAUDIO_REF=v2.8.0
 
-# ORT 1.21 is the newest release AMD pairs with ROCm 6.4 in their published
-# rocm/onnxruntime tags (rocm6.4.4_ub24.04_ort1.21_torch2.8.0). It also still
-# has the pre-removal ROCm flags (--use_rocm/--rocm_home), unlike the v1.27
-# the main Dockerfile builds.
-ARG ORT_VERSION=v1.21.1
+# v1.22.2 is the newest ORT release with a real ROCMExecutionProvider --
+# confirmed directly against upstream history: PR #25181 ("Delete ROCM EP,
+# because there is no active development and we have another AMD GPU
+# EP(migraphx) to use") removed onnxruntime/core/providers/rocm/ entirely
+# right before the v1.23.0 tag (v1.22.2 still has all 76 files, v1.23.0 has
+# zero). MIGraphX EP alone isn't an equivalent replacement on gfx803 --
+# unlike gfx9+, MIGraphX has no Composable Kernel and no MLIR to fuse with
+# here (see the requirements.txt strip further down), so ROCM EP staying
+# available as the fallback path matters more on this arch than most.
+# AMD's own published rocm/onnxruntime tags pair ROCm 6.4 with ORT 1.21, but
+# the actual upstream cutoff is 1.22.2, not 1.21 -- confirmed by diffing
+# v1.21.1..v1.22.2's onnxruntime/core/providers/rocm and
+# onnxruntime/contrib_ops/rocm/bert trees: the changes there are pure
+# interface-compatibility churn (e.g. threading a new GraphOptimizerRegistry
+# param through GetCapability), not behavior changes, so nothing about
+# using 1.22.2 instead of 1.21.1 should be riskier in practice.
+ARG ORT_VERSION=v1.22.2
 
 ARG BUILD_PARALLEL_LEVEL=auto
 
@@ -119,6 +142,36 @@ ENV PIP_ROOT_USER_ACTION=ignore
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# ROCR-Runtime (libhsa-runtime64, with libhsakmt statically linked in)
+# rebuilt from source with patches/rocr/va-reuse-defer.patch: on gfx803,
+# immediate recycling of freed GPU virtual addresses (both in libhsakmt's
+# fmm aperture free-list and in the hsa-runtime SimpleHeap fragment
+# sub-allocator above it) makes MIOpen's CK reduction kernels intermittently
+# mis-read freshly written data -- ORT ReductionOpTest.ReduceSum_
+# apex_matrix_large. The patch defers freed-VAs on a length-bounded FIFO
+# and defaults the fragment allocator to off. See the patch file and
+# KERNEL_BUGS.md for the full investigation, and gfx803/tools/reduce-harness/
+# for the repro harness. Only libhsa-runtime64 is rebuilt: the KFD-layer
+# allocator is statically linked into it, so clr/HIP does not need a rebuild.
+FROM python-base AS rocr-builder
+ARG ROCM_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config xxd \
+        libnuma-dev libdrm-dev libelf-dev \
+        rocm-llvm-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
+        https://github.com/ROCm/ROCR-Runtime.git /rocr-src
+COPY patches/rocr/ /rocr-patches/
+RUN sh /rocr-patches/va-reuse-defer.sh /rocr-src
+RUN cmake -S /rocr-src -B /rocr-src/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/llvm" \
+    && cmake --build /rocr-src/build -j"$(nproc)" \
+    && cmake --install /rocr-src/build \
+    && rm -rf /rocr-src/build
 
 FROM python-base AS rocblas-builder
 
@@ -145,6 +198,16 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # the reasoning, and it fails the build if it ever stops matching upstream.
 COPY patches/rocblas/ /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
+
+# Separately: gfx803's tuned Tensile assembly GEMM kernels silently miscompute
+# when *every* dimension of the problem is small (they are correct from roughly
+# 48x48x48 up, and correct for thin shapes where one dimension is large). This
+# makes rocBLAS's Tensile dispatch prefer a HIP source kernel for exactly those
+# small fp32 problems, which is both correct and faster at that size. Fixed at
+# the rocBLAS level rather than in ORT so every consumer benefits -- takes
+# onnxruntime_test_all from 96 failures to 16. The script header carries the
+# measurements and it fails the build if the file it patches ever moves.
+RUN sh /rocblas-patches/small-gemm-assembly-miscompute.sh /rocblas-src
 
 WORKDIR /rocblas-src
 # rmake.py directly rather than install.sh: as of 6.4, install.sh's own getopt
@@ -293,6 +356,8 @@ RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
 # ARG through a FROM with a static name first).
 FROM ${ROCBLAS_IMAGE} AS rocblas-export
 
+FROM ${ROCR_IMAGE} AS rocr-export
+
 FROM python-base AS miopen-builder
 
 ARG ROCM_VERSION
@@ -314,6 +379,37 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # see the script for the full investigation and how it was root-caused.
 COPY patches/miopen/ /miopen-patches/
 RUN sh /miopen-patches/conv-direct-fwd-grouped-oob.sh /miopen-src
+
+# ConvBinWinogradRxSFused (src/solver/conv_bin_winoRxS_fused.cpp) miscomputes
+# for its padding-generalized non-3x3 shapes (e.g. plain 1x1 pointwise convs)
+# -- see the patch for the full investigation and why it's scoped to spare
+# genuine 3x3 shapes, where the same kernel is verified correct.
+RUN sh /miopen-patches/winograd-fused-conv-miscompute.sh /miopen-src
+
+# ReduceCalculation's Prod (multiply) kernel seeds its accumulator with 0
+# instead of 1, so miopenReduceCalculationForward(..., PROD) always returns
+# all zeros -- a plain logic bug in arch-generic kernel source, not specific
+# to gfx8, still present unfixed as of the newest upstream tag we could find
+# (rocm-7.2.4). Kept in this repo's patch set since we build MIOpen from
+# source here anyway; see the patch for the full investigation.
+RUN sh /miopen-patches/reduce-prod-wrong-identity.sh /miopen-src
+
+# miopenReduceTensor's dynamic-reduction dispatch intermittently returns wrong
+# sums on gfx803 (confirmed via ReductionOpTest.ReduceSum_apex_matrix_large and a
+# standalone repro). The prior kernel-cache-eviction workaround
+# (reduce-kernel-cache-eviction.patch) passed every standalone repro but failed
+# ORT's real test suite, and was abandoned. A NEW narrow workaround
+# (reduce-program-bound-eviction.patch, which bounds how many distinct reduction
+# programs stay resident instead of evicting every call) is under validation and
+# opt-in here via ENABLE_REDUCE_BOUND -- NOT part of any default production
+# build until it passes the real ORT suite AND a perf benchmark. See
+# KERNEL_BUGS.md, "The ReduceSum kernel-cache mystery".
+ARG ENABLE_REDUCE_BOUND=0
+RUN if [ "$ENABLE_REDUCE_BOUND" = "1" ]; then \
+        sh /miopen-patches/reduce-program-bound-eviction.sh /miopen-src; \
+    else \
+        echo "reduce-program-bound workaround NOT applied (opt-in, gfx803 validation)"; \
+    fi
 
 # MIOpen's requirements.txt unconditionally pulls in composable_kernel and
 # rocMLIR, neither of which has ever supported gfx8 (see the top-of-file
@@ -664,6 +760,23 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
         https://github.com/microsoft/onnxruntime.git /onnxruntime
 
+# MultiHeadAttention's ROCm "Generic" pipeline (the only one available once
+# Composable Kernel is compiled out, see onnxruntime_USE_COMPOSABLE_KERNEL=OFF
+# below) refuses the plain three-tensor MHA call whenever query
+# sequence_length > 1 -- an ordinary shape, not an edge case -- because it was
+# never given the Q/K/V transpose its own GEMMs need. See the patch for the
+# full investigation; this is an ORT bug, not rocBLAS/MIOpen.
+COPY patches/onnxruntime/ /onnxruntime-patches/
+RUN sh /onnxruntime-patches/mha-basic-mode-no-viable-op.sh /onnxruntime
+
+# ROCm's generic TopK kernel picks a different winner among exactly-tied
+# candidates from run to run on identical input -- a hipCUB block-primitive
+# tie-break defect, not a gfx803-specific bug. Surfaced as beam search
+# decoding a different (but individually plausible) token sequence each run.
+# See the patch for the full investigation, including two fixes that looked
+# obvious and were rejected (one crashes, one can't safely cover this shape).
+RUN sh /onnxruntime-patches/topk-radix-tiebreak-nondeterministic.sh /onnxruntime
+
 # ORT's cmake/deps.txt fetches Eigen as a GitLab commit-archive zip and pins
 # its SHA1. Those archives aren't reproducible server-side (gitlab.com/
 # libeigen/eigen/-/issues/2744), so the hash drifts and FetchContent's
@@ -713,13 +826,31 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # copying it wholesale here would silently revert those back to stock.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 
+# Same reasoning for the patched ROCR (libhsa-runtime64 with the gfx803
+# VA-reuse defer, see the rocr-builder stage): copy only the libhsa-runtime64
+# files. `make install` in rocr-builder already repointed the
+# libhsa-runtime64.so.1 soname symlink at the new .so.1.15.0, and COPY
+# preserves that.
+COPY --from=rocr-export /opt/rocm/lib/libhsa-runtime64.so* /opt/rocm/lib/
+
 # rocm/dev-ubuntu-* doesn't register /opt/rocm/lib with the dynamic linker, so
 # libs are present on disk but unresolvable at runtime without this.
 RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libprotobuf-dev libopenblas0 libomp5 ffmpeg libsndfile1 \
+        libprotobuf-dev libopenblas0 libomp5 ffmpeg libsndfile1 locales \
     && rm -rf /var/lib/apt/lists/*
+
+# ORT's StringNormalizer op constructs a std::locale by name (e.g.
+# "en_US.UTF-8") at runtime; Ubuntu's base images ship no locale data at all,
+# so that construction throws and the op fails for every caller, not just the
+# test suite. locale-gen writes the actual locale archive; update-locale sets
+# the default so it applies without callers having to pass a locale
+# explicitly.
+RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Polaris runtime environment. These are the difference between "the card is
 # enumerated" and "the stack actually dispatches to it":

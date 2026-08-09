@@ -1,0 +1,193 @@
+MIOpen (pinned tag rocm-6.4.4): gfx803 workaround -- bound how many distinct
+dynamic-reduction programs MIOpen keeps resident on a shared Handle at once,
+to avoid miopenReduceTensor's intermittent wrong-sum bug.
+
+EXPERIMENTAL / UNDER VALIDATION -- not yet shipped. Wired into the Dockerfile
+only behind --build-arg ENABLE_REDUCE_BOUND=1 and must pass the real ORT
+ReductionOpTest suite AND a before/after perf benchmark before shipping. Revert
+the Dockerfile wiring (not this file) if it fails either gate.
+
+This is NOT a root-cause fix: the mechanism is a gfx803 GPU code-object /
+instruction-execution defect tied to accumulated distinct JIT programs (see
+KERNEL_BUGS.md "The ReduceSum kernel-cache mystery"). Proven NOT a data or
+descriptor race: AMD_SERIALIZE_KERNEL=3 and handle.Finish() are inert, a
+never-freed workspace pool is inert, the failure is stable per accumulated
+state (re-dispatch on the same handle still fails), and any added device write
+masks it. The confirmed eliminator is "few distinct reduce programs resident
+during a dispatch". This patch keeps only the most-recent-N reduce programs
+resident (LRU, Default N=2, tunable via MIOPEN_DEBUG_REDUCE_PROGRAM_BOUND; 0
+disables, sweeping N needs just one build) so repeated same-shape calls stay
+cache-hit (fast path preserved) while dispatches run in the low-accumulation
+state that is always correct. Requires handle.Finish() before eviction
+(ClearProgram can release a GPU code object a just-launched kernel may still be
+executing from) and clears every network_config that referenced an evicted
+program so no cached Kernel points into the freed code object.
+
+diff --git a/src/reducetensor.cpp b/src/reducetensor.cpp
+index abaf4d7..b17adbc 100644
+--- a/src/reducetensor.cpp
++++ b/src/reducetensor.cpp
+@@ -43,17 +43,96 @@
+ #include <ostream>
+ #include <iostream>
+ #include <sstream>
++#include <deque>
++#include <unordered_map>
++#include <vector>
+ 
+ // headers from composable kernel, to get consistent ID mapping
+ #include <../composable_kernel/composable_kernel/include/utility/data_type_enum.hpp>
+ #include <../composable_kernel/composable_kernel/include/utility/reduction_enums.hpp>
+ 
+ MIOPEN_DECLARE_ENV_VAR_BOOL(MIOPEN_DEBUG_DYNAMIC_REDUCTION);
++// tunable bound (gfx803 workaround) -- see reduce-program-bound-eviction.patch
++MIOPEN_DECLARE_ENV_VAR(MIOPEN_DEBUG_REDUCE_PROGRAM_BOUND, unsigned long long, 2);
+ 
+ #define WORKAROUND_MIOPEN_ISSUE_557 1
+ 
+ namespace miopen {
+ 
++// ---- gfx803 workaround: bound the number of distinct dynamic-reduction code
++// objects resident on a shared Handle at once. See reduce-program-bound-eviction.patch
++// and KERNEL_BUGS.md "The ReduceSum kernel-cache mystery" for why: when a single
++// Handle accumulates many different compiled reduction kernels across a session,
++// some later dispatches on gfx803 intermittently execute wrong (subset of output
++// columns). Keeping only the most-recent-N reduce programs resident makes a
++// dispatch run in the same "isolated" state that is always correct, while still
++// letting repeated same-shape calls hit the cache (no recompile, no perf cliff).
++// thread_local + keyed on &handle: ORT/PyTorch drive one Handle from one thread,
++// which is the only configuration this workaround targets; documented as a
++// limitation (multi-handle-from-multi-thread apps would need real per-Handle
++// state on the Handle object instead).
++namespace detailReduceProgramBound {
++
++struct ReduceProgramRecord
++{
++    std::string program_name;
++    std::string params;
++    std::vector<std::string> network_configs; // every config that used this program
++};
++
++thread_local std::unordered_map<const Handle*, std::deque<ReduceProgramRecord>>
++    g_reduce_recent_programs;
++
++inline void NoteReduceProgram(const Handle& handle,
++                              const std::string& program_name,
++                              const std::string& params,
++                              const std::string& network_config)
++{
++    auto& q = g_reduce_recent_programs[&handle];
++    for(auto it = q.begin(); it != q.end(); ++it)
++    {
++        if(it->program_name == program_name && it->params == params)
++        {
++            if(std::find(it->network_configs.begin(),
++                         it->network_configs.end(),
++                         network_config) == it->network_configs.end())
++                it->network_configs.push_back(network_config);
++            auto rec                         = std::move(*it);
++            q.erase(it);
++            q.push_back(std::move(rec)); // move-to-front (most-recently-used)
++            return;
++        }
++    }
++    ReduceProgramRecord rec;
++    rec.program_name     = program_name;
++    rec.params           = params;
++    rec.network_configs.push_back(network_config);
++    q.push_back(std::move(rec));
++}
++
++inline void EvictReduceProgramsBeyondBound(const Handle& handle, std::size_t bound)
++{
++    if(bound == 0)
++        return;
++    auto& q = g_reduce_recent_programs[&handle];
++    while(q.size() > bound)
++    {
++        auto old = std::move(q.front());
++        q.pop_front();
++        // ClearProgram can release the underlying GPU code object while the
++        // just-launched kernel may still be executing from it, so Finish() first
++        // (the abandoned always-evict patch shipped a use-after-release race by
++        // omitting this). ClearKernels for every config that referenced this
++        // program so no cached Kernel points into the freed code object.
++        handle.Finish();
++        for(const auto& cfg : old.network_configs)
++            handle.ClearKernels("generic_reduce_tensor", cfg);
++        handle.ClearProgram(old.program_name, old.params);
++    }
++}
++
++} // namespace detailReduceProgramBound
++
+ enum ReductionMethod_t
+ {
+     Reduce_DirectThreadWise = 1,
+@@ -1037,6 +1116,10 @@ void ReduceTensorDescriptor::ReduceTensor(const Handle& handle,
+         std::string network_config_1 = network_config + "_1_P" + std::to_string(reduceImpl) +
+                                        std::to_string(static_cast<int>(use_padding.first)) +
+                                        std::to_string(static_cast<int>(use_padding.second));
++        // REDUCE_PROGRAM_BOUND: captured before network_config_1 is reassigned for
++        // the main (reduce) kernel below -- prepare and reduce kernels share this
++        // program but carry distinct network_configs, and eviction must clear both.
++        const std::string prepare_network_config_1 = network_config_1;
+ 
+         if(nullptr == std::align(workspaceAlignRequirementBytes,
+                                  ws_sizeInBytes - workspaceAlignRequirementBytes,
+@@ -1144,6 +1227,8 @@ void ReduceTensorDescriptor::ReduceTensor(const Handle& handle,
+             std::string network_config_2 = network_config + "_2_P" + std::to_string(reduceImpl2) +
+                                            std::to_string(static_cast<int>(use_padding2.first)) +
+                                            std::to_string(static_cast<int>(use_padding2.second));
++            // REDUCE_PROGRAM_BOUND: same capture as call-1 above.
++            const std::string prepare_network_config_2 = network_config_2;
+ 
+             if(!reduceAllDims)
+             {
+@@ -1186,6 +1271,16 @@ void ReduceTensorDescriptor::ReduceTensor(const Handle& handle,
+ 
+             if(handle.IsProfilingEnabled())
+                 time_reduce += handle.GetKernelTime();
++
++            // REDUCE_PROGRAM_BOUND: register the call-2 (MultiBlock) programs.
++            // Eviction for them happens in the shared block after this.
++            if(env::value_or(MIOPEN_DEBUG_REDUCE_PROGRAM_BOUND, 0ull) > 0)
++            {
++                detailReduceProgramBound::NoteReduceProgram(
++                    handle, program_name2, param2, prepare_network_config_2);
++                detailReduceProgramBound::NoteReduceProgram(
++                    handle, program_name2, param2, network_config_2);
++            }
+         };
+ 
+         if(handle.IsProfilingEnabled())
+@@ -1193,6 +1288,29 @@ void ReduceTensorDescriptor::ReduceTensor(const Handle& handle,
+             handle.ResetKernelTime();
+             handle.AccumKernelTime(time_reduce);
+         };
++
++        // NOTE: call-2 (MultiBlock) program registration happens inside the
++        // useTwoCalls block where program_name2/param2 are in scope; the bound
++        // eviction for it runs below via any non-zero bound.
++
++        // REDUCE_PROGRAM_BOUND (gfx803 workaround): bound how many distinct
++        // dynamic-reduction programs stay resident. See the detail namespace at
++        // the top of this file and KERNEL_BUGS.md "The ReduceSum kernel-cache
++        // mystery". 0 disables; MIOPEN_DEBUG_REDUCE_PROGRAM_BOUND sets the bound.
++        const unsigned long long reduce_program_bound =
++            env::value_or(MIOPEN_DEBUG_REDUCE_PROGRAM_BOUND, 0ull);
++        if(reduce_program_bound > 0)
++        {
++            // Register this call's call-1 program+configs (prepare and main
++            // share a program but distinct configs, both must be evicted
++            // together). Call-2 was already registered inside useTwoCalls.
++            detailReduceProgramBound::NoteReduceProgram(
++                handle, program_name1, param1, prepare_network_config_1);
++            detailReduceProgramBound::NoteReduceProgram(
++                handle, program_name1, param1, network_config_1);
++            detailReduceProgramBound::EvictReduceProgramsBeyondBound(
++                handle, static_cast<std::size_t>(reduce_program_bound));
++        }
+     };
+ };
+ 

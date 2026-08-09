@@ -1,0 +1,122 @@
+diff --git a/library/src/tensile_host.cpp b/library/src/tensile_host.cpp
+index 1b1289f..38312f2 100644
+--- a/library/src/tensile_host.cpp
++++ b/library/src/tensile_host.cpp
+@@ -46,6 +46,8 @@
+ #include <Tensile/hip/HipSolutionAdapter.hpp>
+ #include <Tensile/hip/HipUtils.hpp>
+ #include <atomic>
++#include <tuple>
++#include <map>
+ #include <complex>
+ #include <exception>
+ #include <future>
+@@ -1177,7 +1179,107 @@ rocblas_status
+         }
+         else
+         {
+-            solution = library->findBestSolution(tensile_prob, *hardware, fitness_query);
++            // GFX803_SMALL_GEMM_PATCH
++            //
++            // gfx803's tuned Tensile *assembly* GEMM kernels silently
++            // miscompute when every dimension of the problem is small. They
++            // are correct from roughly 48x48x48 upwards, and correct for
++            // thin/GEMV-shaped problems as long as one dimension is large --
++            // the corruption needs all of m, n and k to be small. The failure
++            // was reproduced down to a 1x1x1 problem (one output element, one
++            // multiply), which rules out split-K, the LDS reduction and
++            // barrier ordering; the defect inside the assembly kernels has not
++            // been isolated further. rocBLAS reports rocblas_status_success
++            // either way, so callers have no way to notice.
++            //
++            // For those small problems, prefer a HIP *source* kernel (KLS)
++            // over the tuned assembly (KLA). The source kernels are correct
++            // here and are also faster at this size (0.63-0.71x the runtime at
++            // 2x2x1 and 4x4x4), so no performance is given up. Every larger
++            // problem still gets findBestSolution and the tuned assembly.
++            //
++            // Scoped to gfx803 and to all-float problems, so no other
++            // architecture or datatype changes behaviour.
++            //
++            // Also scoped to prob.strided_batch: rocBLAS's array-of-device-
++            // pointers "Batched" GEMM (rocblas_gemm_batched_ex, as opposed to
++            // gemm_strided_batched_ex or plain gemm_ex) builds this same
++            // RocblasContractionProblem with strided_batch = false. The HIP
++            // source (KLS) kernels' canSolve() says yes to those problems too
++            // -- it only validates shape, not pointer-array compatibility --
++            // but rocBLAS rejects the dispatch at runtime with
++            // rocblas_status_invalid_value. Restricting to strided_batch
++            // avoids routing into that unsupported combination; those GEMMs
++            // fall through to findBestSolution and the tuned assembly kernel
++            // exactly as before this patch existed.
++            //
++            // The chosen solution is cached per problem signature: findAll-
++            // Solutions is far too expensive to run on every small GEMM, and
++            // small GEMMs are exactly the latency-bound ones.
++            constexpr bool gfx803_all_float
++                = std::is_same<TiA, float>::value && std::is_same<TiB, float>::value
++                  && std::is_same<To, float>::value && std::is_same<Tc, float>::value;
++
++            if(gfx803_all_float && prob.strided_batch && prob.m <= 8 && prob.n <= 8
++               && prob.k <= 8 && deviceProp
++               && std::string(deviceProp->gcnArchName).rfind("gfx803", 0) == 0)
++            {
++                struct SmallGemmKey
++                {
++                    size_t m, n, k, batch_count;
++                    int    trans_a, trans_b;
++                    bool   operator<(const SmallGemmKey& o) const
++                    {
++                        return std::tie(m, n, k, batch_count, trans_a, trans_b)
++                               < std::tie(o.m, o.n, o.k, o.batch_count, o.trans_a, o.trans_b);
++                    }
++                };
++                static std::map<SmallGemmKey, std::shared_ptr<Tensile::ContractionSolution>>
++                                  small_gemm_cache;
++                static std::mutex small_gemm_mutex;
++
++                const SmallGemmKey key{prob.m,
++                                       prob.n,
++                                       prob.k,
++                                       prob.batch_count,
++                                       static_cast<int>(prob.trans_a),
++                                       static_cast<int>(prob.trans_b)};
++
++                std::lock_guard<std::mutex> guard(small_gemm_mutex);
++                auto                        cached = small_gemm_cache.find(key);
++                if(cached != small_gemm_cache.end())
++                {
++                    solution = cached->second;
++                }
++                else
++                {
++                    // Pick the *lowest-indexed* applicable source solution, not
++                    // simply the first one iteration happens to yield: the
++                    // candidate container is a std::set of shared_ptr, so its
++                    // order is by pointer value and therefore arbitrary between
++                    // runs. Picking deterministically makes the cache above
++                    // (and any future debugging) reproducible across runs.
++                    for(auto& candidate : library->findAllSolutions(tensile_prob, *hardware))
++                    {
++                        // Tensile encodes the kernel language in the solution
++                        // name: _KLS_ is the HIP source kernel, _KLA_ the
++                        // assembly one.
++                        if(candidate && candidate->name().find("_KLS_") != std::string::npos
++                           && candidate->canSolve(tensile_prob, *hardware)
++                           && (!solution || candidate->index < solution->index))
++                        {
++                            solution = candidate;
++                        }
++                    }
++                    // A null result is cached too: if no source kernel can
++                    // solve this problem there is nothing better than the
++                    // stock path, and the search must not be repeated.
++                    small_gemm_cache[key] = solution;
++                }
++            }
++
++            if(!solution)
++                solution = library->findBestSolution(tensile_prob, *hardware, fitness_query);
+         }
+ 
+         if(!solution && fallbackTensileProblem(tensile_prob))
