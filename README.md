@@ -1,97 +1,190 @@
-# gfx803 on ROCm 7.14 -- proof of concept
+# rocm-gfx803
 
-**Status: builds end-to-end and confirmed working on real gfx803
-hardware** -- `rocminfo` enumerates the card as a real `KERNEL_DISPATCH`
-agent, and rocBLAS, MIOpen, MIGraphX, and ORT's MIGraphX EP have all done
-real GPU work on it (single-shot correctness checks, not the full
-correctness-suite yet, not a sustained/performance run). See
-`MIGRATION_NOTES.md` for the detailed, as-found investigation log, and
-`rocm6.4.4/EVALUATION_ROCM_7.md` for the original pre-implementation
-feasibility read this implements.
+AMD Polaris (gfx803: RX 460/470/480/560/570/580/590 and friends) support for
+the MIGraphX + ONNX Runtime + PyTorch stack, split out from
+[`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder) into its own
+repository.
 
-This is a **third build target**, alongside `rocm6.4.4/Dockerfile` (pinned
-ROCm 6.4.4, hardware-verified, actively maintained) and the main
-repo's nightly/release lines (gfx900+). It does not replace either. ROCm 7
-rejects Polaris at HSA agent creation by default (legacy doorbell type),
-which 6.4.4 never had to work around -- this directory exists to find out
-whether patching around that, and everything downstream of it, is
-actually viable, not to commit to it as an ongoing target yet.
+## Why a separate repo
 
-## What this is
+gfx803 is unsupported upstream as of ROCm 6.0 -- AMD stopped building for it,
+and ROCm 7 rejects the card outright at HSA agent creation. Everything that
+makes gfx803 work at all is a local patch: a legacy-doorbell restore just to
+get dispatch working on ROCm 7, plus a growing set of Tensile/MIOpen/MIGraphX
+correctness patches for bugs that only manifest on this old GCN3 hardware.
+That patch set changes independently of, and faster than, the mainline
+nightly/release pipeline `rocm-migraphx-ort-builder` runs for every other
+architecture -- keeping it there meant every gfx803-specific investigation
+was noise in a repo that otherwise doesn't need any of it. This repo is
+where that investigation and patch history actually lives now.
 
-- `Dockerfile` -- multi-stage build, same shape as `rocm6.4.4/Dockerfile` but
-  with a new first stage (`rocr-clr-builder`) that rebuilds ROCR-Runtime
-  and CLR (HIP only) from source with the legacy-doorbell restore, before
-  the familiar rocBLAS/MIOpen/MIGraphX/PyTorch/ORT stages run on top of
-  the patched runtime.
-- `patches/` -- gfx803-specific source patches, grouped by project.
-  `patches/rocm-systems/` is new for this line (the doorbell/OpenCL
-  restore); the rest are re-diffed or unchanged carryovers from
-  `rocm6.4.4/patches/`, documented per-patch in `MIGRATION_NOTES.md`.
-- `tools/correctness-suite/` -- copied from `rocm6.4.4/tools/`, not yet
-  adapted or re-run against 7.14.
+The two repos stay linked in one direction: `rocm-migraphx-ort-builder`'s
+docs point here for gfx803; this repo doesn't try to track or duplicate the
+mainline build's own per-arch matrix.
 
-Everything here is a **copy, deliberately, not a shared asset**: this
-directory is a self-contained fork of the 6.4.4 line that can be worked on
-in isolation, so nothing done while chasing 7.14 can reach the
-hardware-verified 6.4.4 build. Both lines are still moving. Once gfx803 on
-7.14 is fully confirmed working, the copies get diffed and merged back --
-which is also why anything written here should stay as close as possible to
-its counterpart in the main ROCm 7 build (`docker/`, `scripts/build/`),
-not just to 6.4.4's.
+## Repository layout
 
-For on-hardware checks, `rocm6.4.4/verify.py` works against an image from this
-Dockerfile unchanged (it only asserts the MIGraphX EP is present and does
-real GPU work) -- see
-[`rocm6.4.4/README.md`](../README.md#verifying-on-hardware); only the image tag
-differs.
+```
+rocm-gfx803/
+├── Dockerfile              # ROCm 7.14 (TheRock), the primary/actively-developed line
+├── .dockerignore
+├── patches/                # gfx803 patches against the 7.14 pin
+├── tools/                  # correctness-suite, reduce-harness (copies, not shared)
+├── verify.py                # on-hardware smoke test
+├── MIGRATION_NOTES.md      # running investigation log, written as findings happen
+├── rocm6.4.4/               # the older, hardware-verified, classic-tag ROCm 6.4.4 line
+│   ├── Dockerfile
+│   ├── patches/
+│   ├── tools/
+│   ├── verify.py
+│   ├── KERNEL_BUGS.md      # the original gfx803 bug-hunting methodology and record
+│   └── wip_patches/        # rejected/superseded patch designs, kept for the record
+└── .github/workflows/      # CI, same image tags/ghcr.io paths as before the split
+```
 
-## What's confirmed
+**rocm7 (this repo's root) is the actively developed line.** ROCm 7.14 is a
+TheRock meta-release, not a classic per-repo tag -- every component
+(ROCR-Runtime, rocBLAS, MIOpen, MIGraphX, PyTorch, ONNX Runtime) is pinned by
+exact commit SHA against that release, not a stable "6.4.4"-style tag. See
+`MIGRATION_NOTES.md` for how those pins were resolved and why.
 
-- ROCm 7.14 resolves to TheRock's `therock-7.14` meta-release, not a
-  classic per-repo tag -- see `MIGRATION_NOTES.md` for how the exact
-  source commits were pinned.
-- The legacy-doorbell fix restores real dispatch, not just enumeration --
-  **now confirmed on real hardware**: `rocminfo` shows `gfx803` as a
-  `KERNEL_DISPATCH` agent, and a real `torch` matmul executed on it.
-- ROCm 7.14's LLVM still emits real gfx803 device code objects (compiled
-  and verified directly, not assumed).
-- Most carried-over rocBLAS/MIOpen patches re-diff clean against 7.14.
-  One (`conv-direct-fwd-grouped-oob`) is **blocked**: its target MIOpen
-  solver was removed upstream and replaced with a different
-  implementation whose correctness on this bug is unverified. See
-  `MIGRATION_NOTES.md`.
-- MIGraphX needed two *new* 7.14-specific patches, not zero -- both
-  genuine upstream gaps (declared-but-unstubbed functions behind
-  disabled feature flags), not gfx803-specific. See
-  `MIGRATION_NOTES.md`'s MIGraphX section.
-- PyTorch's `TensorTopK.hip` needs a build-time `-O1` override or it
-  OOM-kills the build host (~20GB RSS at `-O3`) -- see
-  `MIGRATION_NOTES.md`.
-- rocBLAS, MIOpen, MIGraphX, and ORT's MIGraphX EP have all done real
-  GPU work on the actual card (single-shot correctness checks, not the
-  full correctness-suite).
+**`rocm6.4.4/` is the older, stable line** -- classic per-repo `rocm-6.4.4`
+tags, hardware-verified over a longer period, actively maintained but not
+where new investigation happens. It's kept because it's still the only line
+with a full correctness-suite pass and extensive real-hardware mileage; the
+rocm7 line inherits its patches and methodology but does not share code with
+it -- **the two lines are deliberately independent copies**, not a shared
+asset. Both are under active development; a shared file would mean a bug
+found while chasing 7.14 could reach the hardware-verified 6.4.4 build. Once
+7.14 is confirmed at least as solid as 6.4.4 across the board, the two get
+diffed and consciously merged back together -- see "Convergence" below.
 
-## What's NOT done yet
+## Status
 
-- The correctness-suite hasn't been run or adapted for 7.14 -- broader
-  shape/op coverage than today's single-shot checks.
-- No sustained or performance run -- today's hardware validation was
-  all tiny tensors, one-shot, proving correctness of the happy path,
-  not stability under load or how it compares to the 6.4.4 line.
-- PyTorch/torchvision/torchaudio ref pins (`release/2.13` /
-  `release/0.28` / `release/2.11.0.2`) are traced to this repo's own CI
-  decision logic (`scripts/torch-package-build-decide.sh`), not an
-  independent compatibility-matrix check.
+- **rocm7**: builds end-to-end, confirmed on real gfx803 hardware --
+  `rocminfo` enumerates the card as a real `KERNEL_DISPATCH` agent, and
+  rocBLAS/MIOpen/MIGraphX/PyTorch/ORT have all done real GPU work on it. The
+  full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean.
+  ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
+  against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
+  separate real regressions from generic upstream gaps -- one confirmed
+  regression remains open (`ConvTranspose`, traced to an upstream MIGraphX
+  bug, not gfx803-specific -- see `MIGRATION_NOTES.md`). Real-model
+  validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
+  HIP-accelerated) all pass with correct transcripts on real audio.
+- **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
+  `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 
-## Next steps
+## Building
 
-1. Adapt and run `tools/correctness-suite/` against this line, expect
-   new findings distinct from the 6.4.4 line's own `KERNEL_BUGS.md` -- a
-   Tensile/MIOpen version bump can change *which* shapes are broken
-   without changing *whether* something is broken.
-2. A longer/heavier real-workload run (not just single-shot ops) to
-   check for stability under sustained dispatch, matching the class of
-   bug `rocm6.4.4/KERNEL_BUGS.md` documents for the 6.4.4 line (e.g. the
-   GSU CAS-accumulate race that only manifests under back-to-back
-   dispatch).
+Both lines build the same way -- multi-stage Dockerfile, patches applied
+per-project before each component compiles from source:
+
+```sh
+# rocm7 (this repo's root)
+docker build -t rocm-gfx803:rocm7 .
+
+# rocm6.4.4
+docker build -t rocm-gfx803:rocm6.4.4 -f rocm6.4.4/Dockerfile rocm6.4.4/
+```
+
+Every component (ROCR-Runtime/CLR, rocBLAS, MIOpen, MIGraphX, PyTorch,
+torchvision, torchaudio, ONNX Runtime) is compiled from source, every time --
+there is no prebuilt-wheel shortcut for gfx803 anywhere upstream, unlike the
+mainline repo's newer/more-common architectures, which can sometimes import
+an already-published wheel instead of recompiling. CI reflects that: no
+`ARG *_IMAGE=...`-style "pull instead of build" branch exists for gfx803.
+
+For on-hardware checks, `verify.py` (and `rocm6.4.4/verify.py`, identical in
+spirit) asserts the MIGraphX EP is present and does real GPU work -- run it
+inside a container started with `--device=/dev/kfd --device=/dev/dri
+--group-add video`.
+
+## Patches: philosophy and conventions
+
+Every patch under `patches/`/`rocm6.4.4/patches/` documents, in its own
+header, the WHY (what's broken, how it was found, hardware measurements
+where applicable) and the WHAT (the actual fix), plus a re-diff note when a
+patch was carried from one line to the other and something in the upstream
+source shifted. Read the patch header before touching the code it targets --
+the reasoning usually isn't obvious from the diff alone.
+
+**Two apply dialects, on purpose, not by accident**: `.sh` drivers under
+`patches/rocm-systems/` use `git apply` (their target, `rocm-systems`, is
+cloned as a real git repo root); everything else (`rocblas/`, `miopen/`,
+`migraphx/`, `pytorch/`) uses `patch -p1`, because those targets are
+sparse-checked-out *subdirectories* of a monorepo, and this box's git
+version silently no-ops `git apply --check` there ("Skipped patch", exit 0,
+nothing modified) instead of failing loudly. Every driver script is
+self-verifying: it greps for a marker string after applying and fails the
+build if the marker isn't there, so a patch that silently stopped applying
+can't ship unpatched code.
+
+## When a patch needs updating
+
+A gfx803 patch stops applying (or starts applying with fuzz) whenever the
+pinned upstream commit moves and the target file changed shape around it --
+that's expected, not a sign something is wrong with the patch itself. Before
+re-diffing:
+
+1. **Check whether the bug is even still there.** Re-pinning to a newer
+   upstream commit sometimes fixes the underlying issue outright (it's
+   happened before -- see `MIGRATION_NOTES.md`'s MIGraphX section, where two
+   6.4.4-era ONNX-parser patches turned out to be fully obsolete against
+   7.14, one because the fix already landed upstream, one because the whole
+   code path it patched was replaced). Grep the new source for the
+   patch's target function/struct before assuming a straight re-diff is
+   needed.
+2. **Check whether the fix is still gfx803-specific.** Some of these bugs
+   are architecture-general defects that just happen to be *exposed* by
+   gfx803's kernel/solver selection (the WGM Tensile swizzle bug, the
+   small-GEMM assembly miscompute) rather than genuine hardware quirks. If
+   re-investigating turns up a bug that would also misfire on other
+   architectures using the same code path, that's a signal to report it
+   upstream instead of (or in addition to) patching around it here -- see
+   the `rewrite_convolution.cpp`/ConvTranspose writeup in
+   `MIGRATION_NOTES.md` for a worked example of that judgment call.
+3. **Re-verify on real hardware, not just "applies clean."** A patch that
+   compiles is not a patch that's confirmed fixed -- several patches in this
+   repo's history were re-diffed successfully but flagged "not yet
+   re-verified on real hardware" until someone actually ran the repro
+   against the new binaries. Don't assume a clean apply means the original
+   bug is still handled correctly.
+
+## What needs real gfx803 hardware to validate, and what doesn't
+
+- **Needs the real card**: anything that dispatches a GPU kernel --
+  `verify.py`, `tools/correctness-suite/`, `tools/reduce-harness/`, any real
+  transcription/inference run, MIOpen's own `MIOpenDriver -V 1` verification.
+  Silent miscompute is the recurring bug class here (`rocblas_status_success`
+  returned with wrong numbers) -- CPU/emulation cannot reproduce it, and a
+  patch that only "applies clean" and "compiles" has verified nothing about
+  correctness.
+- **Doesn't need the card**: whether a Dockerfile builds at all, whether a
+  patch applies against a given pin, source-level tracing of *where* a bug
+  lives (MIOpen's own `MIOPEN_ENABLE_LOGGING_CMD`/`MIGRAPHX_TRACE_COMPILE`
+  traces and upstream source diffs found several root causes in this repo's
+  history without ever touching a GPU), and cross-arch differential testing
+  against an image for a *different* card (used repeatedly in
+  `MIGRATION_NOTES.md` to separate "this line broke it" from "upstream never
+  worked here").
+
+## Convergence
+
+Once the rocm7 line is confirmed at least as solid as `rocm6.4.4/` --
+correctness-suite clean (already true), ORT suite parity (one open item, see
+Status above), and comparable real-model results (already true) -- the two
+lines get diffed and deliberately merged: whatever's still 6.4.4-only that
+should generalize moves up, and the two independent copies collapse back
+into a shared structure. Not done yet; both lines are still receiving
+patches independently.
+
+## See also
+
+- `MIGRATION_NOTES.md` -- the detailed, as-found rocm7 investigation log.
+  Read this before assuming something is broken or fixed; it's the primary
+  source of truth for what's been checked and how.
+- `rocm6.4.4/KERNEL_BUGS.md` -- the original gfx803 bug-hunting methodology
+  and bug record for the 6.4.4 line.
+- [`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder) -- the
+  mainline (gfx900+) build this repo split off from.

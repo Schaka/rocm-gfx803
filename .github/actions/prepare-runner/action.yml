@@ -1,0 +1,82 @@
+name: Prepare build runner
+description: >-
+  Disk cleanup, swap, buildx and ghcr login -- the identical preamble every
+  build job in this repo needs before it can run a multi-hour ROCm build on a
+  hosted runner. Assumes the repository is already checked out.
+
+inputs:
+  debug:
+    description: 'Open an SSH debug session (tmate) into the runner for the duration of the job'
+    required: false
+    default: 'false'
+  swap-size-gb:
+    description: >-
+      Size of the swapfile to add, in GB. 0 skips the swapfile entirely AND lets
+      the disk-cleanup step reclaim the runner's own preinstalled swap -- for
+      jobs that only pull images and install wheels, where a swapfile is 16GB+ of
+      root-disk space spent on memory headroom nothing needs.
+    required: false
+    default: '16'
+  registry:
+    description: 'Container registry to log in to'
+    required: false
+    default: 'ghcr.io'
+  registry-username:
+    required: true
+    description: 'Registry username'
+  registry-password:
+    required: true
+    description: 'Registry password or token'
+
+runs:
+  using: composite
+  steps:
+    - name: Debug session (tmate)
+      if: inputs.debug == 'true'
+      uses: mxschmitt/action-tmate@v3
+      with:
+        detached: true
+        limit-access-to-actor: true
+
+    # A fat multi-arch image (all ROCM_ARCH targets baked into one binary) is
+    # infeasible on hosted runners: official rocm/pytorch, which bakes in only 5
+    # arches, runs ~54GB uncompressed -- past the ~14GB disk hosted runners ship
+    # with, even after cleanup. Building one image per arch instead keeps each
+    # job's disk footprint to a single arch's worth of kernel binaries.
+    #
+    # swap-storage is kept (the action removes it by default) as a
+    # memory-pressure safety net for the compile stages -- but swap is root-disk
+    # space, so a job declaring swap-size-gb: 0 (one that compiles nothing) hands
+    # it back.
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@v1.3.1
+      with:
+        tool-cache: true
+        docker-images: true
+        swap-storage: ${{ inputs.swap-size-gb == '0' }}
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+
+    # Report what's actually available before the build starts: when a build does
+    # fail on space, the log otherwise gives no baseline to compare against.
+    - name: Report free disk space
+      shell: bash
+      run: df -h / /mnt
+
+    - name: Set swap space
+      if: inputs.swap-size-gb != '0'
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: ${{ inputs.swap-size-gb }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to ${{ inputs.registry }}
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}

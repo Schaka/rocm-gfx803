@@ -1,12 +1,11 @@
-# Build context for gfx803/Dockerfile is this directory. Only patches/ is ever
-# COPYed from it; everything else here is documentation, host-side tooling, or
-# the whole separate rocm7/ build tree (which has its own context and its own
-# .dockerignore), and would otherwise be hashed and shipped to the daemon on
-# every build. Same reasoning as the repo-root .dockerignore.
+# Build context for this Dockerfile is this directory (rocm6.4.4/). Only
+# patches/ is ever COPYed from it; everything else here is documentation or
+# host-side tooling that would otherwise be hashed and shipped to the daemon
+# on every build. Same reasoning as the repo-root .dockerignore (the rocm7
+# line, which has its own context and its own .dockerignore).
 #
 # This does not affect layer caching: BuildKit keys a COPY on the checksums of
 # the files it actually copies, not on the whole context.
 *.md
 *.py
 tools/
-rocm7/

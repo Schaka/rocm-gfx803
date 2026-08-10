@@ -1,0 +1,255 @@
+name: Build gfx803 component
+
+# Reusable single-component build for gfx803. Structurally the same idea as
+# the mainline repo's build-component.yml -- each component gets its own
+# runner and its own 360-minute budget, and publishes an intermediate image
+# the next component COPYs from. No arch matrix: gfx803 is the only target
+# this file ever builds, across two build lines (rocm7 at the repo root,
+# rocm6.4.4/ the older classic-tag line). The published packages are shared
+# with the mainline repo's own pipeline -- gfx803 is just another arch tag
+# there.
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: 'Component name -- drives the package and the Dockerfile target (rocr-clr|rocr|rocblas|miopen|migraphx|pytorch|ort|final)'
+        required: true
+        type: string
+      target:
+        description: 'Dockerfile target stage to build; empty string builds the final image'
+        required: false
+        type: string
+        default: ''
+      final:
+        description: 'Tag as the published :latest-<arch>/:<date>-<arch> image instead of a :<arch> intermediate'
+        required: false
+        type: boolean
+        default: false
+      # This repo holds two build lines (root: rocm7/Dockerfile on ROCm 7.14;
+      # rocm6.4.4/Dockerfile on the classic ROCm 6.4.4 tags). They publish to
+      # the same packages, so a line MUST carry its own tag suffix or it
+      # overwrites the other line's images -- including :latest-gfx803, the
+      # one downstream consumers actually pull. Defaults are rocm7 (the main
+      # line, unsuffixed); rocm6.4.4 is called with build-dir/tag-suffix
+      # overrides below.
+      build-dir:
+        description: 'Directory holding the Dockerfile, and the build context (. | rocm6.4.4)'
+        required: false
+        type: string
+        default: '.'
+      tag-suffix:
+        description: 'Appended to every tag and to the cache ref, e.g. -rocm6.4.4. Empty for the rocm7 (main) line.'
+        required: false
+        type: string
+        default: ''
+      release-tag:
+        description: 'ROCm-release tag component for the final image, e.g. rocm7.14'
+        required: false
+        type: string
+        default: 'rocm7.14'
+      with-rocr-clr-image:
+        description: 'Pass ROCR_CLR_IMAGE so this build COPYs from the prebuilt ROCR-Runtime/CLR image'
+        required: false
+        type: boolean
+        default: false
+      with-rocr-image:
+        description: 'Pass ROCR_IMAGE so this build COPYs from the prebuilt gfx803 ROCR-Runtime (libhsa) image'
+        required: false
+        type: boolean
+        default: false
+      with-rocblas-image:
+        description: 'Pass ROCBLAS_IMAGE so this build COPYs from the prebuilt rocBLAS image'
+        required: false
+        type: boolean
+        default: false
+      with-miopen-image:
+        description: 'Pass MIOPEN_IMAGE so this build COPYs from the prebuilt MIOpen image'
+        required: false
+        type: boolean
+        default: false
+      with-migraphx-image:
+        description: 'Pass MIGRAPHX_IMAGE so this build COPYs from the prebuilt MIGraphX image'
+        required: false
+        type: boolean
+        default: false
+      with-pytorch-image:
+        description: 'Pass PYTORCH_IMAGE so this build COPYs from the prebuilt PyTorch image'
+        required: false
+        type: boolean
+        default: false
+      with-ort-image:
+        description: 'Pass ORT_IMAGE so this build COPYs from the prebuilt ORT image'
+        required: false
+        type: boolean
+        default: false
+      pytorch-ref:
+        description: 'Override PYTORCH_REF (empty uses the Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      torchvision-ref:
+        description: 'Override TORCHVISION_REF (empty uses the Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      torchaudio-ref:
+        description: 'Override TORCHAUDIO_REF (empty uses the Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      debug:
+        description: 'Open an SSH debug session (tmate) into the runner for the duration of the build'
+        required: false
+        type: boolean
+        default: false
+      no-cache:
+        description: 'Ignore cache-from and force a fully fresh build (bypasses a possibly-stale registry cache)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same disk pressure the mainline repo's builds see, and then some: a
+      # full ROCm install rather than a runtime-only one, and rocBLAS's
+      # Tensile step generates a large intermediate tree even for a single
+      # architecture (which is why the Dockerfile passes --cleanup). The
+      # non-zero swap size keeps the runner's own swap in place as a
+      # memory-pressure safety net for the compile stages.
+      - name: Prepare runner
+        uses: ./.github/actions/prepare-runner
+        with:
+          debug: ${{ inputs.debug }}
+          swap-size-gb: '16'
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute build date
+        id: date
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # Same packages the mainline (rocm-migraphx-ort-builder) repo publishes
+      # to, with gfx803 as just another arch tag -- this split kept the
+      # package names on purpose so nothing downstream had to change. rocr-clr
+      # and miopen get their own packages rather than being built inline by
+      # whatever stage happens to need them: both are needed by more than one
+      # downstream stage (ROCR/CLR by rocblas AND miopen; MIOpen by final),
+      # and a stage that isn't handed a prebuilt image recompiles it from
+      # source inside its own job -- so without these, the final job alone
+      # would compile ROCR, CLR and MIOpen on top of everything else it does,
+      # inside one 360-minute, disk-tight runner.
+      - name: Assemble tags, build-args and cache ref
+        id: meta
+        run: |
+          owner="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          pkg() {
+            case "$1" in
+              rocr-clr) echo "${owner}/rocm-rocr-clr-builder" ;;
+              rocr)     echo "${owner}/rocm-rocr-builder" ;;
+              rocblas)  echo "${owner}/rocm-rocblas-builder" ;;
+              miopen)   echo "${owner}/rocm-miopen-builder" ;;
+              migraphx) echo "${owner}/rocm-migraphx-builder" ;;
+              pytorch)  echo "${owner}/rocm-migraphx-torch-builder" ;;
+              ort)      echo "${owner}/rocm-migraphx-ort-builder" ;;
+              final)    echo "${owner}/rocm-migraphx-ort-torch-builder" ;;
+            esac
+          }
+          component="${{ inputs.component }}"
+          self="$(pkg "${component}")"
+          # Every tag this workflow reads or writes carries the suffix, so the
+          # two build lines never see each other's images -- an intermediate
+          # pulled without it would silently mix a 6.4.4 component into a 7.14
+          # build, which fails much later and very confusingly.
+          arch="gfx803${{ inputs.tag-suffix }}"
+
+          {
+            echo "build-args<<ARGS_EOF"
+            echo "ROCM_ARCH=gfx803"
+            if [ "${{ inputs.with-rocr-clr-image }}" = "true" ]; then
+              echo "ROCR_CLR_IMAGE=$(pkg rocr-clr):${arch}"
+            fi
+            if [ "${{ inputs.with-rocr-image }}" = "true" ]; then
+              echo "ROCR_IMAGE=$(pkg rocr):${arch}"
+            fi
+            if [ "${{ inputs.with-rocblas-image }}" = "true" ]; then
+              echo "ROCBLAS_IMAGE=$(pkg rocblas):${arch}"
+            fi
+            if [ "${{ inputs.with-miopen-image }}" = "true" ]; then
+              echo "MIOPEN_IMAGE=$(pkg miopen):${arch}"
+            fi
+            if [ "${{ inputs.with-migraphx-image }}" = "true" ]; then
+              echo "MIGRAPHX_IMAGE=$(pkg migraphx):${arch}"
+            fi
+            if [ "${{ inputs.with-pytorch-image }}" = "true" ]; then
+              echo "PYTORCH_IMAGE=$(pkg pytorch):${arch}"
+            fi
+            if [ "${{ inputs.with-ort-image }}" = "true" ]; then
+              echo "ORT_IMAGE=$(pkg ort):${arch}"
+            fi
+            # Empty means "leave the Dockerfile's pin alone" -- passing an
+            # empty build-arg would override the ARG default with "" and break
+            # the clone, so each is only emitted when actually set.
+            [ -n "${{ inputs.pytorch-ref }}" ] && echo "PYTORCH_REF=${{ inputs.pytorch-ref }}"
+            [ -n "${{ inputs.torchvision-ref }}" ] && echo "TORCHVISION_REF=${{ inputs.torchvision-ref }}"
+            [ -n "${{ inputs.torchaudio-ref }}" ] && echo "TORCHAUDIO_REF=${{ inputs.torchaudio-ref }}"
+            echo "ARGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.final }}" = "true" ]; then
+            {
+              echo "tags<<TAGS_EOF"
+              echo "${self}:latest-${arch}"
+              # No suffix on this one: the ROCm release already names the line
+              # (rocm6.4.4-gfx803 vs rocm7.14-gfx803), so adding it would just
+              # read as rocm7.14-gfx803-rocm7.
+              echo "${self}:${{ inputs.release-tag }}-gfx803"
+              echo "${self}:${{ steps.date.outputs.date }}-${arch}"
+              echo "TAGS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${self}:${arch}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "cache-ref=${self}:cache-${arch}" >> "$GITHUB_OUTPUT"
+
+          # final's cache is never consumed downstream (nothing builds FROM the
+          # final image), so mode=max there just re-exports every inherited
+          # layer as a cache blob for no benefit -- pure disk pressure on the
+          # runner during the export step, which is exactly where these builds
+          # have been running out of space. mode=min only exports the layers
+          # unique to this build.
+          if [ "${{ inputs.final }}" = "true" ]; then
+            echo "cache-mode=min" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache-mode=max" >> "$GITHUB_OUTPUT"
+          fi
+
+      # no-cache bypasses cache-from entirely rather than just skipping cache-to,
+      # so a bad/stale layer already sitting under cache-ref can't be reused --
+      # this run still repopulates cache-ref with a fresh result.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          # Context is the build line's own directory, not necessarily the
+          # repo root: rocm7 (build-dir '.') IS the repo root; rocm6.4.4 is
+          # self-contained under rocm6.4.4/ and COPYs only from its own
+          # patches/ (see each Dockerfile's header).
+          context: ${{ inputs.build-dir }}
+          file: ${{ inputs.build-dir }}/Dockerfile
+          push: true
+          target: ${{ inputs.target }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: ${{ steps.meta.outputs.build-args }}
+          no-cache: ${{ inputs.no-cache }}
+          cache-from: ${{ inputs.no-cache && '' || format('type=registry,ref={0}', steps.meta.outputs.cache-ref) }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache-ref }},mode=${{ steps.meta.outputs.cache-mode }}
