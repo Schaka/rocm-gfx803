@@ -136,6 +136,31 @@ approach work in this repo:
   other. Copy, don't link, until the deliberate convergence step (see
   README's "Convergence" section) is actually happening.
 
+## Component ref pinning -- branches, not commit SHAs, no nightlies
+
+Every upstream component this repo builds from source (`ROCM_SYSTEMS_REF`,
+`ROCM_LIBRARIES_REF`, `MIGRAPHX_REF`, `PYTORCH_REF`, etc. in the Dockerfile)
+is pinned to a named release *branch* -- `release/therock-7.14`,
+`release/rocm-rel-7.14`, and so on -- not a frozen commit SHA and not a
+per-run resolution of `develop`/`main`. Same convention the mainline
+(`rocm-migraphx-ort-builder`) repo's `release.yml` uses.
+
+This works only because CI here is manual-dispatch only, with no schedule --
+there's no nightly job re-running against a moving branch tip unattended. A
+branch pin means "build whatever's on that branch the day someone runs the
+workflow"; two manual runs weeks apart can legitimately land different
+commits if upstream pushed a cherry-pick to the branch in between. That's
+expected, not drift to chase down -- if a build starts failing that
+previously passed and nothing in this repo changed, check the branch's
+current tip against what the last successful build actually used before
+assuming a local regression.
+
+If you ever add a component that has no such release branch (rocBLAS/MIOpen
+before the `rocm-libraries` monorepo restructure, or a component whose
+upstream only tags releases rather than branching them), pin that one to an
+exact commit SHA instead and say so explicitly in the Dockerfile comment --
+don't default to `develop`/`main` to avoid the question.
+
 ## Hardware access
 
 Real-hardware validation requires the actual gfx803 card -- this cannot be

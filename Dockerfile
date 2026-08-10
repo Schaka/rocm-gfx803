@@ -1,18 +1,16 @@
 # syntax=docker/dockerfile:1
-# Polaris / gfx803 on ROCm 7.14 -- proof-of-concept variant, NOT a production
-# build. See gfx803/EVALUATION_ROCM_7.md for the full source-level evaluation
-# this Dockerfile implements, and this directory's README.md for current
-# status (what's verified vs. what's untested).
+# Polaris / gfx803 on ROCm 7.14 -- this repo's main line. See README.md for
+# current status (what's verified vs. what's untested) and MIGRATION_NOTES.md
+# for the full source-level evaluation this Dockerfile implements.
 #
-# Separate from gfx803/Dockerfile (the pinned ROCm 6.4.4 build) on purpose:
-# that one is the known-good, hardware-verified line and stays untouched.
-# This is a THIRD build target, not a replacement -- ROCm 7's ROCR-Runtime
-# rejects Polaris at HSA agent creation (legacy/pre-1.0 doorbell type), which
-# 6.4.4 never had to work around. Getting past that wall needs a source-level
-# ROCR-Runtime + CLR rebuild that gfx803/Dockerfile has no equivalent of.
+# Separate from rocm6.4.4/Dockerfile (the older, archived-but-still-buildable
+# ROCm 6.4.4 line) on purpose -- ROCm 7's ROCR-Runtime rejects Polaris at HSA
+# agent creation (legacy/pre-1.0 doorbell type), which 6.4.4 never had to work
+# around. Getting past that wall needs a source-level ROCR-Runtime + CLR
+# rebuild that rocm6.4.4/Dockerfile has no equivalent of.
 #
-# What still has to be rebuilt from source, and why (see EVALUATION_ROCM_7.md
-# for the full per-layer investigation):
+# What has to be rebuilt from source, and why (see MIGRATION_NOTES.md for the
+# full per-layer investigation):
 #
 #   ROCR-Runtime + CLR -- NEW for this line. ROCm 7's GpuAgent constructor
 #                throws for any HSA agent whose DoorbellType != 2; Polaris
@@ -25,13 +23,14 @@
 #                TARGET_LIST at ROCm 6.0 but the Tensile logic
 #                (Logic/asm_full/r9nano/*.yaml) is still in the tree, so
 #                `rmake.py -a gfx803` builds it back. rocBLAS moved into the
-#                ROCm/rocm-libraries monorepo since 6.4.4; this pins an exact
-#                commit within it (see ROCM_LIBRARIES_COMMIT below), not a
-#                release tag -- rocm-libraries has no per-component release
-#                tags the way the old standalone rocBLAS repo did.
+#                ROCm/rocm-libraries monorepo since 6.4.4; this tracks its
+#                release/therock-7.14 branch (see ROCM_LIBRARIES_REF below),
+#                not a per-component release tag -- rocm-libraries stopped
+#                cutting rocm-rel-X.Y tags/branches after 7.2.
 #   MIGraphX  -- prebuilt for gfx900+ only, same as the main image. Still a
-#                standalone repo (not folded into rocm-libraries); pinned to
-#                its own rocm-7.14 tag.
+#                standalone repo (not folded into rocm-libraries); tracks its
+#                release/rocm-rel-7.14 branch, same convention the main repo's
+#                release.yml uses for MIGRAPHX_REF.
 #   PyTorch   -- no gfx803 wheel has ever been published.
 #   ORT       -- v1.28.0, MIGraphX EP only, matching the main (gfx900+)
 #                build exactly -- NOT the 6.4.4 line's v1.22.2 ROCm-EP
@@ -44,7 +43,7 @@
 #                is gone from ORT's own build flags as of 1.28 regardless.
 #                Accepted cost: the CK/MLIR-fusion gap the 6.4.4 line's
 #                ROCm EP fallback existed to soften is unsoftened here.
-#                See gfx803/rocm7/MIGRATION_NOTES.md.
+#                See MIGRATION_NOTES.md.
 #   MIOpen    -- same story as 6.4.4: still lists gfx803 in
 #                ALL_GPU_DATABASES and keeps its Ellesmere/Baffin/Polaris
 #                device-name gating. Moved into rocm-libraries too.
@@ -53,7 +52,7 @@
 # hardware (see README.md "Status" for the current list):
 #
 #   - MIOpen's ConvOclDirectFwd/ConvOclDirectFwdFused solver (the one
-#     gfx803/patches/miopen/conv-direct-fwd-grouped-oob.sh targets) was
+#     rocm6.4.4/patches/miopen/conv-direct-fwd-grouped-oob.sh targets) was
 #     REMOVED from MIOpen upstream between 6.4.4 and 7.14 -- replaced by a
 #     new ConvHipDirectFwd (HIP-source, not OpenCL-source). Whether the
 #     grouped-conv out-of-bounds read this patch fixed still exists in the
@@ -72,19 +71,20 @@
 #     KERNEL_BUGS.md's methodology against 7.14 binaries.
 #
 # What is switched off, because no version of it has ever supported gfx8
-# (unchanged from 6.4.4 -- see gfx803/Dockerfile for the same reasoning):
+# (unchanged from 6.4.4 -- see rocm6.4.4/Dockerfile for the same reasoning):
 #
 #   rocMLIR, Composable Kernel, hipBLASLt.
 #
 # Build context is this directory, and everything this build needs lives under
 # it -- patches/, including its own copy of the sgemm-shim, and tools/. That
-# duplication against gfx803/ is deliberate, not an oversight: both lines are
-# still actively changing, and this one is a copy of 6.4.4 that can be worked
-# on in isolation without any edit here being able to reach the
+# duplication against rocm6.4.4/ is deliberate, not an oversight: both lines
+# are still actively changing, and this one started as a copy of 6.4.4 that
+# can be worked on in isolation without any edit here being able to reach the
 # hardware-verified 6.4.4 build. Fold the two back together once gfx803 on
-# 7.14 is fully confirmed working, not before.
+# 7.14 is fully confirmed working, not before -- see README.md's
+# "Convergence" section.
 #
-# Build: docker build -f gfx803/rocm7/Dockerfile -t <tag> gfx803/rocm7
+# Build: docker build -f Dockerfile -t <tag> .
 ARG BASE_IMAGE=rocm/dev-ubuntu-26.04:7.14.0-full
 
 ARG ROCR_CLR_IMAGE=rocr-clr-builder
@@ -94,22 +94,30 @@ ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
 ARG ORT_IMAGE=ort-builder
 
-# ROCm 7.14 no longer has per-component release tags the way the classic
-# rocBLAS/MIOpen repos did pre-monorepo -- rocm-libraries (rocBLAS, MIOpen)
-# and rocm-systems (ROCR-Runtime, CLR) are pinned by exact commit SHA instead,
-# taken from TheRock's therock-7.14 tag (the actual meta-release this ROCm
-# version number refers to -- confirmed via `git ls-remote --tags` against
-# ROCm/rocm-libraries and ROCm/ROCR-Runtime: neither has a "rocm-7.14" tag,
-# only up to rocm-7.2.4; ROCm/TheRock has therock-7.14, whose .gitmodules
-# pins these exact commits). Re-pinning to a later 7.14.x point release means
-# reading TheRock's therock-7.14 tag's submodule pins again, not just bumping
-# a version string.
-ARG ROCM_SYSTEMS_COMMIT=2b22ab0195cc1461cd9abf3b969e9dd7c10af350
-ARG ROCM_LIBRARIES_COMMIT=cd9574023093742434e8c992d13b89ab9a6c1cf8
+# Branch pins, not commit SHAs -- same policy the main (gfx900+) repo's
+# release.yml uses for MIGRAPHX_REF (release/rocm-rel-<major.minor>, "MIGraphX's
+# own stable branch for that ROCm line, not develop"): track the named
+# release's branch tip at build time, not a frozen point-in-time SHA. This
+# build is manual-dispatch only (no schedule), so "branch tip at build time"
+# means "whatever AMD has landed on release/therock-7.14 the day someone runs
+# this," not a moving nightly target -- re-running the same workflow_dispatch
+# twice can legitimately pick up new commits if AMD pushed a cherry-pick to
+# the branch since the last run, which is expected and desired, not drift to
+# chase down.
+#
+# rocm-libraries (rocBLAS, MIOpen) and rocm-systems (ROCR-Runtime, CLR)
+# stopped cutting per-component rocm-rel-X.Y tags/branches after 7.2 (confirmed
+# via `git ls-remote --heads`); ROCm/TheRock's release/therock-7.14 branch is
+# the actual release line these two repos track for 7.14, confirmed by
+# `git ls-remote --heads` against both landing on the exact same commits this
+# Dockerfile pinned by SHA before this branch-based rewrite.
+ARG ROCM_SYSTEMS_REF=release/therock-7.14
+ARG ROCM_LIBRARIES_REF=release/therock-7.14
 
-# MIGraphX stayed a standalone repo (not folded into rocm-libraries) -- it
-# does publish its own per-release tags, unlike rocBLAS/MIOpen now.
-ARG MIGRAPHX_REF=rocm-7.14
+# MIGraphX stayed a standalone repo (not folded into rocm-libraries) and still
+# cuts its own release/rocm-rel-<major.minor> branch -- same ref the main
+# repo's release.yml derives MIGRAPHX_REF from.
+ARG MIGRAPHX_REF=release/rocm-rel-7.14
 
 # ROCm's PyTorch fork. release/2.13 matches what this repo's main
 # (gfx900+) release track pins for ROCm 7.14 (see .github/workflows/
@@ -141,7 +149,7 @@ ARG TORCHAUDIO_REF=release/2.11.0.2
 # own flag set as of 1.28 regardless (see docker/ort.Dockerfile's
 # scripts/build/ort.sh). Accepted cost: MIGraphX-only on gfx803, same
 # CK/MLIR-fusion gap the 6.4.4 line's ROCm EP fallback existed to soften,
-# now unsoftened here. See gfx803/rocm7/MIGRATION_NOTES.md.
+# now unsoftened here. See MIGRATION_NOTES.md.
 ARG ORT_VERSION=v1.28.0
 
 ARG BUILD_PARALLEL_LEVEL=auto
@@ -149,7 +157,7 @@ ARG BUILD_PARALLEL_LEVEL=auto
 # Ubuntu 26.04's native python3 is 3.14 (confirmed: `rocm/dev-ubuntu-26.04:
 # 7.14.0-full` ships it), same situation the main Dockerfile's python-base
 # documents -- numpy/onnx dependency resolution needs 3.12. uv-managed 3.12
-# here, same approach as docker/python-base.Dockerfile, instead of gfx803/
+# here, same approach as docker/python-base.Dockerfile, instead of rocm6.4.4/Dockerfile
 # Dockerfile's "system python IS 3.12" assumption, which does not hold on
 # this base image.
 FROM ${BASE_IMAGE} AS python-base
@@ -182,7 +190,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 # the normal /opt/rocm paths every other stage already hardcodes.
 FROM python-base AS rocr-clr-builder
 
-ARG ROCM_SYSTEMS_COMMIT
+ARG ROCM_SYSTEMS_REF
 ARG BUILD_PARALLEL_LEVEL
 
 # CLR's README prerequisite (rocm-llvm-dev) is an apt package name from
@@ -205,16 +213,16 @@ RUN git clone --filter=blob:none --no-checkout \
     && cd /rocm-systems-src \
     && git sparse-checkout init --cone \
     && git sparse-checkout set projects/rocr-runtime projects/clr projects/hip \
-    && git checkout "${ROCM_SYSTEMS_COMMIT}"
+    && git checkout "${ROCM_SYSTEMS_REF}"
 
 COPY patches/rocm-systems/ /rocm-systems-patches/
 RUN sh /rocm-systems-patches/hsa-agent-rejects-legacy-doorbell.sh /rocm-systems-src
 RUN sh /rocm-systems-patches/opencl-gfx8-hardcoded-rejection.sh /rocm-systems-src
 
 # VA-reuse defer, re-diffed from the shipped 6.4.4 fix
-# (gfx803/patches/rocr/va-reuse-defer.patch). Confirmed still needed on
+# (rocm6.4.4/patches/rocr/va-reuse-defer.patch). Confirmed still needed on
 # 7.14 and confirmed effective via the actual 52-shape reduce-harness
-# sweep (gfx803/tools/reduce-harness/): unpatched ~10/52 fail every run
+# sweep (rocm6.4.4/tools/reduce-harness/): unpatched ~10/52 fail every run
 # (30/30 runs), patched 0/52 across 100/100 runs. See
 # patches/rocm-systems/va-reuse-defer.patch's header for the full WHY and
 # MIGRATION_NOTES.md ("va-reuse-defer: real signal from the actual
@@ -268,7 +276,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-clr-ccache \
     # string should no longer be present in the installed HSA runtime lib,
     # and rocminfo/hipcc should still run cleanly (no GPU on this build box,
     # so this only proves the tools didn't break, not that a real card
-    # enumerates -- see gfx803/rocm7/README.md for what still needs real
+    # enumerates -- see README.md for what still needs real
     # hardware).
     && echo "Verifying legacy-doorbell throw string is gone from the installed HSA runtime..." \
     && if strings /opt/rocm/lib/libhsa-runtime64.so* 2>/dev/null | grep -q "deprecated doorbell type"; then \
@@ -282,14 +290,14 @@ FROM ${ROCR_CLR_IMAGE} AS rocr-clr-export
 
 FROM python-base AS rocblas-builder
 
-ARG ROCM_LIBRARIES_COMMIT
+ARG ROCM_LIBRARIES_REF
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
 
 COPY --from=rocr-clr-export /opt/rocm /opt/rocm
 
 # libmsgpack-dev is a transitional dummy package on Ubuntu 26.04 (unlike
-# 24.04, where gfx803/Dockerfile's identical line still works) -- the real
+# 24.04, where rocm6.4.4/Dockerfile's identical line still works) -- the real
 # C++ bindings Tensile's CMake looks for (msgpackc-cxx) are in
 # libmsgpack-cxx-dev.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -317,7 +325,7 @@ RUN git clone --filter=blob:none --no-checkout \
     # of shared/tensile, and the repo-root `cmake` directory is added to match
     # it -- rocBLAS's CMakeLists reaches up into it.
     && git sparse-checkout set cmake shared projects/rocblas \
-    && git checkout "${ROCM_LIBRARIES_COMMIT}"
+    && git checkout "${ROCM_LIBRARIES_REF}"
 ENV ROCBLAS_SRC=/rocblas-src-root/projects/rocblas
 
 # WGM8 miscompute -- unchanged from 6.4.4, self-verifying (fails the build if
@@ -411,7 +419,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocblas-ccache \
 # investigation. LD_PRELOAD shim that routes the standard-algo f32
 # rocblas_sgemm/rocblas_gemm_ex path to a correctness-verified replacement
 # kernel; the ENV enabling it lives in the final stage. Byte-identical to
-# gfx803/patches/rocblas/sgemm-shim/ today, kept as its own copy so this line
+# rocm6.4.4/patches/rocblas/sgemm-shim/ today, kept as its own copy so this line
 # can change it without touching the 6.4.4 build (see the header).
 RUN mkdir -p /opt/rocm-sgemm-shim
 COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
@@ -425,7 +433,7 @@ FROM ${ROCBLAS_IMAGE} AS rocblas-export
 
 FROM python-base AS miopen-builder
 
-ARG ROCM_LIBRARIES_COMMIT
+ARG ROCM_LIBRARIES_REF
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
 
@@ -449,7 +457,7 @@ RUN git clone --filter=blob:none --no-checkout \
     && cd /miopen-src-root \
     && git sparse-checkout init --cone \
     && git sparse-checkout set projects/miopen shared \
-    && git checkout "${ROCM_LIBRARIES_COMMIT}"
+    && git checkout "${ROCM_LIBRARIES_REF}"
 ENV MIOPEN_SRC=/miopen-src-root/projects/miopen
 
 # NOT applied here: conv-direct-fwd-grouped-oob (6.4.4's grouped-conv OOB
@@ -459,7 +467,7 @@ ENV MIOPEN_SRC=/miopen-src-root/projects/miopen
 # out-of-bounds weights-buffer read exists in the new solver is unknown;
 # porting the fix without re-running the original repro against the new
 # solver on real hardware would be guessing. See this directory's README.md
-# and gfx803/EVALUATION_ROCM_7.md for the current status of this gap.
+# and MIGRATION_NOTES.md for the current status of this gap.
 COPY patches/miopen/ /miopen-patches/
 RUN sh /miopen-patches/winograd-fused-conv-miscompute.sh "${MIOPEN_SRC}"
 RUN sh /miopen-patches/reduce-prod-wrong-identity.sh "${MIOPEN_SRC}"
@@ -595,7 +603,7 @@ RUN uv venv /rbuild-venv --python 3.12 --seed \
 RUN sed -i '/composable_kernel/d; /rocMLIR/d' /migraphx-src/requirements.txt \
     && ! grep -q 'composable_kernel\|rocMLIR' /migraphx-src/requirements.txt
 
-# Same MLIR-stub reasoning as gfx803/Dockerfile: rocMLIR is stripped from
+# Same MLIR-stub reasoning as rocm6.4.4/Dockerfile: rocMLIR is stripped from
 # requirements.txt, but src/targets/gpu/mlir.cpp still #includes
 # <mlir-c/Dialect/RockEnums.h> unconditionally -- vendor the one header
 # instead of building all of rocMLIR/LLVM for it.
@@ -626,11 +634,11 @@ typedef enum RocmlirSplitKSelectionLikelihood RocmlirSplitKSelectionLikelihood;
 EOF
 
 # NOT re-verified against 7.14's actual src/targets/gpu/{mlir,jit/mlir}.cpp
-# whether the same MIGRAPHX_MLIR-stub-function gap gfx803/Dockerfile's
+# whether the same MIGRAPHX_MLIR-stub-function gap rocm6.4.4/Dockerfile's
 # migraphx-builder stage documents (missing is_module_fusible/dump_mlir_to_*
 # definitions in the #else branch) still exists on this MIGRAPHX_REF. If the
 # build below fails at the python-import step with an undefined-symbol error
-# for one of those three, apply the same sed fix gfx803/Dockerfile uses.
+# for one of those three, apply the same sed fix rocm6.4.4/Dockerfile uses.
 
 WORKDIR /migraphx-src
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-migraphx-ccache \
@@ -804,7 +812,7 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
         https://github.com/microsoft/onnxruntime.git /onnxruntime
 
-# gfx803/Dockerfile's two ORT patches (mha-basic-mode-no-viable-op,
+# rocm6.4.4/Dockerfile's two ORT patches (mha-basic-mode-no-viable-op,
 # topk-radix-tiebreak-nondeterministic) are NOT carried over here: both
 # patch ROCm-EP-only source (contrib_ops/rocm/bert/... and
 # core/providers/cuda/math/topk_impl.cuh, the latter shared/hipified into
@@ -849,7 +857,7 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # chains from rocr-clr-export, not from rocblas-export/migraphx-export, so its
 # own /opt/rocm never received the gfx803 rocBLAS or the from-source MIGraphX --
 # copying it wholesale here would silently revert both back to stock. Same
-# reasoning as gfx803/Dockerfile's final stage; the glob is looser only because
+# reasoning as rocm6.4.4/Dockerfile's final stage; the glob is looser only because
 # this base image's MIOpen SOVERSION filename isn't fixed the way 6.4.4's
 # libMIOpen.so.1.0.<suffix> was.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
@@ -877,7 +885,7 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-# Same Polaris runtime environment as gfx803/Dockerfile -- unchanged
+# Same Polaris runtime environment as rocm6.4.4/Dockerfile -- unchanged
 # reasoning, see that file's comment block for HSA_OVERRIDE_GFX_VERSION /
 # ROC_ENABLE_PRE_VEGA / TORCH_BLAS_PREFER_HIPBLASLT.
 ENV HSA_OVERRIDE_GFX_VERSION=8.0.3

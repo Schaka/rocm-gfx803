@@ -43,10 +43,15 @@ rocm-gfx803/
 ```
 
 **rocm7 (this repo's root) is the actively developed line.** ROCm 7.14 is a
-TheRock meta-release, not a classic per-repo tag -- every component
-(ROCR-Runtime, rocBLAS, MIOpen, MIGraphX, PyTorch, ONNX Runtime) is pinned by
-exact commit SHA against that release, not a stable "6.4.4"-style tag. See
-`MIGRATION_NOTES.md` for how those pins were resolved and why.
+TheRock meta-release, not a classic per-repo tag -- every component is pinned
+to a release *branch*, not a frozen commit: ROCR-Runtime, rocBLAS and MIOpen
+(now the `rocm-systems`/`rocm-libraries` monorepos) track
+`release/therock-7.14`, MIGraphX tracks `release/rocm-rel-7.14`, same
+`release/rocm-rel-<major.minor>` convention this repo's mainline
+(`rocm-migraphx-ort-builder`) uses for its own manual releases -- no nightly
+scheduling, no prebuilt wheels, just "build from the named release branch's
+current tip when someone runs it." See `MIGRATION_NOTES.md` for how those refs
+were resolved and why.
 
 **`rocm6.4.4/` is the older, stable line** -- classic per-repo `rocm-6.4.4`
 tags, hardware-verified over a longer period, actively maintained but not
