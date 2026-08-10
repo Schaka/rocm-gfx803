@@ -11,14 +11,34 @@ name: Build gfx803 (rocm6.4.4, archived line)
 # and buildable, but only gets re-run when a pin needs updating or something
 # needs re-verifying, not as ongoing development.
 #
-# Chain: rocr -> rocblas -> {migraphx, pytorch} -> ort -> final. rocr (patched
-# libhsa with the gfx803 VA-reuse defer) is consumed only by the final
-# assembly; the component builders compile fine against the base image's
-# stock ROCR headers. rocBLAS has to come before MIGraphX/PyTorch because
-# both link it and both need the gfx803 rebuild rather than the base image's
-# gfx900+ copy. MIGraphX and PyTorch are independent of each other and run
-# in parallel; ORT builds against MIGraphX's /opt/rocm; the final job
-# assembles everything.
+# Chain: {rocr, rocblas, miopen} -> {migraphx, pytorch} -> ort -> final. rocr
+# (patched libhsa with the gfx803 VA-reuse defer) and miopen are consumed only
+# by the final assembly -- confirmed via rocm6.4.4/Dockerfile's own
+# `COPY --from=`: miopen-builder and rocr-builder both build straight off the
+# base image with no COPY --from at all, so neither gates anything except
+# final. rocBLAS has to come before MIGraphX/PyTorch because both link it and
+# both need the gfx803 rebuild rather than the base image's gfx900+ copy.
+# MIGraphX and PyTorch are independent of each other and run in parallel; ORT
+# builds against MIGraphX's /opt/rocm; the final job assembles everything.
+#
+# `miopen` was missing from this file until it was ported over from a
+# pre-split bug in the original single-repo gfx803.yml: without a dedicated
+# job + with-miopen-image on final, final's own build silently compiled
+# MIOpen from source inline, uncached, inside the one 360-minute final job --
+# exactly what gfx803-component.yml's per-component split exists to avoid.
+#
+# Every `needs.X.result == 'skipped'` check below is scoped to
+# `&& !inputs.build-X` -- a skip only counts as "safe to proceed, reuse the
+# last published image" when it's the user's own unchecked input. Without
+# that guard, a job that gets skipped because ITS OWN upstream dependency
+# failed (also reported as result == 'skipped', not 'failure', by GitHub
+# Actions) would be indistinguishable from a deliberate skip, and every
+# downstream gate would wrongly treat a real failure as "fine, continue" --
+# building on top of an image that was never actually rebuilt or never
+# existed. A real failure now propagates as false all the way to final,
+# so final either doesn't run or the workflow run's overall conclusion is
+# still failure, rather than silently assembling a final image on top of a
+# missing/stale component.
 #
 # Publishes under a -rocm6.4.4 tag suffix (:latest-gfx803-rocm6.4.4 etc) --
 # rocm7 owns the unsuffixed :latest-gfx803/:gfx803 tags now that it's this
@@ -35,6 +55,11 @@ on:
         default: true
       build-rocblas:
         description: 'Build rocBLAS for gfx803 (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-miopen:
+        description: 'Build MIOpen for gfx803 (uncheck to reuse the last published one)'
         type: boolean
         required: false
         default: true
@@ -109,13 +134,25 @@ jobs:
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
-  # `needs` + a skipped dependency: GitHub reports result == 'skipped', not
-  # 'success', so every downstream gate has to accept both -- otherwise
-  # unchecking build-rocblas would cascade into skipping the whole pipeline
-  # instead of reusing the published rocBLAS image.
+  miopen:
+    if: ${{ inputs.build-miopen }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: miopen
+      target: miopen-builder
+      build-dir: rocm6.4.4
+      tag-suffix: -rocm6.4.4
+      release-tag: rocm6.4.4
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
   migraphx:
     needs: rocblas
-    if: ${{ !cancelled() && inputs.build-migraphx && (needs.rocblas.result == 'success' || needs.rocblas.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-migraphx && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
     permissions:
       contents: read
       packages: write
@@ -133,7 +170,7 @@ jobs:
 
   pytorch:
     needs: rocblas
-    if: ${{ !cancelled() && inputs.build-pytorch && (needs.rocblas.result == 'success' || needs.rocblas.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-pytorch && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
     permissions:
       contents: read
       packages: write
@@ -154,7 +191,7 @@ jobs:
 
   ort:
     needs: migraphx
-    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || needs.migraphx.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
     permissions:
       contents: read
       packages: write
@@ -171,12 +208,13 @@ jobs:
       no-cache: ${{ inputs.no-cache }}
 
   final:
-    needs: [rocr, migraphx, pytorch, ort]
+    needs: [rocr, miopen, migraphx, pytorch, ort]
     if: ${{ !cancelled()
-      && (needs.rocr.result == 'success' || needs.rocr.result == 'skipped')
-      && (needs.migraphx.result == 'success' || needs.migraphx.result == 'skipped')
-      && (needs.pytorch.result == 'success' || needs.pytorch.result == 'skipped')
-      && (needs.ort.result == 'success' || needs.ort.result == 'skipped') }}
+      && (needs.rocr.result == 'success' || (needs.rocr.result == 'skipped' && !inputs.build-rocr))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
+      && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
+      && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort)) }}
     permissions:
       contents: read
       packages: write
@@ -189,6 +227,7 @@ jobs:
       tag-suffix: -rocm6.4.4
       release-tag: rocm6.4.4
       with-rocr-image: true
+      with-miopen-image: true
       with-migraphx-image: true
       with-pytorch-image: true
       with-ort-image: true

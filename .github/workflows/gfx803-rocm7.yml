@@ -94,13 +94,20 @@ jobs:
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
-  # `needs` + a skipped dependency: GitHub reports result == 'skipped', not
-  # 'success', so every downstream gate has to accept both -- otherwise
-  # unchecking build-rocr-clr would cascade into skipping the whole
-  # pipeline instead of reusing the published image.
+  # `needs` + a skipped dependency: GitHub reports result == 'skipped' both
+  # when a job's own `if` was false because the user unchecked its input, AND
+  # when it was false because an upstream dependency failed -- the two are
+  # indistinguishable from `result` alone. Every gate below is written
+  # `success || (skipped && !inputs.build-X)` specifically to keep those
+  # apart: a skip only counts as "safe to proceed, reuse the last published
+  # image" when it's the user's own unchecked input for THAT job. Without the
+  # `!inputs.build-X` guard, a real upstream failure reports as 'skipped' too,
+  # and every downstream gate would wrongly wave it through as if the user
+  # had deliberately opted out -- building on top of an image that was never
+  # actually rebuilt.
   rocblas:
     needs: rocr-clr
-    if: ${{ !cancelled() && inputs.build-rocblas && (needs.rocr-clr.result == 'success' || needs.rocr-clr.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-rocblas && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
     permissions:
       contents: read
       packages: write
@@ -115,7 +122,7 @@ jobs:
 
   miopen:
     needs: rocr-clr
-    if: ${{ !cancelled() && inputs.build-miopen && (needs.rocr-clr.result == 'success' || needs.rocr-clr.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-miopen && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
     permissions:
       contents: read
       packages: write
@@ -130,7 +137,7 @@ jobs:
 
   migraphx:
     needs: rocblas
-    if: ${{ !cancelled() && inputs.build-migraphx && (needs.rocblas.result == 'success' || needs.rocblas.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-migraphx && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
     permissions:
       contents: read
       packages: write
@@ -145,7 +152,7 @@ jobs:
 
   pytorch:
     needs: migraphx
-    if: ${{ !cancelled() && inputs.build-pytorch && (needs.migraphx.result == 'success' || needs.migraphx.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-pytorch && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
     permissions:
       contents: read
       packages: write
@@ -163,7 +170,7 @@ jobs:
 
   ort:
     needs: migraphx
-    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || needs.migraphx.result == 'skipped') }}
+    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
     permissions:
       contents: read
       packages: write
@@ -179,10 +186,10 @@ jobs:
   final:
     needs: [migraphx, miopen, pytorch, ort]
     if: ${{ !cancelled()
-      && (needs.migraphx.result == 'success' || needs.migraphx.result == 'skipped')
-      && (needs.miopen.result == 'success' || needs.miopen.result == 'skipped')
-      && (needs.pytorch.result == 'success' || needs.pytorch.result == 'skipped')
-      && (needs.ort.result == 'success' || needs.ort.result == 'skipped') }}
+      && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
+      && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort)) }}
     permissions:
       contents: read
       packages: write
