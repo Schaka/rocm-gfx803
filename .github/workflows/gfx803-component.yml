@@ -13,7 +13,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: 'Component name -- drives the package and the Dockerfile target (rocr-clr|rocr|rocblas|miopen|migraphx|pytorch|ort|final)'
+        description: 'Component name -- drives the package and the Dockerfile target (rocr-clr|rocr|rocblas|miopen|migraphx|pytorch|torchvision|torchaudio|ort|final)'
         required: true
         type: string
       target:
@@ -75,6 +75,16 @@ on:
         default: false
       with-pytorch-image:
         description: 'Pass PYTORCH_IMAGE so this build COPYs from the prebuilt PyTorch image'
+        required: false
+        type: boolean
+        default: false
+      with-torchvision-image:
+        description: 'Pass TORCHVISION_IMAGE so this build COPYs from the prebuilt torchvision image'
+        required: false
+        type: boolean
+        default: false
+      with-torchaudio-image:
+        description: 'Pass TORCHAUDIO_IMAGE so this build COPYs from the prebuilt torchaudio image'
         required: false
         type: boolean
         default: false
@@ -165,6 +175,8 @@ jobs:
               miopen)   echo "${owner}/rocm-miopen-builder" ;;
               migraphx) echo "${owner}/rocm-migraphx-builder" ;;
               pytorch)  echo "${owner}/rocm-migraphx-torch-builder" ;;
+              torchvision) echo "${owner}/rocm-torchvision-builder" ;;
+              torchaudio)  echo "${owner}/rocm-torchaudio-builder" ;;
               ort)      echo "${owner}/rocm-migraphx-ort-builder" ;;
               final)    echo "${owner}/rocm-migraphx-ort-torch-builder" ;;
             esac
@@ -197,6 +209,12 @@ jobs:
             fi
             if [ "${{ inputs.with-pytorch-image }}" = "true" ]; then
               echo "PYTORCH_IMAGE=$(pkg pytorch):${arch}"
+            fi
+            if [ "${{ inputs.with-torchvision-image }}" = "true" ]; then
+              echo "TORCHVISION_IMAGE=$(pkg torchvision):${arch}"
+            fi
+            if [ "${{ inputs.with-torchaudio-image }}" = "true" ]; then
+              echo "TORCHAUDIO_IMAGE=$(pkg torchaudio):${arch}"
             fi
             if [ "${{ inputs.with-ort-image }}" = "true" ]; then
               echo "ORT_IMAGE=$(pkg ort):${arch}"

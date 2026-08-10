@@ -92,6 +92,8 @@ ARG ROCBLAS_IMAGE=rocblas-builder
 ARG MIOPEN_IMAGE=miopen-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
+ARG TORCHVISION_IMAGE=torchvision-builder
+ARG TORCHAUDIO_IMAGE=torchaudio-builder
 ARG ORT_IMAGE=ort-builder
 
 # Branch pins, not commit SHAs -- same policy the main (gfx900+) repo's
@@ -722,8 +724,6 @@ FROM python-base AS pytorch-builder
 
 ARG ROCM_ARCH=gfx803
 ARG PYTORCH_REF
-ARG TORCHVISION_REF
-ARG TORCHAUDIO_REF
 ARG BUILD_PARALLEL_LEVEL
 
 COPY --from=rocblas-export /opt/rocm /opt/rocm
@@ -731,8 +731,6 @@ COPY --from=rocblas-export /opt/rocm /opt/rocm
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
         libopenblas-dev libdrm-dev libomp-dev \
-        ffmpeg libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
-        libsndfile1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # --python 3.12: base image's system python3 is 3.14 (Ubuntu 26.04); the
@@ -770,6 +768,24 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
 RUN pip install --no-cache-dir dist/torch*.whl \
     && mkdir -p /wheels && cp dist/torch*.whl /wheels/
 
+FROM ${PYTORCH_IMAGE} AS pytorch-export
+
+# Own image/CI job rather than folded into pytorch-builder: each of MIGraphX,
+# PyTorch, torchvision and torchaudio gets its own runner and its own
+# 360-minute budget in gfx803-rocm7.yml, same reasoning the mainline repo's
+# docker/torchvision.Dockerfile split gives (one monolithic build overran a
+# hosted runner's time budget). No prebuilt-wheel tier here, unlike the
+# mainline Dockerfile -- gfx803 has never had one published for torch or its
+# companions, so this always takes the from-source path.
+FROM ${PYTORCH_IMAGE} AS torchvision-builder
+
+ARG ROCM_ARCH=gfx803
+ARG TORCHVISION_REF
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libjpeg-dev libpng-dev libfreetype6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN git clone --recursive --branch "${TORCHVISION_REF}" --depth 1 --shallow-submodules \
         https://github.com/pytorch/vision.git /vision
 WORKDIR /vision
@@ -777,13 +793,24 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-vision-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 \
         python3 setup.py bdist_wheel \
-    && pip install --no-cache-dir dist/torchvision-*.whl \
-    && cp dist/torchvision-*.whl /wheels/
+    && mkdir -p /wheels && cp dist/torchvision-*.whl /wheels/
+
+FROM ${TORCHVISION_IMAGE} AS torchvision-export
 
 # ROCm/audio, not upstream pytorch/audio -- matches
 # scripts/torch-package-build-decide.sh's determine_torchaudio_repo_branch
 # exactly (torchvision stays on upstream pytorch/vision; only audio has a
 # ROCm-specific fork in this repo's own build logic).
+FROM ${PYTORCH_IMAGE} AS torchaudio-builder
+
+ARG ROCM_ARCH=gfx803
+ARG TORCHAUDIO_REF
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+        libsndfile1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN git clone --recursive --branch "${TORCHAUDIO_REF}" --depth 1 --shallow-submodules \
         https://github.com/ROCm/audio.git /audio
 WORKDIR /audio
@@ -791,9 +818,9 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-audio-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 USE_FFMPEG=1 \
         python3 setup.py bdist_wheel \
-    && cp dist/torchaudio*.whl /wheels/
+    && mkdir -p /wheels && cp dist/torchaudio*.whl /wheels/
 
-FROM ${PYTORCH_IMAGE} AS pytorch-export
+FROM ${TORCHAUDIO_IMAGE} AS torchaudio-export
 
 FROM python-base AS ort-builder
 
@@ -923,6 +950,8 @@ RUN uv venv $VIRTUAL_ENV --python 3.12 --seed
 
 COPY --from=ort-export /onnxruntime/dist/*.whl /tmp/ort/
 COPY --from=pytorch-export /wheels/*.whl /tmp/torch/
+COPY --from=torchvision-export /wheels/*.whl /tmp/torch/
+COPY --from=torchaudio-export /wheels/*.whl /tmp/torch/
 RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torch/*.whl \
     && rm -rf /tmp/ort /tmp/torch \
     && "$VIRTUAL_ENV/bin/python3" -c "import onnxruntime as ort; p=ort.get_available_providers(); print('ORT providers:', p); assert 'MIGraphXExecutionProvider' in p" \

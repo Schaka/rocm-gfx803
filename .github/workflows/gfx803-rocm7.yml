@@ -7,17 +7,21 @@ name: Build gfx803 (rocm7, main)
 # byte-identical inputs and republish the same image. Run it when a pin
 # changes, or when something needs re-verifying on hardware.
 #
-# Chain: rocr-clr -> {rocblas, miopen} -> migraphx -> {pytorch, ort} -> final.
-# rocr-clr (patched ROCR-Runtime/CLR: legacy-doorbell restore, VA-reuse
-# defer) is needed by both rocblas and miopen, which both build from it in
-# parallel. migraphx needs BOTH rocblas and miopen -- it links rocBLAS, and
-# it's configured with -DMIGRAPHX_USE_MIOPEN=On and genuinely links
-# libMIOpen.so too, not just a runtime dlopen, so it has to build against the
-# gfx803-patched MIOpen from the start rather than the base image's stock one
-# with the patch spliced in only at final. pytorch and ort both build from
-# migraphx's /opt/rocm (not rocblas/miopen directly), and are independent of
-# each other, so they run in parallel. final assembles migraphx + miopen +
-# pytorch + ort.
+# Chain: rocr-clr -> {rocblas, miopen} -> migraphx -> {pytorch, ort} ->
+# {torchvision, torchaudio} -> final. rocr-clr (patched ROCR-Runtime/CLR:
+# legacy-doorbell restore, VA-reuse defer) is needed by both rocblas and
+# miopen, which both build from it in parallel. migraphx needs BOTH rocblas
+# and miopen -- it links rocBLAS, and it's configured with
+# -DMIGRAPHX_USE_MIOPEN=On and genuinely links libMIOpen.so too, not just a
+# runtime dlopen, so it has to build against the gfx803-patched MIOpen from
+# the start rather than the base image's stock one with the patch spliced in
+# only at final. pytorch and ort both build from migraphx's /opt/rocm (not
+# rocblas/miopen directly), and are independent of each other, so they run in
+# parallel. torchvision and torchaudio each build from the pytorch wheel, in
+# their own job/image, same reasoning as the mainline repo's per-component
+# split -- no prebuilt wheel exists for gfx803 on either, so both always take
+# the from-source path. final assembles migraphx + miopen + pytorch +
+# torchvision + torchaudio + ort.
 #
 # This produces the *unsuffixed* :latest-gfx803/:gfx803/:cache-gfx803 tags --
 # rocm7 is this repo's main line. rocm6.4.4 (the older, still-maintained-
@@ -52,7 +56,17 @@ on:
         required: false
         default: true
       build-pytorch:
-        description: 'Build PyTorch + torchvision + torchaudio'
+        description: 'Build PyTorch (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-torchvision:
+        description: 'Build torchvision (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-torchaudio:
+        description: 'Build torchaudio (uncheck to reuse the last published one)'
         type: boolean
         required: false
         default: true
@@ -173,11 +187,46 @@ jobs:
       target: pytorch-builder
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
-      torchvision-ref: ${{ inputs.torchvision-ref }}
-      torchaudio-ref: ${{ inputs.torchaudio-ref }}
       # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
       # RSS -- real headroom for that spike, not a source-level workaround.
       swap-size-gb: '24'
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  # torchvision and torchaudio each get their own job/image rather than
+  # building inside pytorch's, same as the mainline repo's per-component
+  # split -- both build from source against the PyTorch wheel above; no
+  # prebuilt wheel exists for gfx803 on either, so there is no tier to pick
+  # between.
+  torchvision:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchvision && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: torchvision
+      target: torchvision-builder
+      with-pytorch-image: true
+      torchvision-ref: ${{ inputs.torchvision-ref }}
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  torchaudio:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchaudio && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: torchaudio
+      target: torchaudio-builder
+      with-pytorch-image: true
+      torchaudio-ref: ${{ inputs.torchaudio-ref }}
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
@@ -197,11 +246,13 @@ jobs:
       no-cache: ${{ inputs.no-cache }}
 
   final:
-    needs: [migraphx, miopen, pytorch, ort]
+    needs: [migraphx, miopen, pytorch, torchvision, torchaudio, ort]
     if: ${{ !cancelled()
       && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
       && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
       && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
+      && (needs.torchvision.result == 'success' || (needs.torchvision.result == 'skipped' && !inputs.build-torchvision))
+      && (needs.torchaudio.result == 'success' || (needs.torchaudio.result == 'skipped' && !inputs.build-torchaudio))
       && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort)) }}
     permissions:
       contents: read
@@ -214,6 +265,8 @@ jobs:
       with-migraphx-image: true
       with-miopen-image: true
       with-pytorch-image: true
+      with-torchvision-image: true
+      with-torchaudio-image: true
       with-ort-image: true
       release-tag: rocm7.14
       debug: ${{ inputs.debug }}
