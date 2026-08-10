@@ -173,11 +173,26 @@ RUN cmake -S /rocr-src -B /rocr-src/build -G Ninja \
     && cmake --install /rocr-src/build \
     && rm -rf /rocr-src/build
 
+# Indirection alias (BuildKit rejects a variable in COPY --from, so resolve the
+# ARG through a FROM with a static name first). Moved ahead of rocblas-builder/
+# miopen-builder (rather than sitting after them, where it originally was)
+# so both can build against the patched runtime from the start instead of
+# linking against the base image's stock one and having the patch spliced
+# into /opt/rocm/lib only at the final assembly step -- the two aren't
+# guaranteed equivalent just because today's specific patches (va-reuse-defer)
+# happen to touch only runtime scheduling logic, not the ABI. Nothing here
+# is ever run against anything but the final assembled /opt/rocm, so the
+# build environment should match it from the start, not assume a same-SONAME
+# swap-in is safe without ever actually building against it.
+FROM ${ROCR_IMAGE} AS rocr-export
+
 FROM python-base AS rocblas-builder
 
 ARG ROCM_VERSION
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
+
+COPY --from=rocr-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config gfortran ccache \
@@ -356,13 +371,17 @@ RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
 # ARG through a FROM with a static name first).
 FROM ${ROCBLAS_IMAGE} AS rocblas-export
 
-FROM ${ROCR_IMAGE} AS rocr-export
-
 FROM python-base AS miopen-builder
 
 ARG ROCM_VERSION
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
+
+# Same reasoning as rocblas-builder above: build against the patched runtime
+# from the start (rocr-export is defined earlier in this file, right after
+# rocr-builder) rather than linking against the base image's stock one and
+# relying on a same-SONAME splice-in at final to make it equivalent.
+COPY --from=rocr-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -498,6 +517,16 @@ ARG BUILD_PARALLEL_LEVEL
 # it -- MIGraphX links rocBLAS, so it has to see the rebuilt one, not the
 # gfx900+ stock copy.
 COPY --from=rocblas-export /opt/rocm /opt/rocm
+
+# MIGraphX is configured with -DMIGRAPHX_USE_MIOPEN=On below and genuinely
+# links against libMIOpen.so at build time, not just a runtime dlopen -- so
+# it has to build against the gfx803-patched one from the start, same
+# reasoning as the rocBLAS copy above. Only the .so, not the whole /opt/rocm:
+# miopen-export builds straight off the base image (no COPY --from= at all),
+# so copying its /opt/rocm wholesale here would silently revert the gfx803
+# rocBLAS build the line above just installed. Same glob as the final
+# stage's own copy of this file.
+COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -824,6 +853,13 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # is an independent stage (doesn't chain from rocblas-export/migraphx-export),
 # so its own /opt/rocm never received the gfx803 rocBLAS/MIGraphX builds --
 # copying it wholesale here would silently revert those back to stock.
+#
+# migraphx-builder already copies this same file in before building itself
+# (see that stage), so what's sitting in /opt/rocm after the migraphx-export
+# copy above should already match -- this explicit copy is kept as the
+# independently-controllable, authoritative source (final takes its own
+# MIOPEN_IMAGE/with-miopen-image input), not as the only place this file
+# reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 
 # Same reasoning for the patched ROCR (libhsa-runtime64 with the gfx803
@@ -831,6 +867,13 @@ COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 # files. `make install` in rocr-builder already repointed the
 # libhsa-runtime64.so.1 soname symlink at the new .so.1.15.0, and COPY
 # preserves that.
+#
+# rocblas-builder and miopen-builder both already build against rocr-export
+# from the start now, so this file should already match what's sitting in
+# /opt/rocm after the migraphx-export copy above -- this explicit copy is
+# kept anyway as the independently-controllable, authoritative source (final
+# takes its own ROCR_IMAGE/with-rocr-image input), not as the only place the
+# patch reaches this image.
 COPY --from=rocr-export /opt/rocm/lib/libhsa-runtime64.so* /opt/rocm/lib/
 
 # rocm/dev-ubuntu-* doesn't register /opt/rocm/lib with the dynamic linker, so

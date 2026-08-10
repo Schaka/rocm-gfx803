@@ -10,8 +10,12 @@ name: Build gfx803 (rocm7, main)
 # Chain: rocr-clr -> {rocblas, miopen} -> migraphx -> {pytorch, ort} -> final.
 # rocr-clr (patched ROCR-Runtime/CLR: legacy-doorbell restore, VA-reuse
 # defer) is needed by both rocblas and miopen, which both build from it in
-# parallel. migraphx needs rocblas (links it). pytorch and ort both build
-# from migraphx's /opt/rocm (not rocblas directly), and are independent of
+# parallel. migraphx needs BOTH rocblas and miopen -- it links rocBLAS, and
+# it's configured with -DMIGRAPHX_USE_MIOPEN=On and genuinely links
+# libMIOpen.so too, not just a runtime dlopen, so it has to build against the
+# gfx803-patched MIOpen from the start rather than the base image's stock one
+# with the patch spliced in only at final. pytorch and ort both build from
+# migraphx's /opt/rocm (not rocblas/miopen directly), and are independent of
 # each other, so they run in parallel. final assembles migraphx + miopen +
 # pytorch + ort.
 #
@@ -135,9 +139,14 @@ jobs:
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
+  # migraphx builds with -DMIGRAPHX_USE_MIOPEN=On and genuinely links against
+  # libMIOpen.so, not just a runtime dlopen -- so it needs the gfx803-patched
+  # MIOpen image at build time too, same reasoning as its rocblas dependency.
   migraphx:
-    needs: rocblas
-    if: ${{ !cancelled() && inputs.build-migraphx && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
+    needs: [rocblas, miopen]
+    if: ${{ !cancelled() && inputs.build-migraphx
+      && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen)) }}
     permissions:
       contents: read
       packages: write
@@ -147,6 +156,7 @@ jobs:
       component: migraphx
       target: migraphx-builder
       with-rocblas-image: true
+      with-miopen-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 

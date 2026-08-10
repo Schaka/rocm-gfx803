@@ -552,6 +552,18 @@ ARG BUILD_PARALLEL_LEVEL
 
 COPY --from=rocblas-export /opt/rocm /opt/rocm
 
+# MIGraphX is configured with -DMIGRAPHX_USE_MIOPEN=On below and genuinely
+# links against libMIOpen.so at build time -- not just a runtime dlopen --
+# so it has to build against the gfx803-patched one from the start, same
+# reasoning as rocblas-builder/miopen-builder building against rocr-clr-export
+# instead of the base image's stock runtime. Only the .so, not the whole
+# /opt/rocm: miopen-export chains from rocr-clr-export directly (not from
+# rocblas-export), so copying its /opt/rocm wholesale here would silently
+# revert the gfx803 rocBLAS build the line above just installed. Same glob as
+# the final stage's own copy of this file, for the same base-image-SOVERSION
+# reason.
+COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
         python3-pybind11 \
@@ -860,6 +872,13 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # reasoning as rocm6.4.4/Dockerfile's final stage; the glob is looser only because
 # this base image's MIOpen SOVERSION filename isn't fixed the way 6.4.4's
 # libMIOpen.so.1.0.<suffix> was.
+#
+# migraphx-builder already copies this same file in before building itself
+# (see that stage), so what's sitting in /opt/rocm after the migraphx-export
+# copy above should already match -- this explicit copy is kept as the
+# independently-controllable, authoritative source (final takes its own
+# MIOPEN_IMAGE/with-miopen-image input), not as the only place this file
+# reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 
 RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
