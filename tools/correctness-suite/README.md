@@ -5,7 +5,7 @@ Each sweep exercises one MIOpen op API directly with synthetic random inputs,
 computes a host CPU reference, and compares via cosine similarity (falling
 back to max-abs-diff when the reference is near-zero, e.g. clamped
 activations). This is the tooling that found and verified all three MIOpen
-bugs fixed by `patches/miopen/` so far.
+bugs fixed by `rocm6.4.4/patches/miopen/` so far.
 
 ## Why this exists
 
@@ -81,8 +81,8 @@ podman run --rm -it \
   <image> /bin/bash
 
 # inside the container:
-sh /work//tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
-sh /work//tools/correctness-suite/run_all.sh /tmp/suite-bin
+sh /work/rocm6.4.4/tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
+sh /work/rocm6.4.4/tools/correctness-suite/run_all.sh /tmp/suite-bin
 ```
 
 `run_all.sh` exits non-zero if anything failed, so it's safe to use as a

@@ -1,0 +1,21 @@
+diff --git a/caffe2/CMakeLists.txt b/caffe2/CMakeLists.txt
+index 98241d6..111878a 100644
+--- a/caffe2/CMakeLists.txt
++++ b/caffe2/CMakeLists.txt
+@@ -934,6 +934,16 @@ if(USE_ROCM)
+   set(__caffe2_hip_srcs_hip ${Caffe2_HIP_SRCS})
+   list(FILTER __caffe2_hip_srcs_hip INCLUDE REGEX "\\.(cu|hip)$")
+   set_source_files_properties(${__caffe2_hip_srcs_hip} PROPERTIES LANGUAGE HIP)
++  # TENSORTOPK_HIP_MEMORY_WORKAROUND_PATCH
++  # TensorTopK.hip's CUB radix-sort instantiations push clang's AMDGPU
++  # backend to ~20GB RSS at -O3, OOM-killing constrained build hosts. -O1
++  # for this one file only; the trailing flag wins over the default -O3.
++  # Must be set here, in torch_hip's own directory scope -- source
++  # properties don't propagate from aten/src/ATen/CMakeLists.txt, where
++  # ATen_HIP_SRCS/Caffe2_HIP_SRCS is only assembled, not where the target
++  # consuming it is actually created.
++  set_source_files_properties(${TORCH_ROOT}/aten/src/ATen/native/hip/TensorTopK.hip
++    PROPERTIES COMPILE_OPTIONS "-O1")
+ endif()
+ 
+ # Compile exposed libraries.

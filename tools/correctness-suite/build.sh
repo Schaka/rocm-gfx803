@@ -12,8 +12,8 @@
 # of all sweeps -- useful while iterating on a fix for one specific bug.
 #
 # Example (run from inside the target container, repo mounted at /work):
-#   sh /work//tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
-#   ONLY=reduce_sweep sh /work//tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
+#   sh /work/rocm6.4.4/tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
+#   ONLY=reduce_sweep sh /work/rocm6.4.4/tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
 set -eu
 
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

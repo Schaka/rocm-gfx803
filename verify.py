@@ -3,7 +3,7 @@
 
 Run inside a container started with --device=/dev/kfd --device=/dev/dri
 --group-add video. Exercises the three paths that only the base image's
-build-time import check (/Dockerfile, final stage) doesn't cover:
+build-time import check (rocm6.4.4/Dockerfile, final stage) doesn't cover:
 MIGraphX EP inference, rocBLAS GEMM, MIOpen convolution -- each of which
 can import fine and still fail (or silently fall back) on real hardware.
 

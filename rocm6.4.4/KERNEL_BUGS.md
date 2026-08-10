@@ -23,7 +23,7 @@ next one.
 | int8_float32 GEMM (CT2) | rocBLAS int8_r/int32_r GEMM path | Garbled/repeating output, not a crash | **Confirmed fixed as of the MIOpen grouped-conv fix**, though not independently re-isolated. Retested end-to-end via the real audiomuse-rocm-plugin image (JFK sample, `faster_whisper`, `int8_float32`) after rebuilding the base image with the MIOpen fix: correct transcription, whereas this was previously garbled. Whisper's encoder has real Conv1D layers, so this was plausibly the same `ConvOclDirectFwd` grouped-conv defect corrupting the int8 path's output, not a separate rocBLAS int8 bug -- but that's an inference from the retest, not a confirmed root cause the way the fp32 GEMM and MIOpen bugs above were. Worth a real isolation pass if it regresses. |
 | MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
 | Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
-| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `gfx803/tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not fixed -- open, below MIOpen.** Fix belongs in the HIP runtime stack (ROCR-Runtime / libhsakmt re-map + invalidation on VA reuse), not MIOpen (confirmed unable: caller owns the recycled d_x). Full root-cause record + ROCm7 repro guidance: see "The ReduceSum kernel-cache mystery" below AND `docs/AGENT_HANDOFF.md` §18. Prior eviction workarounds (always-fresh ~70x slow; LRU-bound 91% not 100%) are NOT shippable. MIOpen-fallback (reduce from a fresh >=16-buffer ring-address internal copy) is proven correct (0/52) at +9-13% perf but is only a fallback. |
+| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not fixed -- open, below MIOpen.** Fix belongs in the HIP runtime stack (ROCR-Runtime / libhsakmt re-map + invalidation on VA reuse), not MIOpen (confirmed unable: caller owns the recycled d_x). Full root-cause record + ROCm7 repro guidance: see "The ReduceSum kernel-cache mystery" below AND `docs/AGENT_HANDOFF.md` §18. Prior eviction workarounds (always-fresh ~70x slow; LRU-bound 91% not 100%) are NOT shippable. MIOpen-fallback (reduce from a fresh >=16-buffer ring-address internal copy) is proven correct (0/52) at +9-13% perf but is only a fallback. |
 
 ## How we found the pervasive GEMM bug
 
@@ -1060,7 +1060,7 @@ repro's inability to reproduce it suggests the trigger condition isn't
 
 ## SOLVED (mechanism) -- 2026-08-08: root cause is below MIOpen, in HIP allocator address recycling
 
-A fresh pass with the committed `gfx803/tools/reduce-harness/` pinned the
+A fresh pass with the committed `tools/reduce-harness/` pinned the
 mechanism. THIS is the authoritative record; the older theories in the mystery
 section above were superseded one by one.
 
@@ -1132,7 +1132,7 @@ small-ring version.
   non-existent). Monorepos (rocm-libraries/rocm-systems) have no 6.4.x tags.
 
 ### How to replicate on ROCm 7 (when the port lands)
-1. Rebuild 11 code objects: `gfx803/tools/reduce-harness/build_variants.sh`
+1. Rebuild 11 code objects: `tools/reduce-harness/build_variants.sh`
    against the ROCm 7 CK sources (adjust CK_SRC/CK_INC at top).
 2. `hipcc -O1 ... miopen_reduce_kernel_harness.cpp -o reduce_harness`,
    `REDUCE_HSACO_DIR=<dir> ./reduce_harness` -> record baseline failed-count.
@@ -1155,8 +1155,8 @@ small-ring version.
 ## FIXED (runtime) -- 2026-08-09: ROCR va-reuse-defer patch, both gates green
 
 The runtime fix called for above is implemented and validated:
-`gfx803/patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`,
-wired into `gfx803/Dockerfile` as the `rocr-builder` stage and into CI as the
+`patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`,
+wired into `Dockerfile` as the `rocr-builder` stage and into CI as the
 `rocr` component). It patches **ROCR-Runtime @ rocm-6.4.4** only -- libhsakmt
 is statically linked into libhsa-runtime64, so no clr/HIP rebuild is needed.
 
@@ -1201,10 +1201,10 @@ shipped without the bypass and exhibited exactly that.
 - Clean process exit (no teardown spin).
 
 ### Harness / test assets (canonical locations)
-- Repo: `gfx803/tools/reduce-harness/harness_exp.cpp` (experiment variant with
+- Repo: `tools/reduce-harness/harness_exp.cpp` (experiment variant with
   `HAR_MODE` etc.; builds like the committed harness:
   `hipcc -O2 harness_exp.cpp -o harness_exp -L<rocm>/lib -Wl,-rpath,<rocm>/lib`,
-  run with `REDUCE_HSACO_DIR=gfx803/tools/reduce-harness/codeobj`).
+  run with `REDUCE_HSACO_DIR=/tools/reduce-harness/codeobj`).
 - gfx803 box (persistent ext4): `/data/rocr644-ring16/` -- harness binary +
   source, `libs/` (libhsa variants: `.ba` baseline, `.r16final` shipped fix,
   `.vanoreuse`/`.leak` rejected experiments, `.orig` stock), `run_harness.sh`

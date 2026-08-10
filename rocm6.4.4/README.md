@@ -152,7 +152,7 @@ fallback, and `debug` for a tmate session.
 Locally:
 
 ```
-docker build -f gfx803/Dockerfile -t rocm-gfx803-builder gfx803
+docker build -f Dockerfile -t rocm-gfx803-builder gfx803
 ```
 
 ## Running
@@ -179,7 +179,7 @@ against expected output:
 
 ```
 docker run --device=/dev/kfd --device=/dev/dri --group-add video \
-    -v "$(pwd)/gfx803/verify.py:/verify.py" \
+    -v "$(pwd)//verify.py:/verify.py" \
     ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803 \
     python3 /verify.py
 ```

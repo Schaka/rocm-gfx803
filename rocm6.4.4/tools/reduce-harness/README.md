@@ -1,7 +1,7 @@
 # gfx803 MIOpen dynamic-reduce kernel harness
 
 Faithful, minimal repro for the MIOpen `miopenReduceTensor` intermittent
-wrong-sum bug on gfx803 (see `gfx803/KERNEL_BUGS.md`, "The ReduceSum
+wrong-sum bug on gfx803 (see `KERNEL_BUGS.md`, "The ReduceSum
 kernel-cache mystery").
 
 It drives **MIOpen's actual compiled CK reduction kernel code objects** through
@@ -42,7 +42,7 @@ README.md
 ```
 
 The bug this reproduces is **fixed at the runtime level** by
-`gfx803/patches/rocr/va-reuse-defer.patch` (see `gfx803/KERNEL_BUGS.md`,
+`patches/rocr/va-reuse-defer.patch` (see `KERNEL_BUGS.md`,
 "FIXED (runtime) -- 2026-08-09"). With the patched libhsa the 52-shape sweep
 is 0/52; against stock libhsa it is ~6-10/52. Keep using this harness to
 re-validate whenever the ROCR/MIOpen layer is touched (including the ROCm 7

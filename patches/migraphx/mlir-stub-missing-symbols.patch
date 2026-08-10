@@ -1,0 +1,26 @@
+diff --git a/src/targets/gpu/mlir.cpp b/src/targets/gpu/mlir.cpp
+index ad02ecb..46a5033 100644
+--- a/src/targets/gpu/mlir.cpp
++++ b/src/targets/gpu/mlir.cpp
+@@ -1431,6 +1431,21 @@ tuning_config get_tuning_config_mlir(const context&, module, const std::vector<s
+ {
+     return {};
+ }
++
++// IS_MODULE_FUSIBLE_MLIR_STUB_PATCH
++// Declared unconditionally in mlir.hpp and called unconditionally from
++// jit/mlir.cpp (always compiled, unlike this file's MIGRAPHX_MLIR-gated
++// half), but upstream never gave these four a stub here -- an eager
++// (BIND_NOW) dynamic linker turns that into an ImportError on the
++// mlir-disabled build's first module load, not a link-time error, since
++// nothing here actually calls the missing symbols to trip the linker.
++bool is_module_fusible(const module&, const context&, const value&) { return false; }
++
++void dump_mlir_to_file(module, const std::vector<shape>&, const fs::path&) {}
++
++void dump_mlir_to_mxr(module, const std::vector<instruction_ref>&, const fs::path&) {}
++
++void adjust_param_shapes(module&, const std::vector<shape>&) {}
+ // NOLINTEND(performance-unnecessary-value-param)
+ 
+ #endif

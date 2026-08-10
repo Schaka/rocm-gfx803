@@ -1,0 +1,93 @@
+MIGraphX (pinned tag rocm-7.14): declare/define gfx_default_rocblas()
+unconditionally, instead of only under `#if MIGRAPHX_USE_HIPBLASLT`, so
+the build compiles with hipBLASLt disabled -- the only configuration any
+non-gfx90a/gfx94x/gfx95x/gfx110x/gfx120x target (gfx803 included) can
+build in, since hipBLASLt has no kernels for anything else.
+
+WHY
+---
+src/targets/gpu/lowering.cpp calls `gpu::gfx_default_rocblas()`
+unconditionally (no `#if MIGRAPHX_USE_HIPBLASLT` around the call site
+itself):
+
+    not hipblaslt_supported() or gpu::gfx_default_rocblas())
+
+But `gfx_default_rocblas()`'s only declaration (device_name.hpp) and
+definition (device_name.cpp) are both wrapped in
+`#if MIGRAPHX_USE_HIPBLASLT`. With hipBLASLt off (`-DMIGRAPHX_USE_HIPBLASLT
+=Off`, required on gfx803 -- hipBLASLt has never had gfx8 kernels, see
+gfx803/EVALUATION_ROCM_7.md's hipBLASLt section), the symbol simply
+doesn't exist and lowering.cpp fails to compile: "no member named
+'gfx_default_rocblas' in namespace 'migraphx::gpu'". This is a real
+upstream gap in the rocm-7.14 source, not a gfx803-specific issue -- it
+would reproduce for any target built with hipBLASLt disabled. Confirmed
+directly against the pinned tag's source, not assumed.
+
+The call is dead code once hipBLASLt is compiled out, not just at
+runtime on this hardware: `hipblaslt_supported()` itself is `#if
+!MIGRAPHX_USE_HIPBLASLT return false; #else ...`, so with HIPBLASLT off
+it always returns false, and `not hipblaslt_supported()` is always true
+-- the `or gpu::gfx_default_rocblas()` after it never actually
+evaluates due to short-circuit `or`. The symbol only needs to exist for
+the translation unit to compile; its return value is unreachable in
+this build configuration.
+
+WHAT
+----
+Move the two `gfx_default_rocblas()` declarations in device_name.hpp
+outside the `#if MIGRAPHX_USE_HIPBLASLT` guard so they're always
+visible. In device_name.cpp, keep the real HIPBLASLT-on implementation
+as-is and add an `#else` branch defining both overloads to return
+`true` -- matching the function's ordinary "prefer rocblas over
+hipblaslt" meaning (there being no hipblaslt at all is the strongest
+case for preferring rocblas), even though this branch is unreachable
+given hipblaslt_supported()'s own false-when-disabled behavior.
+
+Applies to: MIGraphX @ rocm-7.14 tag, any GPU_TARGETS built with
+MIGRAPHX_USE_HIPBLASLT=Off -- not gfx803-specific in what it touches,
+gfx803 is simply the target that surfaced it here. See
+gfx-default-rocblas-hipblaslt-off-build-failure.sh for how this patch
+is applied and verified at build time.
+
+diff --git a/src/targets/gpu/device_name.cpp b/src/targets/gpu/device_name.cpp
+index 2b825ea..5c162af 100644
+--- a/src/targets/gpu/device_name.cpp
++++ b/src/targets/gpu/device_name.cpp
+@@ -143,6 +143,22 @@ static bool hipblaslt_supported_impl(const std::string& gfx_name)
+             (starts_with(gfx_name, "gfx95") and gfx_name >= "gfx950") or
+             starts_with(gfx_name, "gfx110") or starts_with(gfx_name, "gfx120"));
+ }
++
++#else
++
++// GFX_DEFAULT_ROCBLAS_HIPBLASLT_OFF_PATCH: with hipBLASLt compiled out
++// entirely, rocblas is the only GEMM provider there is -- these two
++// overloads are unreachable in practice (hipblaslt_supported() below
++// always returns false in this build, so lowering.cpp's short-circuit
++// `not hipblaslt_supported() or gfx_default_rocblas()` never evaluates
++// them) but must still exist for the translation unit to link.
++bool gfx_default_rocblas() { return true; }
++bool gfx_default_rocblas(const context& ctx)
++{
++    (void)ctx;
++    return true;
++}
++
+ #endif
+ 
+ bool hipblaslt_supported()
+diff --git a/src/targets/gpu/include/migraphx/gpu/device_name.hpp b/src/targets/gpu/include/migraphx/gpu/device_name.hpp
+index 7d8f965..a51f771 100644
+--- a/src/targets/gpu/include/migraphx/gpu/device_name.hpp
++++ b/src/targets/gpu/include/migraphx/gpu/device_name.hpp
+@@ -55,10 +55,8 @@ MIGRAPHX_GPU_EXPORT bool gfx_has_mx_intrinsics(const context& ctx);
+ 
+ MIGRAPHX_GPU_EXPORT bool gfx_has_fp8fnuz_support();
+ 
+-#if MIGRAPHX_USE_HIPBLASLT
+ MIGRAPHX_GPU_EXPORT bool gfx_default_rocblas();
+ MIGRAPHX_GPU_EXPORT bool gfx_default_rocblas(const context& ctx);
+-#endif
+ 
+ MIGRAPHX_GPU_EXPORT bool hipblaslt_supported();
+ MIGRAPHX_GPU_EXPORT bool hipblaslt_supported(const context& ctx);

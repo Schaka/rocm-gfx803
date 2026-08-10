@@ -5,7 +5,7 @@ recycled GPU virtual addresses carrying stale memory-system state. All fix
 attempts live in ROCR-Runtime @ rocm-6.4.4 (`libhsakmt/src/fmm.c` +
 `runtime/hsa-runtime/core/util/flag.h`; libhsakmt is statically linked into
 libhsa-runtime64, no clr/HIP rebuild needed). Full investigation narrative:
-`gfx803/KERNEL_BUGS.md`. Harness: `gfx803/tools/reduce-harness/harness_exp.cpp`
+`KERNEL_BUGS.md`. Harness: `tools/reduce-harness/harness_exp.cpp`
 (HAR_MODE=reuse, 52 shapes; stock baseline = 6-10/52 wrong).
 
 Gates referenced below:
@@ -47,7 +47,7 @@ the versioned one!).
 
 Implication: the kernel upgrade (6.19.10 → 7.1.7, incl. amd-gpu-firmware 20260622) fixed v13's RESIDUAL fault on 6.19.10 (2/40) — on 7.1.7 v13 is 1/170 (~0.6%), a ~5x improvement. But v4's fault (BO teardown while an in-flight kernel reads a freed-behind-its-back buffer) is NOT a kernel bug: it persists at ~12% on 7.1.7, because v4 unmaps the VA immediately at free time and no kernel change can make that safe for the ORT free-before-completion race. v4 stays rejected; v13 (which keeps the mapping alive through the window) is the correct mechanism on both kernels. No upstream amdgpu fix exists for the stale-PTE read on Polaris (rocr-7.2.4 fmm.c carries no defer-FIFO; gfx803 is EOL upstream).
 
-**SHIPPING (2026-08-09):** v13 promoted to `gfx803/patches/rocr/va-reuse-defer.patch` (the shippable patch; diff body byte-identical to the validated build, applies cleanly to stock rocm-6.4.4). Perf: stock 10.888s vs v13 10.843s ORT suite wall, -0.41% within noise (6 interleaved runs). Residual risk: ~0.6% fault rate (1/170) from cap-triggered flush racing a >window reader; accepted as the best achievable at the runtime layer.
+**SHIPPING (2026-08-09):** v13 promoted to `patches/rocr/va-reuse-defer.patch` (the shippable patch; diff body byte-identical to the validated build, applies cleanly to stock rocm-6.4.4). Perf: stock 10.888s vs v13 10.843s ORT suite wall, -0.41% within noise (6 interleaved runs). Residual risk: ~0.6% fault rate (1/170) from cap-triggered flush racing a >window reader; accepted as the best achievable at the runtime layer.
 
 ## What each failure taught (do not re-learn)
 
@@ -146,9 +146,9 @@ defer-FIFO in upstream fmm.c).
 - Local quick-iteration build: `/tmp/opencode/Dockerfile.rocr644-ring16` →
   `docker build --no-cache` (plain builds have served a STALE patch from
   cache despite content change — always `--no-cache` or verify the lib hash).
-- CI/shipped wiring (v13 live): `gfx803/Dockerfile` `rocr-builder` stage
+- CI/shipped wiring (v13 live): `Dockerfile` `rocr-builder` stage
   applies `patches/rocr/va-reuse-defer.patch` (regenerated from v13). To
   change the mechanism, update the wip patch, rebuild + re-validate both
-  gates through `gfx803/tools/reduce-harness/`, then regenerate the
+  gates through `tools/reduce-harness/`, then regenerate the
   shippable patch from the validated build input (the diff body must stay
   byte-identical to what built the tested lib).

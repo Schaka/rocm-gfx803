@@ -1,0 +1,146 @@
+rocBLAS (re-diffed for pinned commit cd9574023093742434e8c992d13b89ab9a6c1cf8,
+therock-7.14 / ROCm 7.14.0, from the original fix against rocm-6.4.4):
+fix the gfx803 GSU (GlobalSplitU / split-K) workspace staleness
+miscompute, by zeroing the GSU workspace immediately after rocBLAS
+allocates/reuses it, before the reduction kernel that accumulates into
+it ever launches. Plus a second, independent bug found while verifying
+the first.
+
+WHY
+---
+gfx803 (Polaris/GCN3) has no native float atomic-add instruction, so
+Tensile emulates GlobalSplitU (split-K) reduction on this architecture via
+a software compare-and-swap retry loop: each of the GSU groups reads
+whatever is currently at the target address, adds its own partial sum, and
+attempts to swap the result in, retrying on contention
+(KernelWriterAssembly.py's globalWriteBatch atomic path, the `else`
+branch taken when `self.useAtomicAdd` is false). This design is only
+correct if the target memory already holds the correct starting value (0,
+or beta-scaled C) before any of the N independent, concurrently-running
+GSU groups begin their first CAS attempt -- there is no "first" group in a
+symmetric, concurrent design, so the kernel cannot self-initialize; zeroing
+is necessarily the caller's responsibility, done once, before the kernel
+launches.
+
+rocBLAS's own device memory pool (library/src/include/handle.hpp,
+gsu_malloc_by_size()) hands out this workspace as reused memory across
+successive GEMM calls WITHOUT re-zeroing it. Confirmed via direct
+hipMalloc/hipFree tracing on an RX 470 (gfx803) against ROCm 6.4.4: the
+pool is allocated once, not per call, and the same physical memory backs
+every GSU-using GEMM call in a process. The first call after a fresh
+allocation is correct (untouched, OS-zeroed memory); every call after
+inherits whatever the previous call's CAS loop left behind, silently
+corrupting the result with rocblas_status_success returned. Confirmed via
+a controlled dose-response test: reusing a workspace without re-zeroing it
+between calls reproduces the corruption at roughly the same rate as
+stock rocBLAS; re-zeroing it before every call eliminates it completely
+(0/N mismatches across every shape tested, including every shape an
+overnight solution-matrix sweep found broken).
+
+RE-DIFF NOTE (7.14): the underlying bug, root cause, and fix are all
+unchanged from 6.4.4 -- verified by reading the current source, not
+assumed. What changed is purely cosmetic: tensile_host.cpp's
+runContractionProblem() gained a third branch (`is_device_memory_size_query()`,
+which pre-computes a GSU-workspace-size hint rounded to
+HPA_GSU_WORKSPACE_SIZE_GRANULARITY, unrelated to this bug) alongside the
+pre-existing `fitness_query` branch, wrapping the GSU-allocate-and-solve
+path this patch touches one indentation level deeper (20 spaces instead
+of 16) than in 6.4.4. `git apply`/`patch` against the original 6.4.4
+hunk fails here -- not because the fix stopped applying, but because the
+context lines it matches on shifted indentation. Confirmed by reading
+the actual current function body: `WorkspaceSize`, `gsu_malloc_by_size()`,
+the `!gsu_malloc` check, and `canSolve()` still appear in the exact same
+relative order, just re-indented; `rocblas_internal_convert_hip_to_rocblas_status`
+and `handle->get_stream()` (both referenced by the inserted memset call)
+are both still present and used the same way elsewhere in this same
+function. Re-diffed by hand against this exact indentation rather than
+assuming the 6.4.4 hunk still applies.
+
+WHAT
+----
+Insert one hipMemsetAsync of the GSU workspace, sized to exactly what
+Tensile itself computed as required (solution->requiredWorkspaceSize),
+immediately after rocBLAS's tensile_host.cpp obtains the workspace pointer
+via gsu_malloc_by_size() and before the kernel launch that follows.
+Bandwidth-bound, proportional to output size, not to full GEMM compute
+cost. Runs on the same stream as the GEMM call, so no extra
+synchronization is introduced -- ordering is already correct by
+construction.
+
+SECOND BUG, found while verifying the above: library/src/include/handle.hpp's
+gsu_malloc_by_size() has its own pre-existing correctness bug, independent
+of the missing zero-init -- still present verbatim in the 7.14 source
+(only the surrounding line numbers moved, +117 lines vs. 6.4.4, no
+content change):
+
+  auto gsu_malloc_by_size(size_t requested_Workspace_Size)
+  {
+      if(this->gsu_workspace) // Added to accomodate quant, remove comment after testing
+          return _gsu_malloc_by_size(this);
+      return _gsu_malloc_by_size(this, requested_Workspace_Size);
+  };
+
+The fast path reuses whatever workspace the handle already has WITHOUT
+checking it's actually big enough for the current request -- if an earlier
+call on the same handle needed less GSU workspace than the current call
+does, this hands back an undersized buffer. Confirmed on real hardware
+(against 6.4.4): applying only the zero-init fix above made a small shape
+(40x72x800) go from ~99% corrupted to ~100% corrupted with LARGER error
+magnitudes (max_abs up to ~4.5 vs ~1.4-2.2 before) -- consistent with an
+actual heap buffer overflow, not just stale data, once our memset (sized
+to the *requested* size) started writing past a too-small *reused*
+buffer. A large shape (768x768x3072, which apparently never hit the
+undersized-reuse path) came back 0/50 clean with the zero-init fix alone,
+which is what pointed at a second, size-tracking-specific bug rather than
+a flaw in the zero-init idea itself.
+
+Fixed by only taking the fast/reuse path when the existing workspace is
+already large enough; otherwise falls through to a fresh, correctly-sized
+allocation exactly as the non-reuse path already does.
+
+Applies to: rocBLAS @ rocm-libraries commit cd9574023093742434e8c992d13b89ab9a6c1cf8
+(therock-7.14 / ROCm 7.14.0 pin), gfx803 only -- not upstreamed, this
+platform is abandoned; see gsu-workspace-not-zeroed.sh for how this patch
+is applied and verified at build time. NOT YET RE-VERIFIED ON REAL
+HARDWARE against 7.14 -- the 6.4.4 investigation above (hipMalloc/hipFree
+tracing, dose-response test, shape sweep) has not been re-run against this
+ROCm line yet; re-diffing only restores clean applicability, it does not
+substitute for re-running KERNEL_BUGS.md's methodology against 7.14
+binaries (see gfx803/EVALUATION_ROCM_7.md, step 7).
+
+diff --git a/library/src/include/handle.hpp b/library/src/include/handle.hpp
+--- a/library/src/include/handle.hpp
++++ b/library/src/include/handle.hpp
+@@ -939,7 +939,7 @@
+
+     auto gsu_malloc_by_size(size_t requested_Workspace_Size)
+     {
+-        if(this->gsu_workspace) // Added to accomodate quant, remove comment after testing
++        if(this->gsu_workspace && this->gsu_workspace_size >= requested_Workspace_Size) // GSU_WORKSPACE_SIZE_GUARD_PATCH: only reuse if big enough
+             return _gsu_malloc_by_size(this);
+
+         return _gsu_malloc_by_size(this, requested_Workspace_Size);
+diff --git a/library/src/tensile_host.cpp b/library/src/tensile_host.cpp
+--- a/library/src/tensile_host.cpp
++++ b/library/src/tensile_host.cpp
+@@ -1356,6 +1356,20 @@
+                         return rocblas_status_memory_error;
+                     }
+
++                    // GSU_WORKSPACE_ZERO_PATCH: gfx803 has no native float
++                    // atomic-add, so GSU reduction here uses a software CAS
++                    // loop that assumes a pre-zeroed workspace -- rocBLAS's
++                    // memory pool reuses this buffer across calls without
++                    // re-zeroing it, corrupting every call after the first.
++                    // See patches/rocblas/gsu-workspace-not-zeroed.sh.
++                    if(WorkspaceSize > 0)
++                    {
++                        hipError_t memset_status = hipMemsetAsync(
++                            prob.handle->gsu_workspace, 0, WorkspaceSize, handle->get_stream());
++                        if(memset_status != hipSuccess)
++                            return rocblas_internal_convert_hip_to_rocblas_status(memset_status);
++                    }
++
+                     if(solution->canSolve(tensile_prob, *hardware))
+                     {
+                         if(!(prob.flags & rocblas_gemm_flags_check_solution_index))

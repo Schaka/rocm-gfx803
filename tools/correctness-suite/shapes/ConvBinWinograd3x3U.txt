@@ -1,0 +1,21 @@
+# ConvBinWinograd3x3U: requires R=S=3, stride=1, pad=1, dilation=1, group=1,
+# fp32, InChannels even, InChannels >= 16 on gfx8. Sweep near boundaries and
+# representative mid-size shapes. Format: C H W K R S group stride pad
+16 32 32 16 3 3 1 1 1
+16 8 8 16 3 3 1 1 1
+16 1 1 16 3 3 1 1 1
+18 32 32 18 3 3 1 1 1
+14 32 32 14 3 3 1 1 1
+32 32 100 24 3 3 1 1 1
+64 32 100 24 3 3 1 1 1
+64 16 16 64 3 3 1 1 1
+128 8 8 128 3 3 1 1 1
+256 4 4 256 3 3 1 1 1
+16 32 32 1 3 3 1 1 1
+16 32 32 2 3 3 1 1 1
+16 32 32 3 3 3 1 1 1
+16 1 100 16 3 3 1 1 1
+16 100 1 16 3 3 1 1 1
+16 3 3 16 3 3 1 1 1
+16 300 300 16 3 3 1 1 1
+16000 4 4 16 3 3 1 1 1

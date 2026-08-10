@@ -1,0 +1,368 @@
+ROCR-Runtime (re-diffed for pinned commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350,
+therock-7.14 / ROCm 7.14.0, from the shipped fix against rocm-6.4.4,
+gfx803/patches/rocr/va-reuse-defer.patch): stop immediate GPU virtual-address
+(VA) recycling in libhsakmt's fmm aperture allocator, which corrupts MIOpen
+CK reduction kernels on gfx803 (Polaris), by parking freed objects alive on
+a length-bounded FIFO and freeing them only at GPU-busy flush points; and
+default the hsa-runtime SimpleHeap fragment sub-allocator to OFF, since it
+is a second, higher-layer VA recycler that the fmm fix cannot see.
+
+See gfx803/patches/rocr/va-reuse-defer.patch for the full WHY (root-cause
+investigation, rejected non-solutions, hardware validation numbers) --
+unchanged in substance from 6.4.4, reproduced here only for the WHAT and
+the re-diff.
+
+NOT AUTOMATICALLY FIXED: confirmed directly against the pinned 7.14 source
+(ROCm/rocm-systems @ 2b22ab0195cc1461cd9abf3b969e9dd7c10af350,
+projects/rocr-runtime) -- neither libhsakmt/src/fmm.c nor
+runtime/hsa-runtime/core/util/flag.h carries any equivalent VA-deferral or
+fragment-allocator-default change. Both files are present and both target
+functions still exist; the immediate-recycle behavior this patch works
+around is unchanged from 6.4.4.
+
+RE-DIFF NOTE (7.14): ROCR-Runtime moved from its own standalone repo into
+the ROCm/rocm-systems monorepo (projects/rocr-runtime) since 6.4.4, and
+libhsakmt/src/fmm.c saw a real internal refactor alongside the move -- all
+of gpu_mem[]/gpu_mem_count/svm, previously free-standing global/static
+state, moved into a per-connection `struct hsa_kfd_fmm_context`, itself
+reached via `HsaKFDContext *ctx` (ROCR-Runtime 7.x supports multiple
+independent KFD connections in one process; 6.4.4 did not). Three real
+changes were needed, confirmed by reading the actual current source, not
+assumed -- the fields and functions the patch touches (`struct vm_object`,
+`struct manageable_aperture`, `vm_create_and_init_object`,
+`aperture_release_area`) are otherwise byte-for-byte identical to 6.4.4:
+
+1. Every function this patch adds or edits gained an `HsaKFDContext *ctx`
+   parameter, threaded through to `ctx->fd` -- the global `hsakmt_kfd_fd`
+   6.4.4 called `hsakmt_ioctl()` against is gone entirely in 7.14 (0
+   occurrences in the pinned source; `hsakmt_ioctl(int fd, ...)` now takes
+   the fd explicitly). `__fmm_release()` itself already gained this `ctx`
+   parameter upstream, independent of this patch -- the diff only adds the
+   same parameter to the two new functions it introduces
+   (`fmm_do_release`, `fmm_defer_release`) so they can reach `ctx->fd`.
+   The deferred-release FIFO itself still lives on the aperture (as
+   before), and an aperture is only ever reachable through the one
+   HsaKFDContext that owns it (ROCm's own kfdcontext.h: "these contexts
+   are fully isolated from one another"), so a parked entry is always
+   flushed by a later call carrying the same ctx that queued it -- no
+   cross-context leak.
+
+2. `fmm_is_scratch_aperture()` -- used by the patch's scratch-bypass
+   branch inside `__fmm_release()` to keep scratch-backed objects out of
+   the defer FIFO (fmm_release_scratch()'s teardown loop requires
+   immediate, not deferred, removal) -- changed both its signature and
+   its return type: 6.4.4 was `fmm_is_scratch_aperture(const void
+   *address)` returning `manageable_aperture_t *` (specifically
+   `&gpu_mem[i].scratch_physical`, the same aperture object being
+   released into, so `== aperture` was a valid identity check); 7.14 is
+   `fmm_is_scratch_aperture(struct hsa_kfd_fmm_context *fmm_ctx, const
+   void *address)` returning `gpu_mem_t *` (the whole per-GPU struct, a
+   different type that can no longer be compared against `aperture`).
+   Ported to a non-NULL check instead of an identity comparison -- safe
+   because `object` was already found inside `aperture`'s own tree by
+   the caller before `__fmm_release()` ever sees it, so a scratch hit at
+   this address can only mean `aperture` itself is the scratch aperture.
+   `hsakmt_fmm_release()` (the primary caller reached from
+   `HSAKMT_STATUS hsakmt_fmm_release(HsaKFDContext *ctx, void *address)`)
+   also special-cases scratch addresses before ever reaching
+   `__fmm_release()`, exactly as in 6.4.4 -- this patch's own check is
+   defense-in-depth for `__fmm_release()`'s other ten-plus call sites,
+   same as on 6.4.4.
+
+3. Pure line-number drift from unrelated upstream churn above each
+   anchor (new VA-width comment/macros, a `bind_mem_to_numa` forward
+   declaration, a `deferred/svm` struct reshuffle) -- no content changes
+   needed beyond (1) and (2).
+
+NOT YET RE-VERIFIED ON REAL HARDWARE against 7.14 -- ports cleanly and
+reads correctly against the pinned source, but this specific reduction
+mis-read has not been re-run through the ReductionOpTest suite or the
+gfx803/tools/reduce-harness/ repro harness on this ROCm line yet. See
+gfx803/rocm7/README.md "Status".
+
+WHAT
+----
+Same mechanism as gfx803/patches/rocr/va-reuse-defer.patch: at
+hsakmt_fmm_release, the object is parked on a per-aperture FIFO, fully
+alive (BOs kept, GPU mapping untouched, VA reserved, content intact).
+When the entry ages out (FIFO > FMM_REUSE_QUEUE_MAX=256 entries or >
+FMM_REUSE_BYTES_MAX=1GiB parked bytes) it is really freed inside a LATER
+FREE call -- i.e. while the GPU pipeline is typically active, the measured
+stale-clearing ingredient -- then the VA returns to the aperture
+free-list. Scratch apertures bypass the FIFO to keep
+fmm_release_scratch's exit loop terminating. HSA_DISABLE_FRAGMENT_ALLOCATOR
+defaults to disabling the fragment sub-allocator (set it to "0" to
+re-enable), since that allocator recycles VAs above libhsakmt where the
+fmm-level fix cannot see it.
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+index e18a6d1..9030eb3 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+@@ -198,7 +198,10 @@ class Flag {
+     report_tool_register_failures_ = (var == "1") ? true : false;
+
+     var = os::GetEnvVar("HSA_DISABLE_FRAGMENT_ALLOCATOR");
+-    disable_fragment_alloc_ = (var == "1") ? true : false;
++    // GFX803 VA-recycling workaround: fragment sub-allocator is OFF by
++    // default (every alloc gets a fresh VA from the driver); set the env var
++    // to 0 to re-enable the 2MB-block sub-allocator.
++    disable_fragment_alloc_ = (var == "0") ? false : true;
+
+     var = os::GetEnvVar("HSA_ENABLE_SDMA_HDP_FLUSH");
+     enable_sdma_hdp_flush_ = (var == "0") ? false : true;
+diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
+index 650522f..3e3d299 100644
+--- a/projects/rocr-runtime/libhsakmt/src/fmm.c
++++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
+@@ -66,7 +66,11 @@
+ 	.vm_ranges = NULL,					\
+ 	.fmm_mutex = PTHREAD_MUTEX_INITIALIZER,			\
+ 	.is_cpu_accessible = false,				\
+-	.ops = &reserved_aperture_ops				\
++	.ops = &reserved_aperture_ops,				\
++	.deferred_head = NULL,					\
++	.deferred_tail = NULL,					\
++	.deferred_len = 0,					\
++	.deferred_bytes = 0				\
+ 	}
+
+ #define container_of(ptr, type, member) ({			\
+@@ -90,6 +94,26 @@
+ #define START_NON_CANONICAL_ADDR (1ULL << 56)
+ #define END_NON_CANONICAL_ADDR (~0ULL - (1ULL << 56))
+
++/* GFX803 VA-recycling workaround: a freed VA is withheld from the aperture
++ * free-list until FMM_REUSE_QUEUE_MAX further frees have occurred, so a hot
++ * address is never handed straight back to the next same-size malloc. The
++ * parked object keeps its BOs ALIVE (mapping + content intact) for the whole
++ * window, so a kernel still in flight that reads a buffer freed behind its
++ * back keeps hitting a valid page with the original data (stock gets the
++ * same tolerance from near-instant VA+phys reuse). When the window expires
++ * the BO is freed during a later FREE call -- i.e. while the GPU is busy,
++ * which is the measured ingredient that clears the stale gfx803
++ * memory-system state (idle-time teardown at a quiescent point does NOT:
++ * v9/v10 harness 5-7/52; busy-flush v5-lineage 0/52). Length-bounded (not
++ * alloc-counted) so it is O(1) per op and self-limiting for every aperture
++ * regardless of which alloc paths fire -- an alloc-counted delay can grow
++ * unboundedly on apertures whose alloc path doesn't bump the counter. A byte
++ * cap bounds the extra VRAM held by parked BOs (4GB-class caps break real
++ * workloads with HIPBLAS_STATUS_ALLOC_FAILED).
++ */
++#define FMM_REUSE_QUEUE_MAX 256
++#define FMM_REUSE_BYTES_MAX (1ULL << 30)
++
+ struct vm_object {
+ 	void *start;
+ 	void *userptr;
+@@ -119,6 +143,14 @@ struct vm_object {
+ 	void *user_data;
+ 	/* Flag to indicate imported KFD buffer */
+ 	bool is_imported_kfd_bo;
++	/* GFX803_VA_REUSE_DEFER_PATCH: set once the object's release was parked
++	 * on the defer FIFO. The object stays in the tree with its BOs ALIVE
++	 * (VA reserved, GPU mapping and content intact) until the window
++	 * expires and fmm_do_release() really frees it. A second release of
++	 * the same address is a no-op (stock gets this tolerance from the
++	 * object being gone at first free).
++	 */
++	bool deferred;
+ #ifdef SANITIZER_AMDGPU
+ 	int mmap_flags;
+ 	int mmap_fd;
+@@ -176,6 +208,19 @@ static const manageable_aperture_ops_t mmap_aperture_ops = {
+ 	mmap_aperture_release
+ };
+
++static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object);
++
++/* A freed allocation whose VA is being withheld from reuse for a short while.
++ * The KV object is kept in the aperture tree (so the area stays reserved and
++ * the allocator can't hand the address back) until the delay expires, then the
++ * area is released and the object removed -- bounded, non-leaking.
++ */
++struct deferred_release {
++	struct deferred_release *next;
++	manageable_aperture_t *aperture;
++	vm_object_t *object;
++};
++
+ struct manageable_aperture {
+ 	void *base;
+ 	void *limit;
+@@ -187,6 +232,15 @@ struct manageable_aperture {
+ 	pthread_mutex_t fmm_mutex;
+ 	bool is_cpu_accessible;
+ 	const manageable_aperture_ops_t *ops;
++	/* GFX803 VA-recycling workaround: FIFO of releases withheld from the
++	 * aperture free-list, bounded at FMM_REUSE_QUEUE_MAX entries. The VA
++	 * stays reserved while queued, so a freed address is never handed back
++	 * to the very next same-size allocation.
++	 */
++	struct deferred_release *deferred_head;
++	struct deferred_release *deferred_tail;
++	uint32_t deferred_len;
++	uint64_t deferred_bytes;
+ };
+
+ typedef struct {
+@@ -425,6 +479,7 @@ static vm_object_t *vm_create_and_init_object(void *start, uint64_t size,
+ 		object->metadata = NULL;
+ 		object->user_data = NULL;
+ 		object->is_imported_kfd_bo = false;
++		object->deferred = false;
+ 		object->node.key = rbtree_key((unsigned long)start, size);
+ 		object->user_node.key = rbtree_key(0, 0);
+ #ifdef SANITIZER_AMDGPU
+@@ -957,6 +1012,83 @@ static void aperture_release_area(manageable_aperture_t *app, void *address,
+ 	app->ops->release_area(app, address, MemorySizeInBytes);
+ }
+
++/* Really release a deferred object: free its BOs (this is the busy-GPU
++ * teardown -- it runs inside a later FREE call, never at a quiescent point,
++ * which is what clears the stale gfx803 state), return the area to the
++ * aperture free-list and drop the object. fmm_mutex must be held.
++ */
++static void fmm_do_release(HsaKFDContext *ctx, struct deferred_release *e)
++{
++	struct kfd_ioctl_free_memory_of_gpu_args args = {0};
++	uint32_t i;
++
++	for (i = 0; i < e->object->handle_num; i++) {
++		args.handle = e->object->handles[i];
++		if (!args.handle)
++			continue;
++		if (hsakmt_ioctl(ctx->fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU,
++				 &args))
++			pr_err("fmm: deferred BO free failed (%d) for obj at %p\n",
++			       -errno, e->object->start);
++	}
++	e->aperture->deferred_bytes -= e->object->size;
++	aperture_release_area(e->aperture, e->object->start, e->object->size);
++	vm_remove_object(e->aperture, e->object);
++	free(e);
++}
++
++/* Push a release onto the aperture's deferred FIFO. fmm_mutex must be held.
++ * Keeps the object in the tree with its BOs ALIVE (VA reserved, GPU mapping
++ * and content intact) so the freed address is never handed straight back to
++ * the next same-size allocation, and a lagging in-flight reader of the freed
++ * buffer keeps hitting a valid page with the original data. Once the FIFO
++ * exceeds FMM_REUSE_QUEUE_MAX entries or FMM_REUSE_BYTES_MAX bytes the oldest
++ * entries are released for real, so the queue is bounded and O(1) per op for
++ * every aperture.
++ */
++static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object)
++{
++	struct deferred_release *e, *head;
++
++	e = calloc(1, sizeof(*e));
++	if (!e) {
++		/* Out of memory: fall back to an immediate release. */
++		struct kfd_ioctl_free_memory_of_gpu_args args = {0};
++		int i;
++
++		for (i = 0; i < object->handle_num; i++) {
++			args.handle = object->handles[i];
++			if (args.handle)
++				hsakmt_ioctl(ctx->fd,
++					     AMDKFD_IOC_FREE_MEMORY_OF_GPU,
++					     &args);
++		}
++		aperture_release_area(aperture, object->start, object->size);
++		vm_remove_object(aperture, object);
++		return;
++	}
++	e->aperture = aperture;
++	e->object = object;
++	e->next = NULL;
++	if (aperture->deferred_tail)
++		aperture->deferred_tail->next = e;
++	else
++		aperture->deferred_head = e;
++	aperture->deferred_tail = e;
++	aperture->deferred_len++;
++	aperture->deferred_bytes += object->size;
++
++	while (aperture->deferred_len > FMM_REUSE_QUEUE_MAX ||
++	       aperture->deferred_bytes > FMM_REUSE_BYTES_MAX) {
++		head = aperture->deferred_head;
++		aperture->deferred_head = head->next;
++		if (!aperture->deferred_head)
++			aperture->deferred_tail = NULL;
++		aperture->deferred_len--;
++		fmm_do_release(ctx, head);
++	}
++}
++
+ /* returns 0 on success. Assumes, that fmm_mutex is locked on entry */
+ static vm_object_t *aperture_allocate_object(manageable_aperture_t *app,
+ 					     void *new_address,
+@@ -2230,24 +2362,54 @@ static int __fmm_release(HsaKFDContext *ctx,
+ 		}
+ 	}
+
+-	/* If memory is user memory and it's still GPU mapped, munmap
+-	 * would cause an eviction. If the restore happens quickly
+-	 * enough, restore would also fail with an error message. So
+-	 * free the BO before unmapping the pages.
++	/* GFX803_VA_REUSE_DEFER_PATCH: this object's release was already parked
++	 * on the defer FIFO (BOs still alive, VA reserved). A second release of
++	 * the same address must be a no-op (stock gets this tolerance from the
++	 * object being gone at first free).
+ 	 */
+-	for (i = 0; i < object->handle_num; i++) {
+-		args.handle = object->handles[i];
+-		if (args.handle == 0)
+-			continue;
+-		if (hsakmt_ioctl(ctx->fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &args))
+-			ret = -errno;
++	if (object->deferred) {
++		pthread_mutex_unlock(&aperture->fmm_mutex);
++		return 0;
+ 	}
+
+-	if (ret)
+-		goto err_free_mem_failed;
++	/* GFX803_VA_REUSE_DEFER_PATCH: scratch-backing apertures must bypass the
++	 * defer FIFO. They are only torn down at shutdown by
++	 * fmm_release_scratch(), whose loop requires each released object to
++	 * leave the tree immediately -- a deferred (still-in-tree) object makes
++	 * that loop spin forever at process exit. fmm_is_scratch_aperture()
++	 * returns the owning gpu_mem_t (not an aperture pointer, unlike the
++	 * upstream ROCm 6.4.4 source this was ported from) -- a non-NULL result
++	 * is sufficient here since `object` was already found in `aperture`'s
++	 * own tree by the caller, so a hit can only mean aperture itself.
++	 */
++	if (fmm_is_scratch_aperture(ctx->fmm_context, object->start)) {
++		for (i = 0; i < object->handle_num; i++) {
++			args.handle = object->handles[i];
++			if (args.handle == 0)
++				continue;
++			if (hsakmt_ioctl(ctx->fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &args))
++				ret = -errno;
++		}
++		if (ret)
++			goto err_free_mem_failed;
++		aperture_release_area(aperture, object->start, object->size);
++		vm_remove_object(aperture, object);
++	} else {
++		/* Park the WHOLE object on the deferred FIFO: BOs stay alive,
++		 * the GPU mapping and the content stay intact, the VA stays
++		 * reserved. The BO is really freed when the entry ages out of
++		 * the window (fmm_defer_release -> fmm_do_release), inside a
++		 * later FREE call while the GPU is busy -- the busy teardown
++		 * is what clears the stale gfx803 memory-system state, and
++		 * keeping the mapping alive through the window is what keeps
++		 * lagging in-flight readers from faulting.
++		 */
++		object->deferred = true;
++		fmm_defer_release(ctx, aperture, object);
++	}
+
+-	aperture_release_area(aperture, object->start, object->size);
+-	vm_remove_object(aperture, object);
++	pthread_mutex_unlock(&aperture->fmm_mutex);
++	return 0;
+
+ err_free_mem_failed:
+ 	pthread_mutex_unlock(&aperture->fmm_mutex);

@@ -1,0 +1,11 @@
+# Build context for this directory's Dockerfile is this directory. Only
+# patches/ is ever COPYed from it; the rest is documentation, host-side
+# tooling, and investigation output (the ORT backend-test logs are tens of
+# megabytes), none of which belongs in a context transfer. Mirrors
+# gfx803/.dockerignore and the repo-root one.
+#
+# This does not affect layer caching: BuildKit keys a COPY on the checksums of
+# the files it actually copies, not on the whole context.
+*.md
+*.log
+tools/

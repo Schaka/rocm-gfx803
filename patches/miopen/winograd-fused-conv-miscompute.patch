@@ -1,0 +1,138 @@
+MIOpen (pinned tag rocm-6.4.4): scope ConvBinWinogradRxSFused's
+applicability down to genuine 3x3 filters, so MIOpen stops selecting it
+for gfx803's Fusion Plan (ConvActivationFusion) path on shapes its
+padding-generalization silently miscomputes.
+
+WHY
+---
+ConvBinWinogradRxSFused (src/solver/conv_bin_winoRxS_fused.cpp) wraps a
+legacy hand-written GCN3 assembly kernel
+(conv_3x3_wheel_alpha_v9_2_7.s / conv_3x3_wheel_alpha_v9_2_7_stride_2.s,
+exported as miopenSp3AsmConvRxSU_CBA) that IsApplicable claims to
+generalize to arbitrary filter sizes via Ceiling()-based padding, but the
+kernel itself was only ever a true 3x3 Winograd transform.
+
+Confirmed miscomputing on real gfx803 hardware (RX 470, ROCm 6.4.4)
+against CLAP's real audio-encoder graph (model_epoch_36.onnx from
+audiomuse-rocm-plugin): a per-node ONNX bisection -- extracting each
+Conv's real input-to-output subgraph via onnx.utils.extract_model, not
+just tapping an extra output on the full graph, so ConvActivationFusion
+still fires exactly like it does in production -- found this solver
+selected for a plain (group=1) 1x1 pointwise conv
+(specialist.backbone.features.2.block.2.0, C=64 K=24 R=S=1) with
+cos(CPU_EP, ROCM_EP)=0.79-0.86 against a CPU-EP reference on the same
+random input, cratering from 1.0 at every node before it. This is the
+same real bug audiomuse-rocm-plugin's arch/gfx803.py works around by
+disabling ConvActivationFusion for CLAP's whole session (see that repo's
+docs/ARCH_NOTES.md, "CLAP on the ROCM EP needs ConvActivationFusion
+disabled") -- this patch fixes it at the MIOpen level instead, so no
+downstream ORT consumer needs to know about it.
+
+A standalone MIOpen-only fusion-plan repro (no ORT: synthetic random
+weights, a host-computed conv+bias reference, miopenCreateFusionPlan /
+miopenCompileFusionPlan / miopenExecuteFusionPlan directly) reproduced
+the same systematic ~2% error (cos~0.98) for the 1x1 shape class chained
+through several of CLAP's real early-layer shapes in sequence on one
+MIOpen handle -- confirming a real defect in the padded-1x1 code path,
+not workspace reuse or session state (contrast
+patches/rocblas/gsu-workspace-not-zeroed.sh, where reused-but-unzeroed
+memory was the actual cause of a similarly silent miscompute).
+
+Scoped, not blanket-disabled: the same standalone repro confirmed a
+genuine 3x3/stride=1/group=1 shape -- this kernel's actual designed case,
+and what its own GetWti() rates as by far its best (wti_approximate_worst
+* .005 for x==3&&y==3, vs *.475 for everything else) -- computes
+correctly (cos=1.0000, 3/3 runs) through the identical
+miopenSp3AsmConvRxSU_CBA kernel. CLAP itself has exactly one group=1 3x3
+conv (the stem, node_Conv_1193, stride=2) and its own kernel file
+(conv_3x3_wheel_alpha_v9_2_7_stride_2.s) fails to even load in this
+MIOpen build ("Failed to load kernel source"), so this patch costs
+nothing for this specific model either way -- but a future gfx803 model
+with a working stride=1 3x3 conv keeps the real assembly-kernel speedup
+this patch would otherwise throw away by disabling the solver outright.
+
+Checked whether a newer, better-supported kernel exists to redirect to
+instead of patching this one, the same way patches/miopen's other fixes
+do: MIOpen's newer general fused Winograd
+(ConvBinWinogradRxSf2x3g1Fused, src/solver/conv_winoRxS_fused.cpp) is
+gated to gfx9/gfx10/gfx11 only and was never ported to gfx8 at all --
+unlike the *non*-fused general Winograd (ConvBinWinogradRxS,
+src/solver/conv/conv_bin_winoRxS.cpp), which does list gfx803 and is
+almost certainly why "unfused" (ConvActivationFusion disabled) already
+tests much closer to correct (cos 0.91-0.96) than "fused" (0.42-0.86) in
+the same audiomuse-rocm-plugin session. No in-place kernel fix was
+attempted: the payload is ~2700 lines of unlabeled GCN3 ISA
+(src/kernels/conv_3x3_wheel_alpha_v9_2_7_gfx8.inc) with runtime (not
+compile-time) R/S arguments, and correctly patching the specific
+mis-handled tap/lane logic would need register-level tracing tooling this
+investigation didn't have time to build with any confidence of not
+introducing a new, harder-to-find bug.
+
+Not the same bug as the already-fixed grouped-conv OOB read
+(patches/miopen/conv-direct-fwd-grouped-oob.sh): that one is
+ConvOclDirectFwd/ConvOclDirectFwdFused (MIOpenConvUniBatchNormActiv),
+reached only for GroupCount()!=1. This solver requires
+GroupCount()==1 (see its own IsApplicable, unchanged by this patch), so
+the two are disjoint solvers, disjoint shape classes, and were found
+independently. (Checked whether the grouped-conv fix has a similar
+"newer kernel we could fall back to" story too: no -- none of MIOpen's
+four fusion solvers can serve GroupCount()!=1 on gfx803 at all, so that
+fix's "reject and let ORT fall back to unfused" was already the only
+option, not a shortcut past something better.)
+
+WHAT
+----
+Reject when the filter isn't genuinely 3x3, immediately after `y`/`x`
+(GetWeightsHeight/Width) become available -- before the Ceiling()-based
+padding math that's actually responsible for extending this kernel past
+its real 3x3 design. Genuine 3x3 shapes are unaffected and keep using the
+verified-correct assembly kernel; everything else falls through to
+MIOpen's other Fusion Plan solvers or an unfused Conv+Bias, matching what
+audiomuse-rocm-plugin's ConvActivationFusion-disable workaround already
+produces for those shapes, minus needing that workaround at all.
+
+Applies to: MIOpen @ rocm-6.4.4, gfx803 only -- this solver is dead code
+on every other arch already (see its own device-name gate above the
+patched lines), so this patch cannot regress them; see
+winograd-fused-conv-miscompute.sh for how this patch is applied and
+verified at build time.
+
+diff --git a/src/solver/conv_bin_winoRxS_fused.cpp b/src/solver/conv_bin_winoRxS_fused.cpp
+--- a/src/solver/conv_bin_winoRxS_fused.cpp
++++ b/src/solver/conv_bin_winoRxS_fused.cpp
+@@ -76,6 +76,35 @@
+     const auto K           = conv_problem.GetOutChannels();
+     const auto y           = conv_problem.GetWeightsHeight();
+     const auto x           = conv_problem.GetWeightsWidth();
++
++    // WINOGRAD_FUSED_CBA_MISCOMPUTE_PATCH: this solver wraps a legacy
++    // hand-written GCN3 assembly kernel (conv_3x3_wheel_alpha_v9_2_7[_stride_2].s,
++    // "miopenSp3AsmConvRxSU_CBA") whose Ceiling()-based padding below claims to
++    // generalize it to any filter size, but the kernel itself was only ever a
++    // true 3x3 Winograd transform. Confirmed on real gfx803 hardware (RX 470,
++    // ROCm 6.4.4) via CLAP's real audio-encoder graph: a per-node ONNX
++    // bisection (extracting each Conv's real input-to-output subgraph via
++    // onnx.utils.extract_model, so ConvActivationFusion still fires exactly
++    // like production) found this solver selected for a plain (group=1) 1x1
++    // pointwise conv (specialist.backbone.features.2.block.2.0, C=64 K=24
++    // R=S=1) with cos(CPU_EP, ROCM_EP)=0.79-0.86 against a CPU-EP reference,
++    // and a standalone MIOpen-only fusion-plan repro (no ORT, synthetic
++    // weights, host-computed reference) reproduced a systematic ~2% error
++    // (cos~0.98) for the same 1x1 shape class in total isolation -- a real
++    // defect in the padded-1x1 code path, not workspace reuse or session
++    // state. The same standalone repro confirmed a genuine 3x3/stride=1
++    // shape (this kernel's actual designed case, and what its own GetWti
++    // rates as by far its best) computes correctly (cos=1.0000, 3/3 runs),
++    // so this is scoped to exclude only the generalized (non-3x3) padding
++    // path rather than disabling the solver outright -- MIOpen's newer,
++    // properly-general Winograd family (Conv_Winograd_v13_3_12/v14_3_3, see
++    // solver/conv/conv_bin_winoRxS.cpp) already covers gfx803 correctly for
++    // arbitrary filter sizes on the non-fused path; this old kernel's fused
++    // (Conv+Bias+Activation) variant was apparently never carried forward to
++    // it. See winograd-fused-conv-miscompute.patch for the full writeup.
++    if(!(y == 3 && x == 3))
++        return false;
++
+     const auto OH          = conv_problem.GetOutHeight();
+     const auto OW          = conv_problem.GetOutWidth();
+     const auto pad_h       = conv_problem.GetPadH();
