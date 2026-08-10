@@ -108,6 +108,11 @@ on:
         required: false
         type: boolean
         default: false
+      swap-size-gb:
+        description: 'Swap size passed to prepare-runner. Override per-component when a single compile step spikes RSS well past the default.'
+        required: false
+        type: string
+        default: '16'
 
 jobs:
   build:
@@ -130,7 +135,7 @@ jobs:
         uses: ./.github/actions/prepare-runner
         with:
           debug: ${{ inputs.debug }}
-          swap-size-gb: '16'
+          swap-size-gb: ${{ inputs.swap-size-gb }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
 

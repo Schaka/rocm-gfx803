@@ -175,6 +175,9 @@ jobs:
       pytorch-ref: ${{ inputs.pytorch-ref }}
       torchvision-ref: ${{ inputs.torchvision-ref }}
       torchaudio-ref: ${{ inputs.torchaudio-ref }}
+      # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
+      # RSS -- real headroom for that spike, not a source-level workaround.
+      swap-size-gb: '24'
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 

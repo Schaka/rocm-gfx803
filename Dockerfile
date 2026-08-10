@@ -747,9 +747,6 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodules \
         https://github.com/ROCm/pytorch.git /pytorch
 
-COPY patches/pytorch/ /pytorch-patches/
-RUN sh /pytorch-patches/tensortopk-hip-build-oom.sh /pytorch
-
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py
