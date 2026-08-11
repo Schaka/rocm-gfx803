@@ -789,6 +789,14 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
         https://github.com/microsoft/onnxruntime.git /onnxruntime
 
+# ORT's setup.py reads VERSION_NUMBER verbatim as the wheel's version, no
+# format validation -- appending a PEP 440 local segment here lands straight
+# in the wheel's METADATA. PyPI's own onnxruntime can otherwise report the
+# exact same version this build does, which would make an exact-version pin
+# in the final image's constraints file (below) unenforceable (PyPI could
+# satisfy it too); a suffix no PyPI release will ever carry closes that gap.
+RUN printf '%s+gfx803' "$(cat /onnxruntime/VERSION_NUMBER)" > /onnxruntime/VERSION_NUMBER
+
 # MultiHeadAttention's ROCm "Generic" pipeline (the only one available once
 # Composable Kernel is compiled out, see onnxruntime_USE_COMPOSABLE_KERNEL=OFF
 # below) refuses the plain three-tensor MHA call whenever query
@@ -939,5 +947,20 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torc
     && "$VIRTUAL_ENV/bin/python3" -c "import torchvision; print('torchvision', torchvision.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import torchaudio; print('torchaudio', torchaudio.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import migraphx; print('migraphx python module OK')"
+
+# This image is a drop-in base for downstream Dockerfiles -- any of them can
+# `pip install`/`uv pip install` something that pulls in torch, torchvision,
+# torchaudio or onnxruntime as a transitive dependency (e.g. faster-whisper
+# via ctranslate2's onnxruntime dependency), and pip will silently swap this
+# image's MIGraphX-EP/gfx803 build for a generic PyPI wheel with neither --
+# no error, no warning. Pinning the exact already-installed version turns
+# that from a silent swap into a loud resolution failure: pip/uv can't
+# satisfy the pin from any index, only by reusing what's already installed.
+# Both env vars are set because pip reads PIP_CONSTRAINT and uv reads
+# UV_CONSTRAINT -- neither honors the other's.
+RUN "$VIRTUAL_ENV/bin/pip" freeze --local | grep -E '^(torch|torchvision|torchaudio|onnxruntime)==' > /opt/pip-constraints.txt \
+    && cat /opt/pip-constraints.txt
+ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
+ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"

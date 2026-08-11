@@ -730,7 +730,7 @@ COPY --from=rocblas-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
-        libopenblas-dev libdrm-dev libomp-dev \
+        libopenblas-dev libdrm-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # --python 3.12: base image's system python3 is 3.14 (Ubuntu 26.04); the
@@ -762,7 +762,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
         "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
         USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
-        USE_DISTRIBUTED=0 \
+        USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
         python3 setup.py bdist_wheel
 
 RUN pip install --no-cache-dir dist/torch*.whl \
@@ -848,6 +848,14 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
         https://github.com/microsoft/onnxruntime.git /onnxruntime
 
+# ORT's setup.py reads VERSION_NUMBER verbatim as the wheel's version, no
+# format validation -- appending a PEP 440 local segment here lands straight
+# in the wheel's METADATA. PyPI's own onnxruntime can otherwise report the
+# exact same version this build does, which would make an exact-version pin
+# in the final image's constraints file (below) unenforceable (PyPI could
+# satisfy it too); a suffix no PyPI release will ever carry closes that gap.
+RUN printf '%s+gfx803' "$(cat /onnxruntime/VERSION_NUMBER)" > /onnxruntime/VERSION_NUMBER
+
 # rocm6.4.4/Dockerfile's two ORT patches (mha-basic-mode-no-viable-op,
 # topk-radix-tiebreak-nondeterministic) are NOT carried over here: both
 # patch ROCm-EP-only source (contrib_ops/rocm/bert/... and
@@ -919,7 +927,7 @@ RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
 # starts fresh FROM python-base; only /opt/rocm/* is copied across
 # stages, not the OS package set the earlier stages needed at build time).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libprotobuf-dev libopenblas0 libomp5 ffmpeg libsndfile1 locales \
+        libprotobuf-dev libopenblas0 ffmpeg libsndfile1 locales \
         libdrm2 libdrm-amdgpu1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -959,5 +967,20 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torc
     && "$VIRTUAL_ENV/bin/python3" -c "import torchvision; print('torchvision', torchvision.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import torchaudio; print('torchaudio', torchaudio.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import migraphx; print('migraphx python module OK')"
+
+# This image is a drop-in base for downstream Dockerfiles -- any of them can
+# `pip install`/`uv pip install` something that pulls in torch, torchvision,
+# torchaudio or onnxruntime as a transitive dependency (e.g. faster-whisper
+# via ctranslate2's onnxruntime dependency), and pip will silently swap this
+# image's MIGraphX-EP/gfx803 build for a generic PyPI wheel with neither --
+# no error, no warning. Pinning the exact already-installed version turns
+# that from a silent swap into a loud resolution failure: pip/uv can't
+# satisfy the pin from any index, only by reusing what's already installed.
+# Both env vars are set because pip reads PIP_CONSTRAINT and uv reads
+# UV_CONSTRAINT -- neither honors the other's.
+RUN "$VIRTUAL_ENV/bin/pip" freeze --local | grep -E '^(torch|torchvision|torchaudio|onnxruntime)==' > /opt/pip-constraints.txt \
+    && cat /opt/pip-constraints.txt
+ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
+ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"

@@ -38,6 +38,14 @@ parts that aren't obvious from the code or the patch headers alone.
   and `git blame` are for, and it rots the moment the described change is
   no longer the most recent one. A comment should make sense read cold, by
   someone with no idea what the last edit was.
+- **Never comment on absence.** Don't write a comment explaining that
+  something *isn't* there, *used to be* there, or *isn't being done* --
+  "no libomp-dev here", "removed the X workaround", "we don't do Y
+  anymore". A reader sees only the code that exists; a note about code
+  that doesn't exist is unverifiable noise the moment they check, and dead
+  weight forever after. If a line was dropped, dropping it needs no
+  comment -- the absence speaks for itself. Only write a comment when it
+  justifies something *present*.
 - **Comments don't describe cross-component architecture.** If a comment
   needs to explain how this file relates to three other files, why a
   particular Dockerfile stage exists in the overall pipeline, or how the
