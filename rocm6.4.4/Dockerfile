@@ -789,14 +789,6 @@ ENV PATH=/build-venv/bin:$PATH
 RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
         https://github.com/microsoft/onnxruntime.git /onnxruntime
 
-# ORT's setup.py reads VERSION_NUMBER verbatim as the wheel's version, no
-# format validation -- appending a PEP 440 local segment here lands straight
-# in the wheel's METADATA. PyPI's own onnxruntime can otherwise report the
-# exact same version this build does, which would make an exact-version pin
-# in the final image's constraints file (below) unenforceable (PyPI could
-# satisfy it too); a suffix no PyPI release will ever carry closes that gap.
-RUN printf '%s+gfx803' "$(cat /onnxruntime/VERSION_NUMBER)" > /onnxruntime/VERSION_NUMBER
-
 # MultiHeadAttention's ROCm "Generic" pipeline (the only one available once
 # Composable Kernel is compiled out, see onnxruntime_USE_COMPOSABLE_KERNEL=OFF
 # below) refuses the plain three-tensor MHA call whenever query
@@ -849,8 +841,30 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-ort-ccache \
         --cmake_extra_defines "CMAKE_CXX_COMPILER_LAUNCHER=ccache" \
         --cmake_extra_defines "FETCHCONTENT_SOURCE_DIR_EIGEN=/eigen-src" \
         --cmake_extra_defines "CMAKE_POLICY_VERSION_MINIMUM=3.5" \
-        --cmake_extra_defines "onnxruntime_USE_COMPOSABLE_KERNEL=OFF" \
-    && mkdir -p /onnxruntime/dist && cp /onnxruntime/build/Release/dist/*.whl /onnxruntime/dist/
+        --cmake_extra_defines "onnxruntime_USE_COMPOSABLE_KERNEL=OFF"
+
+# Tagging the wheel's version happens here, post-build, not by editing
+# VERSION_NUMBER before the C++ build above: onnxruntime_c_api.cc has a
+# compile-time static_assert comparing ORT_VERSION against a hardcoded
+# literal, which a PEP 440 local segment in VERSION_NUMBER trips. wheel
+# unpack/pack is the only safe way to add one -- PyPI's own onnxruntime can
+# otherwise report the exact same version this build does, which would make
+# an exact-version pin in the final image's constraints file (below)
+# unenforceable (PyPI could satisfy it too); a suffix no PyPI release will
+# ever carry closes that gap.
+RUN built_whl="$(ls /onnxruntime/build/Release/dist/*.whl)" \
+    && unpack_dir="/onnxruntime/build/Release/dist/unpacked" \
+    && python3 -m wheel unpack "$built_whl" -d "$unpack_dir" \
+    && old_dir="$(find "$unpack_dir" -mindepth 1 -maxdepth 1 -type d)" \
+    && old_name="$(basename "$old_dir")" \
+    && new_name="${old_name}+gfx803" \
+    && mv "$old_dir" "$unpack_dir/$new_name" \
+    && old_dist_info="$(find "$unpack_dir/$new_name" -maxdepth 1 -name '*.dist-info')" \
+    && new_dist_info="$unpack_dir/$new_name/${new_name}.dist-info" \
+    && mv "$old_dist_info" "$new_dist_info" \
+    && sed -i "s/^Version: .*/Version: ${old_name#*-}+gfx803/" "$new_dist_info/METADATA" \
+    && mkdir -p /onnxruntime/dist \
+    && python3 -m wheel pack "$unpack_dir/$new_name" -d /onnxruntime/dist
 
 FROM ${ORT_IMAGE} AS ort-export
 
