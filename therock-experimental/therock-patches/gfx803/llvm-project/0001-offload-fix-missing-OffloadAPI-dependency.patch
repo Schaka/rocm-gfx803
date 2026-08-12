@@ -1,0 +1,52 @@
+From 8f4a6d0e5b6c4a1d9e3f2b7c6a5d4e3f2b1a0c9d Mon Sep 17 00:00:00 2001
+From: Schaka <jonastanzer@gmail.com>
+Date: Tue, 11 Aug 2026 00:00:00 +0000
+Subject: [PATCH] offload: fix missing OffloadAPI dependency on PluginCommon
+
+PluginCommon's sources (PluginInterface.cpp etc.) include the generated
+OffloadAPI.h, but PluginCommon's own add_dependencies() list only names
+intrinsics_gen and PluginErrcodes -- not the OffloadAPI custom target
+(offload/liboffload/API/CMakeLists.txt) that actually generates that
+header. With no build-order edge between them, ninja is free to schedule
+PluginCommon's compiles before OffloadAPI's tablegen+copy steps, so any
+plugin linking PluginCommon (confirmed here via omptarget.rtl.amdgpu)
+can fail with "OffloadAPI.h: file not found" -- reproduced against this
+repo's TheRock pin (release/therock-7.14, amd-llvm @ 46fcb339) at real
+parallel ninja builds (-j2 and -j6 nested), traced down to this exact
+missing edge by reading offload/plugins-nextgen/common/CMakeLists.txt
+and offload/liboffload/API/CMakeLists.txt directly, not guessed from the
+symptom alone. Not gfx803-specific -- this is generic amd-llvm/offload
+build-graph code, reproducible on any target architecture built through
+this same pin, and already fixed upstream.
+
+Already fixed upstream at llvm/llvm-project@319a50123c63 ("[Offload] Fix
+missing dependency on generated OffloadAPI headers", #198055, landed
+2026-05-16) but not yet merged into ROCm's amd-staging fork as of this
+pin's date (2026-06-20) -- the merge that picked it up landed 2026-07-04,
+two weeks after this pin. Ported here rather than switching THEROCK_REF
+to a newer branch/commit: this repo's vendored rocm-libraries/rocm-systems
+patches were verified against release/therock-7.14's specific submodule
+pins, and floating THEROCK_REF to main previously required a real re-port
+of those patches (see therock-experimental/README.md's "Re-porting across
+pins" section) -- not worth reopening for an unrelated one-line fix that's
+already merged upstream and will arrive naturally once this branch's pin
+next advances.
+---
+ offload/plugins-nextgen/common/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/offload/plugins-nextgen/common/CMakeLists.txt b/offload/plugins-nextgen/common/CMakeLists.txt
+index 1111111..2222222 100644
+--- a/offload/plugins-nextgen/common/CMakeLists.txt
++++ b/offload/plugins-nextgen/common/CMakeLists.txt
+@@ -28,7 +28,7 @@ add_library(PluginCommon OBJECT
+   src/GenericProfiler.cpp
+   ${emissary_sources}
+ )
+-add_dependencies(PluginCommon intrinsics_gen PluginErrcodes)
++add_dependencies(PluginCommon intrinsics_gen PluginErrcodes OffloadAPI)
+
+ # Only enable JIT for those targets that LLVM can support.
+ set(supported_jit_targets AMDGPU NVPTX)
+--
+2.55.0

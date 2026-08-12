@@ -1,0 +1,98 @@
+From 747ef4157dd0baaaab27cac577d4bfd8d5c7c608 Mon Sep 17 00:00:00 2001
+From: Schaka <jonastanzer@gmail.com>
+Date: Tue, 11 Aug 2026 00:00:00 +0000
+Subject: [PATCH 4/4] rocblas: force WorkGroupMapping=1 for gfx803 assembly solutions
+
+WHY
+---
+wgm-miscompute.sh's own investigation (RX 470, ROCm 6.4.4) found that
+gfx803's assembly-kernel WorkGroupMapping!=1 swizzle does not produce a
+bijection between workgroups and output tiles, so affected GEMMs silently
+return wrong results with rocblas_status_success. That finding is
+unchanged here -- this patch is a different mechanism for the same fix,
+not a re-investigation.
+
+The sed script rewrites text across Tensile's whole Logic/ yaml tree
+(unbounded file count, no fixed location), which it can only do safely
+because this image builds exactly one architecture (rmake.py -a gfx803,
+per that script's own header) -- in a real multi-architecture build it
+would blindly rewrite every other architecture's WorkGroupMapping entries
+too. Tensile/SolutionStructs.py's assignDerivedParameters() is the single
+normalization pass every solution's parameter dict goes through --
+whether freshly generated or loaded from a Logic yaml at build time --
+and already does WorkGroupMapping normalization (negative values, -1 ->
+1) right above where this patch adds its own gfx803-gated override. Doing
+the same fix there instead: a ~15-line diff on one file, reviewable, and
+gated on the solution's own ISA tuple so it cannot execute for any other
+architecture's solutions, structurally, not just by construction of this
+image.
+
+VERIFIED on real gfx803 hardware (RX 470, 192.168.1.214), not just
+build-level: an initial same-pin static comparison looked like a
+regression (518 "_WGM8" kernel-name occurrences remained in a real
+rocblas-builder build's TensileLibrary_Type_*_fallback_gfx803.{hsaco,dat}
+files, where wgm-miscompute.sh's sed leaves zero) -- investigated rather
+than reverted-and-forgotten. Every one of those 518 kernel names carries
+ISA000_KLS (Tensile's HIP-*source* kernel-language marker), not
+ISA803_KLA (assembly) -- exactly the kernel class this script's own
+header already measured as correct regardless of WGM value ("WGM8 source
+kernels: 2/2 correct... the swizzle is emitted by the compiler rather
+than by Tensile"). Confirmed directly: rocblas_dgemm
+(TensileLibrary_Type_DD_*_fallback) and rocblas_zgemm (..._ZZ_*_fallback)
+both correct to ~1e-16 relative error across multiple shapes on real
+hardware, and zero "_WGM8" kernels remain anywhere OUTSIDE the fallback
+libraries (i.e. the actual ISA803_KLA kernels this patch targets are
+clean). This patch is wired into the Dockerfile -- wgm-miscompute.sh
+remains in patches/rocblas/ for reference/rollback, not invoked anymore.
+
+Also NOT YET established whether the underlying WGM!=1 assembly-codegen
+defect is gfx803-specific or a Tensile bug shared with other GCN-family
+architectures (AGENTS.md workflow step 3's differential test hasn't been
+run for this bug, on this patch or the sed it's based on). Working
+assumption per Schaka: gfx803-specific is the more likely explanation,
+since gfx900/gfx906/etc. see far more real-world and AMD-internal CI
+exercise than an unsupported-since-6.0 architecture, and a GEMM
+correctness bug this blunt (any assembly kernel with WGM!=1, not a narrow
+shape/dtype corner) would plausibly already have surfaced there if it
+were architecture-general. Plausible, not confirmed.
+
+WHAT
+----
+Immediately after assignDerivedParameters()'s existing WorkGroupMapping
+normalization (the `if state["WorkGroupMapping"] == -1: ... = 1` block),
+force WorkGroupMapping=1 whenever the solution's ISA is gfx803 (8, 0, 3)
+and its KernelLanguage is Assembly -- the exact scope wgm-miscompute.sh's
+own measurements cover (WGM8 assembly kernels 0/14 correct; WGM8 source
+kernels 2/2 correct, so HIP-source kernels are left untouched here, unlike
+the sed which also rewrote their (harmless) WGM entries).
+
+Applies to: Tensile @ rocm-libraries commit
+cd9574023093742434e8c992d13b89ab9a6c1cf8 (therock-7.14 / ROCm 7.14.0
+pin), same commit wgm-miscompute.sh already targets in this line.
+---
+diff --git a/shared/tensile/Tensile/SolutionStructs.py b/shared/tensile/Tensile/SolutionStructs.py
+index e4a0457e70..92a941813d 100644
+--- a/shared/tensile/Tensile/SolutionStructs.py
++++ b/shared/tensile/Tensile/SolutionStructs.py
+@@ -3210,6 +3210,21 @@ class Solution(collections.abc.Mapping):
+       # -1 code is same as 1. Convert to 1.
+       state["WorkGroupMapping" ] = 1
+
++    # GFX803_WGM_MISCOMPUTE_PATCH: on gfx803 (GCN3/Polaris), the assembly
++    # kernel's WorkGroupMapping!=1 swizzle (blockId = wg1 / WGM, then a
++    # magic-number-divide re-deal across a WGM-wide tile block) does not
++    # produce a bijection between workgroups and output tiles -- several
++    # workgroups land on the same tile while others are never claimed, so
++    # the GEMM silently returns wrong results with rocblas_status_success.
++    # WGM only ever permutes which workgroup claims which tile (the grid
++    # and tile set are unchanged), so WorkGroupMapping=1 (identity) is
++    # always a valid, correct assignment -- forcing it here costs some L2
++    # locality on large GEMMs and nothing else. See
++    # patches/rocblas/wgm-miscompute.sh for the hardware measurements
++    # this is based on.
++    if tuple(state["ISA"]) == (8, 0, 3) and state["KernelLanguage"] == "Assembly":
++      state["WorkGroupMapping" ] = 1
++
+     # avoid bug somehow related to GlobalSplitU + Persistent
+     # avoid bug related to WGM<0
+     # General Batch doesn't support PersistentKernel

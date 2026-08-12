@@ -1,0 +1,210 @@
+From 1cf0600ff815fd82e837eac7325cf18d8edbda2d Mon Sep 17 00:00:00 2001
+From: Schaka <jonastanzer@gmail.com>
+Date: Tue, 11 Aug 2026 00:00:00 +0000
+Subject: [PATCH 1/3] rocr: restore legacy doorbell support for gfx803 (Polaris)
+
+ROCR-Runtime's GpuAgent constructor (amd_gpu_agent.cpp) unconditionally
+throws for any HSA agent whose Capability.DoorbellType != 2. Polaris
+(gfx803) reports DoorbellType 0 or 1 (board-dependent "legacy" doorbell),
+so this is the entire reason ROCm 7 rejects the card at HSA agent
+enumeration -- rocminfo/clinfo see zero devices.
+
+Removing the throw alone is not sufficient: the doorbell write path
+(AqlQueue::StoreRelaxed, amd_aql_queue.cpp) unconditionally assumes
+DoorbellType 2 semantics (a single hardware-pointer write, no software
+bookkeeping). Legacy doorbell types need the software-maintained
+"max dispatched" watermark protocol upstream deleted in commit 39ecc88
+when DoorbellType 2 became the only supported value -- restored here
+across amd_gpu_agent.cpp, amd_aql_queue.{h,cpp} and amd_hsa_signal.h.
+
+Not original investigation in this vendored copy: restores, re-diffed
+against rocm-systems commit 2b22ab0195 (therock-7.14), an AMD engineer's
+(lucbruni-amd) fix verified on real Polaris hardware (RX 550) via a
+from-source TheRock build -- see
+https://github.com/lucbruni-amd/TheRock/tree/lb/gfx803-polaris-support
+and https://github.com/ROCm/clr/issues/269. Vendored into this
+experimental pipeline (rather than depended on as a live fork) per
+ROCm-gfx803's own patches/rocm-systems/hsa-agent-rejects-legacy-doorbell.patch,
+which carries the full investigation writeup and hardware verification
+notes this commit message only summarizes.
+
+Not gfx803-gated code: this is generic HSA dispatch-protocol logic;
+gfx803 is simply the only consumer of the doorbell_type_ != 2 branch
+among the architectures this repo targets.
+---
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+index b53752cba2..30a81231d2 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+@@ -296,6 +296,9 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
+   // Indicates if queue is active
+   std::atomic<bool> active_;
+ 
++  // Cached value of HsaNodeProperties.HSA_CAPABILITY.DoorbellType
++  int doorbell_type_;
++
+   // Handle of agent, which queue is attached to
+   GpuAgent* agent_;
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+index ccc20b8d19..3d885d90aa 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+@@ -100,6 +100,9 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+       priority_(HSA::HSA_AMD_QUEUE_PRIORITY_NORMAL),
+       exception_signal_(nullptr) {
+ 
++  // Identify doorbell semantics for this agent.
++  doorbell_type_ = agent->properties().Capability.ui32.DoorbellType;
++
+   // Queue size is a function of several restrictions.
+   const uint32_t min_pkts = ComputeRingBufferMinPkts();
+   const uint32_t max_pkts = ComputeRingBufferMaxPkts();
+@@ -132,8 +135,13 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+   HsaQueueResource queue_rsrc = {0};
+   queue_rsrc.Queue_read_ptr_aql = (uint64_t*)&amd_queue_.read_dispatch_id;
+ 
+-  // Hardware write pointer supports AQL semantics.
+-  queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.write_dispatch_id;
++  if (doorbell_type_ == 2) {
++    // Hardware write pointer supports AQL semantics.
++    queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.write_dispatch_id;
++  } else {
++    // Map hardware write pointer to a software proxy.
++    queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.max_legacy_doorbell_dispatch_id_plus_1;
++  }
+ 
+   // Populate amd_queue_ structure.
+   amd_queue_.hsa_queue.type = HSA_QUEUE_TYPE_MULTI;
+@@ -146,8 +154,8 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+       uintptr_t(&amd_queue_.read_dispatch_id) - uintptr_t(&amd_queue_));
+   // Initialize the doorbell signal structure.
+   memset(&signal_, 0, sizeof(signal_));
+-  signal_.kind = AMD_SIGNAL_KIND_DOORBELL;
+-  signal_.hardware_doorbell_ptr = nullptr;
++  signal_.kind = (doorbell_type_ == 2) ? AMD_SIGNAL_KIND_DOORBELL : AMD_SIGNAL_KIND_LEGACY_DOORBELL;
++  signal_.legacy_hardware_doorbell_ptr = nullptr;
+   signal_.queue_ptr = &amd_queue_;
+ 
+   const auto& props = agent->properties();
+@@ -279,7 +287,11 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+     throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                              "Queue create failed\n");
+   // Complete populating the doorbell signal structure.
+-  signal_.hardware_doorbell_ptr = queue_rsrc.Queue_DoorBell_aql;
++  if (doorbell_type_ == 2) {
++    signal_.hardware_doorbell_ptr = queue_rsrc.Queue_DoorBell_aql;
++  } else {
++    signal_.legacy_hardware_doorbell_ptr = (volatile uint32_t*)queue_rsrc.Queue_DoorBell;
++  }
+ 
+   // Bind Id of Queue such that is unique i.e. it is not re-used by another
+   // queue (AQL, HOST) in the same process during its lifetime.
+@@ -469,16 +481,57 @@ uint64_t AqlQueue::AddWriteIndexRelease(uint64_t value) {
+ }
+ 
+ void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+-  if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
+-        core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
+-    HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
+-  } else {
+-    // Hardware doorbell supports AQL semantics.
+-    _mm_sfence();
+-    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
+-    /* signal_ is allocated as uncached so we do not need read-back to flush WC */
++  if (doorbell_type_ == 2) {
++    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
++          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
++      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
++    } else {
++      // Hardware doorbell supports AQL semantics.
++      _mm_sfence();
++      *(signal_.hardware_doorbell_ptr) = uint64_t(value);
++      /* signal_ is allocated as uncached so we do not need read-back to flush WC */
++    }
++    return;
+   }
+-  return;
++
++  // Acquire spinlock protecting the legacy doorbell.
++  while (atomic::Cas(&amd_queue_.legacy_doorbell_lock, 1U, 0U,
++                     std::memory_order_acquire) != 0) {
++    os::YieldThread();
++  }
++
++#ifdef HSA_LARGE_MODEL
++  uint64_t legacy_dispatch_id = value + 1;
++#else
++  uint64_t legacy_dispatch_id = amd_queue_.write_dispatch_id;
++  legacy_dispatch_id =
++      Min(legacy_dispatch_id,
++          uint64_t(amd_queue_.read_dispatch_id) + amd_queue_.hsa_queue.size);
++#endif
++
++  // Discard backwards and duplicate doorbells.
++  if (legacy_dispatch_id > amd_queue_.max_legacy_doorbell_dispatch_id_plus_1) {
++    atomic::Store(&amd_queue_.max_legacy_doorbell_dispatch_id_plus_1,
++                  legacy_dispatch_id, std::memory_order_release);
++
++    if (doorbell_type_ == 0) {
++      uint64_t queue_size_mask = (1 * amd_queue_.hsa_queue.size) - 1;
++
++      atomic::Store(signal_.legacy_hardware_doorbell_ptr,
++                    uint32_t((legacy_dispatch_id & queue_size_mask) *
++                             (sizeof(core::AqlPacket) / sizeof(uint32_t))),
++                    std::memory_order_release);
++    } else if (doorbell_type_ == 1) {
++      atomic::Store(signal_.legacy_hardware_doorbell_ptr,
++                    uint32_t(legacy_dispatch_id), std::memory_order_release);
++    } else {
++      assert(false && "Agent has unsupported doorbell semantics");
++    }
++  }
++
++  // Release spinlock protecting the legacy doorbell.
++  atomic::Store(&amd_queue_.legacy_doorbell_lock, 0U,
++                std::memory_order_release);
+ }
+ 
+ void AqlQueue::StoreRelease(hsa_signal_value_t value) {
+@@ -492,8 +545,11 @@ hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value
+       *(reinterpret_cast<hsa_agent_t*>(value)) = agent_->public_handle();
+       break;
+     case HSA_AMD_QUEUE_INFO_DOORBELL_ID:
+-      *(reinterpret_cast<uint64_t*>(value)) =
+-          reinterpret_cast<uint64_t>(signal_.hardware_doorbell_ptr);
++      if (doorbell_type_ == 2)
++        *(reinterpret_cast<uint64_t*>(value)) =
++            reinterpret_cast<uint64_t>(signal_.hardware_doorbell_ptr);
++      else
++        return HSA_STATUS_ERROR_INVALID_QUEUE;
+       break;
+     case HSA_QUEUE_INFO_USE_COUNT:
+       if (!is_counted_queue) {
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+index 4cff385f25..14d1a108b9 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -123,9 +123,6 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
+   const bool is_apu_node = (properties_.NumCPUCores > 0);
+   profile_ = (is_apu_node) ? HSA_PROFILE_FULL : HSA_PROFILE_BASE;
+ 
+-  if (node_props.Capability.ui32.DoorbellType != 2)
+-    throw AMD::hsa_exception(HSA_STATUS_ERROR, "Agent creation failed.\nThe GPU node uses a deprecated doorbell type\n");
+-
+   hsa_status_t err = driver().GetClockCounters(node_id(), &t0_);
+   t1_ = t0_;
+   historical_clock_ratio_ = 0.0;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
+index 12e1c08157..cc81a32067 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
+@@ -62,6 +62,7 @@ typedef struct AMD_SIGNAL_ALIGN amd_signal_s {
+   amd_signal_kind64_t kind;
+   union {
+     volatile int64_t value;
++    volatile uint32_t* legacy_hardware_doorbell_ptr;
+     volatile uint64_t* hardware_doorbell_ptr;
+   };
+   uint64_t event_mailbox_ptr;
+
