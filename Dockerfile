@@ -330,10 +330,27 @@ RUN git clone --filter=blob:none --no-checkout \
     && git checkout "${ROCM_LIBRARIES_REF}"
 ENV ROCBLAS_SRC=/rocblas-src-root/projects/rocblas
 
-# WGM8 miscompute -- unchanged from 6.4.4, self-verifying (fails the build if
-# its target pattern disappears), no re-diff needed; see the script header.
+# WGM8 miscompute -- source-level fix (Tensile/SolutionStructs.py, gated on
+# ISA==gfx803 && KernelLanguage==Assembly) rather than the sed-based
+# wgm-miscompute.sh this replaces.
+#
+# A real rocblas-builder build of this Dockerfile initially looked like a
+# regression vs. the sed: 518 "_WGM8" kernel-name occurrences remained in
+# TensileLibrary_Type_*_fallback_gfx803.{hsaco,dat}. Investigated rather
+# than assumed broken -- every one of those 518 kernel names carries
+# ISA000_KLS (Tensile's HIP-*source* kernel-language marker), not
+# ISA803_KLA (assembly) -- i.e. exactly the kernel class
+# wgm-miscompute.sh's OWN header already measured as correct regardless of
+# WGM value (2/2 correct, "the swizzle is emitted by the compiler rather
+# than by Tensile"). Confirmed on real gfx803 hardware (RX 470,
+# 192.168.1.214): rocblas_dgemm (TensileLibrary_Type_DD_*_fallback) and
+# rocblas_zgemm (..._ZZ_*_fallback) both correct to ~1e-16 relative error
+# across multiple shapes. Also confirmed zero "_WGM8" kernels remain
+# outside the fallback libraries -- i.e. the actual assembly/KLA kernels
+# this patch targets are clean. wgm-miscompute.sh kept in
+# patches/rocblas/ for reference/rollback, not invoked here anymore.
 COPY patches/rocblas/ /rocblas-patches/
-RUN sh /rocblas-patches/wgm-miscompute.sh "${ROCBLAS_SRC}"
+RUN sh /rocblas-patches/wgm-miscompute-source.sh /rocblas-src-root
 
 # Small-GEMM assembly miscompute -- re-diffed for 7.14 (indentation shift
 # plus a real template-signature change, TiA/TiB collapsed to Ti; see the
@@ -763,6 +780,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
         MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
         USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
         USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
+        BUILD_TEST=0 \
         python3 setup.py bdist_wheel
 
 RUN pip install --no-cache-dir dist/torch*.whl \

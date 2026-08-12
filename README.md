@@ -79,6 +79,13 @@ diffed and consciously merged back together -- see "Convergence" below.
   HIP-accelerated) all pass with correct transcripts on real audio.
 - **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
   `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
+- **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third
+  independent line. Builds gfx803 through TheRock's own build
+  orchestration (`fetch_sources.py --patch-tag` + `cmake
+  -DTHEROCK_AMDGPU_FAMILIES` + `ninja`) instead of this repo's hand-rolled
+  Dockerfile, to test whether this repo's patches survive AMD's own build
+  system -- see `therock-experimental/README.md` and
+  `ROCM_UPSTREAM_ANALYSIS.md`.
 
 ## Building
 

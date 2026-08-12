@@ -1,0 +1,88 @@
+Tensile (ROCmSoftwarePlatform/Tensile commit
+7449c7fefd3d208ba6a2705699cd1c13b654ad87, the tag rocBLAS's own
+tensile_tag.txt pins at rocm-6.4.4): force WorkGroupMapping=1 for gfx803
+assembly solutions at the point every solution's parameters get
+normalized, instead of rewriting the WGM value in every Tensile Logic
+*.yaml file (wgm-miscompute.sh, kept alongside this patch, not removed --
+see that script's own header for the full hardware measurements this is
+based on; not repeated here).
+
+WHY
+---
+Same finding, different mechanism -- see
+patches/rocblas/wgm-miscompute.sh's own header for the hardware
+measurements (RX 470, ROCm 6.4.4) this is based on; not a
+re-investigation. Unlike the root repo's rocm7 line, where Tensile is
+vendored directly in the rocm-libraries monorepo checkout
+(shared/tensile/), 6.4.4-era rocBLAS pip-installs Tensile from its own
+standalone repo at CMake configure time (CMakeLists.txt's
+virtualenv_install("git+https://github.com/${tensile_fork}/Tensile.git@${tensile_tag}"),
+tensile_tag read from rocBLAS's own tensile_tag.txt) -- there is no
+in-tree Tensile checkout to COPY a patch onto before the build starts.
+wgm-miscompute-source.sh works around this by cloning the exact pinned
+Tensile commit into its own local directory, patching it there, and
+pointing rocBLAS's existing Tensile_TEST_LOCAL_PATH cache variable
+(rmake.py's --cmake-darg passthrough, see the driver) at that local copy
+instead -- rocBLAS's own CMakeLists.txt already prefers a local path over
+the pip-fetch when Tensile_TEST_LOCAL_PATH is set, so no change to
+rocBLAS's own build files is needed.
+
+NOT YET RE-VERIFIED as behaviorally equivalent to wgm-miscompute.sh on
+real hardware for THIS line -- the equivalence check (identical generated
+kernel names, zero *_WGM8 symbols) was run against the rocm7 line's pinned
+Tensile source (rocm-libraries @ cd9574023093742434e8c992d13b89ab9a6c1cf8,
+confirmed identical between the two mechanisms there), not re-run against
+this line's separately-pinned Tensile commit. The anchor text this patch
+targets (the `if state["WorkGroupMapping"] == -1: ... = 1` block) is
+byte-for-byte identical between the two Tensile sources at their
+respective pins, confirmed by direct comparison, so this is expected to
+behave the same way -- but "expected" is not "verified" per this repo's
+own standard. wgm-miscompute.sh remains the one actually wired into
+rocm6.4.4/Dockerfile pending that confirmation.
+
+Also NOT YET established whether the underlying WGM!=1 assembly-codegen
+defect is gfx803-specific or shared with other GCN-family architectures
+-- see wgm-miscompute-source.patch's counterpart in the root repo's
+patches/rocblas/ for the same open question and the working assumption
+(gfx803-specific is more likely, per Schaka, since more heavily-used
+architectures would plausibly have already surfaced a bug this blunt) --
+not repeated here.
+
+WHAT
+----
+Identical transformation to the rocm7 line's patch of the same name,
+applied against this line's separately-pinned Tensile source (same
+anchor text, different line number: 3186 here vs. 3210 in the
+rocm-libraries monorepo copy -- confirmed by direct comparison, not
+assumed identical).
+
+Applies to: Tensile @ ROCmSoftwarePlatform/Tensile commit
+7449c7fefd3d208ba6a2705699cd1c13b654ad87 (rocBLAS's own tensile_tag.txt
+pin at rocm-6.4.4).
+
+diff --git a/Tensile/SolutionStructs.py b/Tensile/SolutionStructs.py
+index 26efe1a6..c3bb67f4 100644
+--- a/Tensile/SolutionStructs.py
++++ b/Tensile/SolutionStructs.py
+@@ -3187,6 +3187,21 @@ class Solution(collections.abc.Mapping):
+       # -1 code is same as 1. Convert to 1.
+       state["WorkGroupMapping" ] = 1
+
++    # GFX803_WGM_MISCOMPUTE_PATCH: on gfx803 (GCN3/Polaris), the assembly
++    # kernel's WorkGroupMapping!=1 swizzle (blockId = wg1 / WGM, then a
++    # magic-number-divide re-deal across a WGM-wide tile block) does not
++    # produce a bijection between workgroups and output tiles -- several
++    # workgroups land on the same tile while others are never claimed, so
++    # the GEMM silently returns wrong results with rocblas_status_success.
++    # WGM only ever permutes which workgroup claims which tile (the grid
++    # and tile set are unchanged), so WorkGroupMapping=1 (identity) is
++    # always a valid, correct assignment -- forcing it here costs some L2
++    # locality on large GEMMs and nothing else. See
++    # patches/rocblas/wgm-miscompute.sh for the hardware measurements
++    # this is based on.
++    if tuple(state["ISA"]) == (8, 0, 3) and state["KernelLanguage"] == "Assembly":
++      state["WorkGroupMapping" ] = 1
++
+     # avoid bug somehow related to GlobalSplitU + Persistent
+     # avoid bug related to WGM<0
+     # General Batch doesn't support PersistentKernel

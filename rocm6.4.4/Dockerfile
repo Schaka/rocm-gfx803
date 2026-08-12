@@ -211,6 +211,15 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # with rocblas_status_success. This rewrites the solution logic before Tensile
 # generates any assembly from it; the script header carries the measurements and
 # the reasoning, and it fails the build if it ever stops matching upstream.
+#
+# A source-level replacement (wgm-miscompute-source.{patch,sh}, also in this
+# directory) exists but is NOT wired in -- the rocm7 line's real
+# rocblas-builder build (same underlying source, same anchor text) found it
+# leaves 518 WGM8 kernel symbols in TensileLibrary_Type_*_fallback_gfx803
+# libraries, which don't route through the SolutionStructs.py hook this
+# patch targets. See ../Dockerfile's identical comment for the full story.
+# Not swapped in here until that gap is closed and independently
+# re-verified against a real build of this line specifically.
 COPY patches/rocblas/ /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 
@@ -738,6 +747,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-pytorch-ccache \
         MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
         USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
         USE_DISTRIBUTED=0 \
+        BUILD_TEST=0 \
         python3 setup.py bdist_wheel
 
 # torchvision and torchaudio both compile extensions against the installed
