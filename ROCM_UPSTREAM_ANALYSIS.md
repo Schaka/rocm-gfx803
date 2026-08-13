@@ -34,10 +34,10 @@ chunks, target TheRock directly, let maintainer feedback decide).
   gfx803-only framing (env-gated, `-a gfx803`-only assumptions, sed
   passes over the whole Logic tree) that upstream will want re-scoped to
   "does this affect other archs on the same code path" before merging
-  into shared Tensile/MIOpen logic. Two of the four (WGM, small-GEMM
-  assembly miscompute) look architecture-general on their face (broken
-  assembly codegen, not a gfx803 hardware quirk) and are the best
-  next candidates to break out.
+  into shared Tensile/MIOpen logic. WGM and small-GEMM assembly
+  miscompute look architecture-general on their face (broken assembly
+  codegen, not a gfx803 hardware quirk) and are the best next candidates
+  to break out.
 - **This repo does not currently build through TheRock's own build
   system** -- it clones `rocm-systems`/`rocm-libraries`/MIGraphX/PyTorch
   individually inside a hand-rolled multi-stage Dockerfile and applies
@@ -135,7 +135,7 @@ repo's patch headers already have.
 
 ## Layer 2: correctness patches -- root-caused, not yet upstream-shaped
 
-All four (WGM, GSU zeroing, small-GEMM assembly, Winograd,
+These correctness patches (WGM, small-GEMM assembly, Winograd,
 reduce-prod-wrong-identity, MLIR-stub) share real strengths that most
 upstream contributions don't arrive with:
 
@@ -146,10 +146,9 @@ upstream contributions don't arrive with:
   codegen path, a specific memory-reuse assumption, a specific compiler
   stub), not a symptom-level workaround.
 - Several explicitly re-verified against the new pin rather than
-  assuming the 6.4.4-era finding still holds (`gsu-workspace-not-zeroed`
-  and `va-reuse-defer`'s "RE-DIFF NOTE" / "NOT AUTOMATICALLY FIXED"
-  sections are exactly the kind of diligence a reviewer would otherwise
-  have to redo themselves).
+  assuming the 6.4.4-era finding still holds (`va-reuse-defer`'s
+  "RE-DIFF NOTE" / "NOT AUTOMATICALLY FIXED" section is exactly the kind
+  of diligence a reviewer would otherwise have to redo themselves).
 
 What would block a clean merge as-is:
 
@@ -179,15 +178,7 @@ What would block a clean merge as-is:
    or, if the yaml-rewrite approach is genuinely necessary, a proper
    diff generated from actually rewriting the files rather than a sed
    invocation described in prose.
-3. **`gsu-workspace-not-zeroed.patch` has no matching `.sh` driver** in
-   `patches/rocblas/`, unlike every sibling patch in this repo (which all
-   pair a `.patch` with a self-verifying `.sh`). Either it's applied via
-   a different, undocumented mechanism in the Dockerfile, or the driver
-   is missing -- worth resolving in this repo regardless of the upstream
-   question, since AGENTS.md's own convention ("every driver script is
-   self-verifying... so a patch that silently stopped applying can't
-   ship unpatched code") is violated here as it stands.
-4. **No CI-visible regression evidence for other architectures.** A
+3. **No CI-visible regression evidence for other architectures.** A
    Tensile/MIOpen maintainer's first question on any of these will be
    "does this change behavior for gfx900/gfx906/gfx942/etc," since these
    are shared logic files, not gfx803-gated code paths the way the CLR/
@@ -311,13 +302,10 @@ Passing) is arguably better than "achievable" -- it's close to done:
    lucbruni-amd's two, since his branch gets enumeration+OpenCL working
    but doesn't yet carry the fix this repo found necessary for
    MIOpen CK correctness under sustained use.
-3. Add the missing `.sh` driver for `gsu-workspace-not-zeroed.patch` (or
-   document why it's intentionally different) -- a correctness gap in
-   this repo's own conventions, independent of the upstream question.
-4. Cross-arch differential test WGM and small-GEMM-assembly against a
+3. Cross-arch differential test WGM and small-GEMM-assembly against a
    second GCN-family or RDNA card before framing either as a Tensile bug
    report; only then open issues against `rocm-libraries`.
-5. Treat Winograd/reduce-prod/MLIR-stub patches as lower priority for
+4. Treat Winograd/reduce-prod/MLIR-stub patches as lower priority for
    upstream outreach until 1-4 land -- not because they're less correct,
    but because a first submission succeeding builds the credibility
    (and maintainer relationship) the later, harder-to-review ones will

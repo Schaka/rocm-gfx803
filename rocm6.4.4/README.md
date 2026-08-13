@@ -2,7 +2,7 @@
 
 Experimental image for Polaris cards -- RX 460, 470, 480, 550, 560, 570, 580,
 590, plus the R9 Fury/Nano generation that shares the gfx803 ISA. Built from
-`Dockerfile` by the manual `gfx803.yml` workflow, entirely separate from
+`Dockerfile` by the manual `gfx803-rocm6.4.4.yml` workflow, entirely separate from
 the nightly matrix in the [main README](../README.md).
 
 > **This is not a supported configuration.** Officially supported is gfx900 and
@@ -49,7 +49,7 @@ different ROCm major, base image and dependency set.
 | rocBLAS | `rocm-6.4.4` tag | Dropped gfx803 from its default `TARGET_LIST` at ROCm 6.0, but the gfx803 Tensile logic (`Logic/asm_full/r9nano/*.yaml`) is still in the tree, so `rmake.py -a gfx803` builds it back. The base image's prebuilt copy has no gfx803 code objects. |
 | MIGraphX | `release/rocm-rel-6.4` | Prebuilt for gfx900+ only, same as on the main image. |
 | PyTorch | `ROCm/pytorch` `release/2.8` | No gfx803 wheel has ever been published. torchvision and torchaudio are built alongside it. |
-| ONNX Runtime | `v1.21.1` | Built against the MIGraphX above. |
+| ONNX Runtime | `v1.22.2` | Built against the MIGraphX above. |
 
 **MIOpen is deliberately *not* rebuilt** -- it comes from the base image
 untouched. It still carries its `Ellesmere`/`Baffin`/`Polaris10`/`Polaris11` →
@@ -93,7 +93,7 @@ for anything large, measure before believing.
 | Base | `rocm/dev-ubuntu-24.04:6.4.4-complete` | Last ROCm 6 release. `-complete` because MIGraphX needs MIOpen's dev files. |
 | Python | 3.12 | Ubuntu 24.04's native interpreter, so no uv overlay is needed here (unlike the main image, whose 26.04 base ships 3.14). |
 | PyTorch | `release/2.8` + torchvision `v0.23.0` + torchaudio `v2.8.0` | Matches AMD's own `rocm/onnxruntime:rocm6.4.4_ub24.04_ort1.21_torch2.8.0`. |
-| ONNX Runtime | `v1.21.1` | Newest release AMD pairs with ROCm 6.4. Also still has the pre-removal `--use_rocm`/`--rocm_home` flags, unlike the v1.27 the main image builds. |
+| ONNX Runtime | `v1.22.2` | Still has the pre-removal `--use_rocm`/`--rocm_home` flags, unlike the v1.28.0 the main image builds. |
 
 > **PyTorch 2.8 vs 2.6.** 2.8 is verified against ROCm 6.4.4, not against
 > gfx803. The combination actually run on Polaris hardware is torch
@@ -135,7 +135,7 @@ Manual only. There is deliberately no schedule: every version above is pinned
 to an immutable ref, so a nightly run would rebuild identical inputs.
 
 ```
-gh workflow run gfx803.yml
+gh workflow run gfx803-rocm6.4.4.yml
 ```
 
 The chain is `rocblas` → {`migraphx`, `pytorch`} → `ort` → `final`. rocBLAS
@@ -191,7 +191,12 @@ correctly.
 If it hangs or the process dies without a Python traceback, check `dmesg` on
 the host before suspecting the image -- see the kernel-version caveat below.
 
-## Known runtime issue: ROCMExecutionProvider crashes on fused conv (musicnn-class models)
+## Fixed bug case study: ROCMExecutionProvider fused-conv crash (musicnn-class models)
+
+**Fixed** -- both root causes are patched (see [`KERNEL_BUGS.md`](KERNEL_BUGS.md)
+for the full record); no workaround is needed anymore. The investigation
+below is kept because it's the reference example for how to chase this class
+of bug in this repo (isolate, rule out empirically, don't assume).
 
 `ROCMExecutionProvider` (the plain kernel-based HIP EP, distinct from
 MIGraphX) is present in this image's ONNX Runtime build as a fallback for

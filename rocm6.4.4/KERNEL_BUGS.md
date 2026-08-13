@@ -23,7 +23,7 @@ next one.
 | int8_float32 GEMM (CT2) | rocBLAS int8_r/int32_r GEMM path | Garbled/repeating output, not a crash | **Confirmed fixed as of the MIOpen grouped-conv fix**, though not independently re-isolated. Retested end-to-end via the real audiomuse-rocm-plugin image (JFK sample, `faster_whisper`, `int8_float32`) after rebuilding the base image with the MIOpen fix: correct transcription, whereas this was previously garbled. Whisper's encoder has real Conv1D layers, so this was plausibly the same `ConvOclDirectFwd` grouped-conv defect corrupting the int8 path's output, not a separate rocBLAS int8 bug -- but that's an inference from the retest, not a confirmed root cause the way the fp32 GEMM and MIOpen bugs above were. Worth a real isolation pass if it regresses. |
 | MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
 | Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
-| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not fixed -- open, below MIOpen.** Fix belongs in the HIP runtime stack (ROCR-Runtime / libhsakmt re-map + invalidation on VA reuse), not MIOpen (confirmed unable: caller owns the recycled d_x). Full root-cause record + ROCm7 repro guidance: see "The ReduceSum kernel-cache mystery" below AND `docs/AGENT_HANDOFF.md` §18. Prior eviction workarounds (always-fresh ~70x slow; LRU-bound 91% not 100%) are NOT shippable. MIOpen-fallback (reduce from a fresh >=16-buffer ring-address internal copy) is proven correct (0/52) at +9-13% perf but is only a fallback. |
+| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Fixed (runtime):** [`patches/rocr/va-reuse-defer.patch`](patches/rocr/va-reuse-defer.patch), wired into `Dockerfile`'s `rocr-builder` stage. See "FIXED (runtime): ROCR va-reuse-defer patch" below for the mechanism, and `wip_patches/README.md` for the full version history (the shipped patch is the v13 "park fully alive, busy-flush teardown" mechanism, not the earlier v4 lineage). Prior eviction workarounds (always-fresh ~70x slow; LRU-bound 91% not 100%) are NOT shippable and were superseded by this fix. |
 
 ## How we found the pervasive GEMM bug
 
@@ -365,8 +365,8 @@ enumerating individual solvers explicitly, for the same reason.
 Not covered by this fix at all:
 
 - **int8/int32 GEMM** (used by CT2's `int8_float32` compute type): different
-  rocBLAS dtype path, confirmed still broken (garbled repeating output, not a
-  crash), not yet investigated with this methodology.
+  rocBLAS dtype path, not covered by this fix -- see the "Known-broken so
+  far" table above for its current (since-resolved) status.
 
 MIOpen's own conv solvers (separate from rocBLAS/Tensile's GEMM library
 entirely, not reached by this shim) were also confirmed to have their own,
@@ -1152,7 +1152,7 @@ small-ring version.
   experiment files (tmpfs -- may not persist across reboot; the important
   knowledge is recorded here and in `docs/AGENT_HANDOFF.md` §18).
 
-## FIXED (runtime) -- 2026-08-09: ROCR va-reuse-defer patch, both gates green
+## FIXED (runtime): ROCR va-reuse-defer patch, both gates green
 
 The runtime fix called for above is implemented and validated:
 `patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`,
@@ -1160,27 +1160,32 @@ wired into `Dockerfile` as the `rocr-builder` stage and into CI as the
 `rocr` component). It patches **ROCR-Runtime @ rocm-6.4.4** only -- libhsakmt
 is statically linked into libhsa-runtime64, so no clr/HIP rebuild is needed.
 
-### What the fix is
-Two layers recycle freed GPU VAs; both are blocked:
+The shipped mechanism is v13 ("park fully alive, busy-flush teardown") --
+see `wip_patches/README.md` for the full version history and
+`wip_patches/v13-park-alive-busy-flush/README.md` for the mechanism in
+detail. Two layers recycle freed GPU VAs; both are blocked:
 
 1. **libhsakmt fmm aperture free-list** (`libhsakmt/src/fmm.c`,
-   `__fmm_release`): the KFD buffer object and physical pages are still freed
-   IMMEDIATELY (no memory-footprint change), but the VA stays reserved -- the
-   vm_object remains in the aperture tree on a per-aperture FIFO and is only
-   returned to the free-list once the FIFO exceeds 64 entries
-   (`FMM_REUSE_QUEUE_MAX`). A freed address therefore can't be re-issued until
-   >=64 intervening frees -- comfortably above the proven ring-16 freshness
-   window -- while the queue is length-bounded and O(1), so nothing leaks
-   (contrast: the earlier "never reuse VAs" leak experiment passed the harness
-   but made ORT time out at 900s with 400+ failures -- VA space exhaustion).
+   `__fmm_release`): a freed object is parked on a per-aperture FIFO fully
+   alive -- BOs NOT freed, GPU mapping NOT touched, VA stays reserved,
+   content intact. Only when the entry ages out (FIFO > `FMM_REUSE_QUEUE_MAX`
+   = 256 entries, or > `FMM_REUSE_BYTES_MAX` = 1GiB parked bytes) does
+   `fmm_do_release()` really free the BOs, inside a *later* FREE call while
+   the GPU pipeline is typically active -- the busy-teardown timing is what
+   actually clears the stale GPU memory-system state (an idle-time teardown
+   does not, per the v9/v10 dead ends in `wip_patches/README.md`). The VA
+   only returns to the aperture free-list once freed, so it can't be
+   reallocated until it has sat through the FIFO window (contrast: the
+   earlier "never reuse VAs" leak experiment passed the harness but made ORT
+   time out at 900s with 400+ failures -- VA space exhaustion).
 2. **libhsa SimpleHeap fragment sub-allocator** (`core/util/flag.h`): default
    of `HSA_DISABLE_FRAGMENT_ALLOCATOR` is INVERTED (now off unless explicitly
    set to "0"). This layer caches freed 2MB blocks above libhsakmt, so the
    fmm defer cannot see its recycles: with it re-enabled (`=0`) the harness
    still fails **10/52 (3/3 runs)** even with the fmm defer active. The flip
    is load-bearing, not optional. Measured cost on the real gates: zero
-   (ORT ReductionOpTest wall time unchanged, 28.4s vs 28.5s stock); it would
-   only show in alloc/free-hot microbenchmarks.
+   (stock 10.888s vs v13 10.843s ORT ReductionOpTest wall time, -0.41%
+   within noise); it would only show in alloc/free-hot microbenchmarks.
 
 ### The one trap in the fix: scratch teardown
 Scratch-backing apertures must bypass the defer FIFO
@@ -1258,11 +1263,15 @@ ReductionOpTest **10/10 runs: 315 OK / 0 FAILED / 0 GPU faults** (previously
 conclusive -- rerun the soak after any further fmm change).
 
 Tooling for this: `run_ort_faultprobe.sh` on the gfx803 box
-(`/data/rocr644-ring16/`), counts per-run `Memory access fault` occurrences;
-lib variants `.r16final` (unhardened, faults) and `.r16v4` (hardened, shipped).
+(`/data/rocr644-ring16/`), counts per-run `Memory access fault` occurrences.
+The handle-scrub/`deferred` flag this fix added carried forward into the
+later v13 mechanism (see the "FIXED (runtime)" section above) -- v13's
+park-alive approach eliminates the fault class further still, per
+`wip_patches/README.md`'s kernel-7.1.7 cross-check (v13: 1/170 vs v4's
+persistent 6/50).
 
-NOTE also a build trap hit here: iterating on `/tmp/opencode/Dockerfile.
-rocr644-ring16` locally, `docker build` served a STALE `ring16.patch` from
-cache despite the file changing (produced a byte-identical lib, hash checked).
-Use `--no-cache` (or verify the extracted lib's sha256 against expectations)
+NOTE also a build trap hit here: iterating on a local quick-iteration
+Dockerfile, `docker build` served a STALE `ring16.patch` from cache despite
+the file changing (produced a byte-identical lib, hash checked). Use
+`--no-cache` (or verify the extracted lib's sha256 against expectations)
 when rebuilding the local quick-iteration image.

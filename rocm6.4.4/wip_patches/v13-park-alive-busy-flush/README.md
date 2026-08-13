@@ -17,7 +17,8 @@ frees, so the stale physical/VA pair churns before reuse.
 ## Why this shape
 
 - **Both ORT gates at once**: harness 0/52; ORT `*ReductionOpTest*`
-  315 OK / 0 FAILED in 20/20 runs (40-run validation running).
+  315 OK / 0 FAILED in 20/20 runs, later reinforced by the 169/170-run
+  kernel-7.1.7 cross-check in `wip_patches/README.md`.
 - **0 faults** (vs ~3/40 for the v4 family): the parked mapping stays alive,
   so an in-flight kernel that reads a buffer freed behind its back hits a
   valid page with the ORIGINAL content (proven required by v11: a fresh

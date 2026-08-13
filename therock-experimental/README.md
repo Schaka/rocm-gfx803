@@ -109,6 +109,18 @@ out to already match `../patches/`'s pins exactly.
   - `0002-miopen-scope-fused-winograd-to-genuine-3x3-on-gfx803.patch`
   - `0003-miopen-fix-reducecalculation-prod-identity.patch`
   - `0004-rocblas-wgm-miscompute-source-fix.patch` -- see below.
+- `llvm-project/`: `0001-offload-fix-missing-OffloadAPI-dependency.patch` --
+  not a gfx803 patch. `offload/plugins-nextgen/common/CMakeLists.txt`'s
+  `PluginCommon` target is missing a build-order dependency on the
+  `OffloadAPI` codegen target, so a parallel ninja build can schedule
+  `PluginCommon`'s compiles before the generated `OffloadAPI.h` exists,
+  failing with "file not found" -- generic amd-llvm/offload build-graph
+  bug, reproducible on any target architecture built through this pin, not
+  specific to this pipeline or to gfx803. Already fixed upstream
+  (llvm/llvm-project@319a50123c63, landed 2026-05-16) but not yet merged
+  into ROCm's amd-staging fork as of `THEROCK_REF`'s pin date; backported
+  here rather than moving `THEROCK_REF` (see "Pinned to an exact commit"
+  above for why floating the pin is avoided).
 
 ### wgm-miscompute: source-level fix, replaces the sed, hardware-verified
 

@@ -4,8 +4,8 @@ Standalone, MIOpen-only (no ORT/PyTorch/model involved) correctness sweeps.
 Each sweep exercises one MIOpen op API directly with synthetic random inputs,
 computes a host CPU reference, and compares via cosine similarity (falling
 back to max-abs-diff when the reference is near-zero, e.g. clamped
-activations). This is the tooling that found and verified all three MIOpen
-bugs fixed by `rocm6.4.4/patches/miopen/` so far.
+activations). This is the tooling that found and verified the MIOpen bugs
+fixed by `patches/miopen/` so far.
 
 ## Why this exists
 
@@ -76,13 +76,13 @@ this repo builds qualifies) with the repo mounted in:
 
 ```sh
 podman run --rm -it \
-  -v /path/to/rocm-migraphx-ort-builder:/work:Z \
+  -v /path/to/rocm-gfx803:/work:Z \
   --device=/dev/kfd --device=/dev/dri --group-add video \
   <image> /bin/bash
 
 # inside the container:
-sh /work/rocm6.4.4/tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm-6.4.4
-sh /work/rocm6.4.4/tools/correctness-suite/run_all.sh /tmp/suite-bin
+sh /work/tools/correctness-suite/build.sh /tmp/suite-bin /opt/rocm
+sh /work/tools/correctness-suite/run_all.sh /tmp/suite-bin
 ```
 
 `run_all.sh` exits non-zero if anything failed, so it's safe to use as a
@@ -105,7 +105,7 @@ every time. Both `build.sh` and `run_all.sh` take an `ONLY` env var
 (space-separated names) for exactly this:
 
 ```sh
-ONLY=reduce_sweep sh build.sh /tmp/suite-bin /opt/rocm-6.4.4
+ONLY=reduce_sweep sh build.sh /tmp/suite-bin /opt/rocm
 ONLY=reduce_sweep sh run_all.sh /tmp/suite-bin /tmp/suite-results
 
 # conv solver sweeps are named "conv:<SolverName>" (matching shapes/*.txt):
