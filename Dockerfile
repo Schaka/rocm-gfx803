@@ -743,7 +743,10 @@ ARG ROCM_ARCH=gfx803
 ARG PYTORCH_REF
 ARG BUILD_PARALLEL_LEVEL
 
-COPY --from=rocblas-export /opt/rocm /opt/rocm
+# migraphx-export, not rocblas-export: pytorch needs the gfx803-patched
+# rocBLAS AND MIOpen, which only migraphx-export's /opt/rocm carries (same
+# reasoning as ort-builder below).
+COPY --from=migraphx-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
