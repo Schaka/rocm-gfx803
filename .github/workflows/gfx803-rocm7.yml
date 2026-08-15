@@ -190,6 +190,11 @@ jobs:
       # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
       # RSS -- real headroom for that spike, not a source-level workaround.
       swap-size-gb: '24'
+      # At the Dockerfile's auto job count (~3 on this runner), TensorTopK's
+      # RSS spike lands concurrently with other compiles, pushing total
+      # memory past the runner's 16GB RAM into swap thrash. Capping
+      # parallelism gives that one compile more of the box to itself.
+      build-parallel-level: '2'
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
