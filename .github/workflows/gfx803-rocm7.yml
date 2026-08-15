@@ -192,9 +192,10 @@ jobs:
       swap-size-gb: '24'
       # At the Dockerfile's auto job count (~3 on this runner), TensorTopK's
       # RSS spike lands concurrently with other compiles, pushing total
-      # memory past the runner's 16GB RAM into swap thrash. Capping
-      # parallelism gives that one compile more of the box to itself.
-      build-parallel-level: '2'
+      # memory past the runner's 16GB RAM into swap thrash. 2 concurrent
+      # jobs still reached the same stall point without clearing it, so
+      # this compile alone needs the whole runner's RAM to stay resident.
+      build-parallel-level: '1'
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
