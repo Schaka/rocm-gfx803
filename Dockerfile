@@ -815,7 +815,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
     fi; \
     echo "PyTorch build (stage 1): using $jobs parallel jobs"; \
     set +e; \
-    timeout --signal=INT 4h45m \
+    timeout --signal=INT 330m \
         env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
             "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
             MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
@@ -845,7 +845,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
     fi; \
     echo "PyTorch build (stage 2): using $jobs parallel jobs"; \
     set +e; \
-    timeout --signal=INT 4h45m \
+    timeout --signal=INT 330m \
         env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
             "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
             MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
