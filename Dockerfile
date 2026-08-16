@@ -92,6 +92,14 @@ ARG ROCBLAS_IMAGE=rocblas-builder
 ARG MIOPEN_IMAGE=miopen-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
+# Overridable per-stage so each of pytorch's split CI jobs (see
+# pytorch-configure below) can point its FROM at the previous job's
+# locally-loaded image instead of the next stage in this same file --
+# same indirection mechanism as every other *_IMAGE ARG here, just backed
+# by a docker-save/load handoff between jobs rather than a registry pull.
+ARG PYTORCH_CONFIGURE_IMAGE=pytorch-configure
+ARG PYTORCH_COMPILE1_IMAGE=pytorch-compile-1
+ARG PYTORCH_COMPILE2_IMAGE=pytorch-compile-2
 ARG TORCHVISION_IMAGE=torchvision-builder
 ARG TORCHAUDIO_IMAGE=torchaudio-builder
 ARG ORT_IMAGE=ort-builder
@@ -737,11 +745,10 @@ RUN if ! find /opt/rocm -iname "migraphx.cpython-312-*.so" | grep -q .; then \
 
 FROM ${MIGRAPHX_IMAGE} AS migraphx-export
 
-FROM python-base AS pytorch-builder
+FROM python-base AS pytorch-configure
 
 ARG ROCM_ARCH=gfx803
 ARG PYTORCH_REF
-ARG BUILD_PARALLEL_LEVEL
 
 # migraphx-export, not rocblas-export: pytorch needs the gfx803-patched
 # rocBLAS AND MIOpen, which only migraphx-export's /opt/rocm carries (same
@@ -769,6 +776,35 @@ WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py
 
+# CMAKE_ONLY=1 (documented in PyTorch's CONTRIBUTING.md) stops after CMake
+# configure -- every USE_*/BUILD_* flag below has to be set here too, since
+# they become CMake options baked into build/CMakeCache.txt at this step;
+# setup.py's own cmake.py skips reconfigure whenever that file already
+# exists, so a flag only passed to a later compile stage would silently
+# never take effect.
+RUN env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
+        "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
+        USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
+        USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
+        USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
+        BUILD_TEST=0 CMAKE_ONLY=1 \
+        python3 setup.py build
+
+# PyTorch's from-source compile alone exceeds a single CI job's 6-hour wall
+# clock, whatever the parallelism -- 3 concurrent jobs blitz through most
+# targets but then wedge for hours on one -O3 AMDGPU backend TU (RSS far
+# past the runner's RAM, swapping instead of failing); 1 job avoids that
+# wedge but at roughly 1/3 the throughput, so it *also* misses the 6h
+# window, just without ever looking stuck. Neither knob alone fits in one
+# job -- splitting the compile itself across several jobs, each with its
+# own fresh 6-hour budget, is what actually fits it. ninja's own resumable
+# state (build/.ninja_log + object-file mtimes) is what makes picking back
+# up in the next stage/job just continue, not restart.
+FROM ${PYTORCH_CONFIGURE_IMAGE} AS pytorch-compile-1
+
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
     ulimit -s unlimited && \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
@@ -777,7 +813,68 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
         cpu=$(nproc); [ "$jobs" -gt "$cpu" ] && jobs=$cpu; \
         [ "$jobs" -lt 1 ] && jobs=1; \
     fi; \
-    echo "PyTorch build: using $jobs parallel jobs"; \
+    echo "PyTorch build (stage 1): using $jobs parallel jobs"; \
+    set +e; \
+    timeout --signal=INT 4h45m \
+        env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
+            "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
+            MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
+            USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
+            USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
+            BUILD_TEST=0 \
+            python3 setup.py build; \
+    rc=$?; \
+    set -e; \
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 130 ]; then \
+        echo "PyTorch build (stage 1): failed with exit $rc" >&2; exit "$rc"; \
+    fi; \
+    echo "PyTorch build (stage 1): stopped (rc=$rc) -- resuming in stage 2"
+
+FROM ${PYTORCH_COMPILE1_IMAGE} AS pytorch-compile-2
+
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
+    ulimit -s unlimited && \
+    jobs="${BUILD_PARALLEL_LEVEL}"; \
+    if [ "$jobs" = "auto" ]; then \
+        jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
+        cpu=$(nproc); [ "$jobs" -gt "$cpu" ] && jobs=$cpu; \
+        [ "$jobs" -lt 1 ] && jobs=1; \
+    fi; \
+    echo "PyTorch build (stage 2): using $jobs parallel jobs"; \
+    set +e; \
+    timeout --signal=INT 4h45m \
+        env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
+            "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
+            MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
+            USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
+            USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
+            BUILD_TEST=0 \
+            python3 setup.py build; \
+    rc=$?; \
+    set -e; \
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 130 ]; then \
+        echo "PyTorch build (stage 2): failed with exit $rc" >&2; exit "$rc"; \
+    fi; \
+    echo "PyTorch build (stage 2): stopped (rc=$rc) -- resuming in stage 3"
+
+FROM ${PYTORCH_COMPILE2_IMAGE} AS pytorch-builder
+
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+# Build already finished (or nearly so) by stage 2 -- setup.py's own
+# resume logic (see stage 1's comment) makes this pick up whatever's left
+# and package the result, not start over.
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
+    jobs="${BUILD_PARALLEL_LEVEL}"; \
+    if [ "$jobs" = "auto" ]; then \
+        jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
+        cpu=$(nproc); [ "$jobs" -gt "$cpu" ] && jobs=$cpu; \
+        [ "$jobs" -lt 1 ] && jobs=1; \
+    fi; \
     env USE_ROCM=1 USE_CUDA=0 ROCM_HOME=/opt/rocm \
         "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \

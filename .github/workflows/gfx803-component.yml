@@ -123,11 +123,6 @@ on:
         required: false
         type: string
         default: '16'
-      build-parallel-level:
-        description: 'Override BUILD_PARALLEL_LEVEL (empty uses the Dockerfile default, "auto"). Lower this when a single TU''s peak RSS is large enough that the auto job count still leaves multiple such compiles competing for the runner''s RAM at once.'
-        required: false
-        type: string
-        default: ''
 
 jobs:
   build:
@@ -230,7 +225,6 @@ jobs:
             [ -n "${{ inputs.pytorch-ref }}" ] && echo "PYTORCH_REF=${{ inputs.pytorch-ref }}"
             [ -n "${{ inputs.torchvision-ref }}" ] && echo "TORCHVISION_REF=${{ inputs.torchvision-ref }}"
             [ -n "${{ inputs.torchaudio-ref }}" ] && echo "TORCHAUDIO_REF=${{ inputs.torchaudio-ref }}"
-            [ -n "${{ inputs.build-parallel-level }}" ] && echo "BUILD_PARALLEL_LEVEL=${{ inputs.build-parallel-level }}"
             echo "ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
