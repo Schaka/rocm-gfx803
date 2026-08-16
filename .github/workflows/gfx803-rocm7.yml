@@ -174,78 +174,24 @@ jobs:
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
-  # PyTorch's from-source compile alone exceeds a single 360-minute CI job,
-  # whatever the parallelism -- see the Dockerfile's pytorch-configure
-  # comment for the full reasoning. Split across 4 jobs here, each with its
-  # own fresh 360-minute budget, chained via gfx803-pytorch-stage.yml's
-  # docker-save/docker-load artifact handoff rather than a registry push --
-  # only the last stage (still named "pytorch", so every downstream job's
-  # `needs: pytorch` below keeps working unchanged) is real, published
-  # output.
-  pytorch-configure:
+  pytorch:
     needs: migraphx
     if: ${{ !cancelled() && inputs.build-pytorch && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/gfx803-pytorch-stage.yml
+    uses: ./.github/workflows/gfx803-component.yml
     secrets: inherit
     with:
-      target: pytorch-configure
+      component: pytorch
+      target: pytorch-builder
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
-      upload-artifact-name: pytorch-stage-configure
-      debug: ${{ inputs.debug }}
-
-  pytorch-compile-1:
-    needs: pytorch-configure
-    if: ${{ !cancelled() && needs.pytorch-configure.result == 'success' }}
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/gfx803-pytorch-stage.yml
-    secrets: inherit
-    with:
-      target: pytorch-compile-1
-      download-artifact-name: pytorch-stage-configure
-      download-build-arg: PYTORCH_CONFIGURE_IMAGE
-      upload-artifact-name: pytorch-stage-compile-1
       # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
       # RSS -- real headroom for that spike, not a source-level workaround.
       swap-size-gb: '24'
       debug: ${{ inputs.debug }}
-
-  pytorch-compile-2:
-    needs: pytorch-compile-1
-    if: ${{ !cancelled() && needs.pytorch-compile-1.result == 'success' }}
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/gfx803-pytorch-stage.yml
-    secrets: inherit
-    with:
-      target: pytorch-compile-2
-      download-artifact-name: pytorch-stage-compile-1
-      download-build-arg: PYTORCH_COMPILE1_IMAGE
-      upload-artifact-name: pytorch-stage-compile-2
-      swap-size-gb: '24'
-      debug: ${{ inputs.debug }}
-
-  pytorch:
-    needs: pytorch-compile-2
-    if: ${{ !cancelled() && needs.pytorch-compile-2.result == 'success' }}
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/gfx803-pytorch-stage.yml
-    secrets: inherit
-    with:
-      target: pytorch-builder
-      download-artifact-name: pytorch-stage-compile-2
-      download-build-arg: PYTORCH_COMPILE2_IMAGE
-      push: true
-      swap-size-gb: '24'
-      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
 
   # torchvision and torchaudio each get their own job/image rather than
   # building inside pytorch's, same as the mainline repo's per-component
