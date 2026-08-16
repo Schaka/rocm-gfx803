@@ -188,7 +188,10 @@ jobs:
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
       # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
-      # RSS -- real headroom for that spike, not a source-level workaround.
+      # RSS and multiple hours regardless of hardware; -O1 for just this
+      # file clears it in under a minute -- confirmed on both a 4-vCPU/16GB
+      # CI runner and a 24-core/30GB workstation.
+      tensor-topk-opt-level: '-O1'
       swap-size-gb: '24'
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}

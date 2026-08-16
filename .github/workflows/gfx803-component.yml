@@ -123,6 +123,11 @@ on:
         required: false
         type: string
         default: '16'
+      tensor-topk-opt-level:
+        description: 'Override TENSOR_TOPK_OPT_LEVEL (empty uses the Dockerfile default, -O3). Lower this for pytorch specifically -- TensorTopK.hip''s -O3 AMDGPU backend compile has been measured taking 40GB+ RSS+swap and multiple hours; -O1 clears it in under a minute.'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -225,6 +230,7 @@ jobs:
             [ -n "${{ inputs.pytorch-ref }}" ] && echo "PYTORCH_REF=${{ inputs.pytorch-ref }}"
             [ -n "${{ inputs.torchvision-ref }}" ] && echo "TORCHVISION_REF=${{ inputs.torchvision-ref }}"
             [ -n "${{ inputs.torchaudio-ref }}" ] && echo "TORCHAUDIO_REF=${{ inputs.torchaudio-ref }}"
+            [ -n "${{ inputs.tensor-topk-opt-level }}" ] && echo "TENSOR_TOPK_OPT_LEVEL=${{ inputs.tensor-topk-opt-level }}"
             echo "ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 

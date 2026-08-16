@@ -742,6 +742,7 @@ FROM python-base AS pytorch-builder
 ARG ROCM_ARCH=gfx803
 ARG PYTORCH_REF
 ARG BUILD_PARALLEL_LEVEL
+ARG TENSOR_TOPK_OPT_LEVEL=-O3
 
 # migraphx-export, not rocblas-export: pytorch needs the gfx803-patched
 # rocBLAS AND MIOpen, which only migraphx-export's /opt/rocm carries (same
@@ -769,20 +770,23 @@ WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py
 
-# TensorTopK.hip's -O3 AMDGPU backend compile has been measured taking
-# 40GB+ combined RSS+swap and multiple hours regardless of available
-# cores/RAM (both a 4-vCPU/16GB CI runner and a 24-core/30GB workstation
-# hit the same wall). -O2 for just this one file cuts both without
-# touching every other kernel's codegen. PyTorch's build system has no
-# per-file flag override, so this wraps the compiler binary it invokes by
-# absolute path instead -- a build-environment change, not a patch on
-# PyTorch's own source.
+# TensorTopK.hip's default -O3 AMDGPU backend compile has been measured
+# taking 40GB+ combined RSS+swap and multiple hours regardless of
+# available cores/RAM (both a 4-vCPU/16GB CI runner and a 24-core/30GB
+# workstation hit the same wall). A lower TENSOR_TOPK_OPT_LEVEL for just
+# this one file cuts both without touching every other kernel's codegen --
+# confirmed at -O1, which cleared it in under a minute. Left at -O3 by
+# default since this stays a real perf/build-time tradeoff for CI to opt
+# into explicitly, not a source-level fact about the file. PyTorch's build
+# system has no per-file flag override, so this wraps the compiler binary
+# it invokes by absolute path instead -- a build-environment change, not a
+# patch on PyTorch's own source.
 RUN real=/opt/rocm/lib/llvm/bin/clang++.real \
     && mv /opt/rocm/lib/llvm/bin/clang++ "$real" \
     && printf '%s\n' \
         '#!/bin/sh' \
         "case \"\$*\" in" \
-        "  *TensorTopK.hip*) exec $real \"\$@\" -O2 ;;" \
+        "  *TensorTopK.hip*) exec $real \"\$@\" ${TENSOR_TOPK_OPT_LEVEL} ;;" \
         "  *) exec $real \"\$@\" ;;" \
         'esac' \
         > /opt/rocm/lib/llvm/bin/clang++ \
