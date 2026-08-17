@@ -1027,16 +1027,33 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torc
     && "$VIRTUAL_ENV/bin/python3" -c "import migraphx; print('migraphx python module OK')"
 
 # This image is a drop-in base for downstream Dockerfiles -- any of them can
-# `pip install`/`uv pip install` something that pulls in torch, torchvision,
-# torchaudio or onnxruntime as a transitive dependency (e.g. faster-whisper
-# via ctranslate2's onnxruntime dependency), and pip will silently swap this
-# image's MIGraphX-EP/gfx803 build for a generic PyPI wheel with neither --
-# no error, no warning. Pinning the exact already-installed version turns
-# that from a silent swap into a loud resolution failure: pip/uv can't
-# satisfy the pin from any index, only by reusing what's already installed.
-# Both env vars are set because pip reads PIP_CONSTRAINT and uv reads
+# `pip install`/`uv pip install` something that pulls in torch, torchvision
+# or torchaudio as a transitive dependency, and pip will silently swap this
+# image's ROCm/gfx803 build for a generic PyPI wheel with neither -- no
+# error, no warning. Pinning the exact already-installed version turns that
+# from a silent swap into a loud resolution failure: pip/uv can't satisfy
+# the pin from any index, only by reusing what's already installed. Both
+# env vars are set because pip reads PIP_CONSTRAINT and uv reads
 # UV_CONSTRAINT -- neither honors the other's.
-RUN "$VIRTUAL_ENV/bin/pip" freeze --local | grep -E '^(torch|torchvision|torchaudio|onnxruntime)==' > /opt/pip-constraints.txt \
+#
+# importlib.metadata, not `pip freeze | grep`: torch/torchvision/torchaudio
+# and the ORT wheel here were all installed from a local file path
+# (`pip install ./dist/*.whl`), which pip freeze renders as
+# `name @ file:///...` rather than `name==version` -- the `==`-anchored
+# grep this used to be never matches that format regardless of install
+# order. importlib.metadata.version() reads the installed distribution's
+# actual version regardless of how it got there.
+#
+# The distribution here is onnxruntime-migraphx, not onnxruntime (its
+# import name is onnxruntime, but that's a different thing from its pip
+# package name) -- pinning it protects against a transitive
+# onnxruntime-migraphx pull, not a transitive plain onnxruntime one. A
+# downstream Dockerfile that pulls in generic `onnxruntime` (e.g.
+# faster-whisper via ctranslate2) is not blocked by this constraint file;
+# closing that gap needs the wheel itself renamed or a real pip
+# override, not a constraints-file entry under a name nothing is
+# installed as.
+RUN "$VIRTUAL_ENV/bin/python3" -c "import importlib.metadata as m; [print(f'{p}=={m.version(p)}') for p in ('torch', 'torchvision', 'torchaudio', 'onnxruntime-migraphx')]" > /opt/pip-constraints.txt \
     && cat /opt/pip-constraints.txt
 ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
 ENV UV_CONSTRAINT=/opt/pip-constraints.txt
