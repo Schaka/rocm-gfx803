@@ -12,18 +12,17 @@ build the Dockerfile locally unless you're patching something. Pull it:
 
 ```bash
 # rocm7 (main line, ROCm 7.14) -- versioned tag
-docker pull ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:rocm7.14-gfx803
+docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm7.14-gfx803
 
 # rocm7 -- always the newest successful rocm7 build
-docker pull ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:latest-gfx803
+docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:latest-gfx803
 
 # rocm6.4.4 (older, hardware-verified line) -- versioned tag
-docker pull ghcr.io/<owner>/rocm-migraphx-ort-torch-builder:rocm6.4.4-gfx803
+docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm6.4.4-gfx803
 ```
 
-Replace `<owner>` with this repo's GitHub owner/org, lowercased. See
-"Repository layout" and `.github/workflows/gfx803-component.yml` for the
-full tag scheme (per-component images, cache tags, dated tags).
+See "Repository layout" and `.github/workflows/gfx803-component.yml` for
+the full tag scheme (per-component images, cache tags, dated tags).
 
 ## Why a separate repo
 
