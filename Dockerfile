@@ -285,7 +285,12 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-clr-ccache \
         echo "FATAL: installed libhsa-runtime64.so still contains the DoorbellType!=2 throw string." >&2; \
         exit 1; \
     fi \
-    && echo "OK: patched HSA runtime installed, no deprecated-doorbell throw string present." \
+    && echo "Verifying the active libamdhip64 is this build, not the stock one..." \
+    && if ! strings "$(readlink -f /opt/rocm/lib/libamdhip64.so)" 2>/dev/null | grep -q "Image extension queries failed"; then \
+        echo "FATAL: active libamdhip64.so does not carry the gfx8 opencl patch marker." >&2; \
+        exit 1; \
+    fi \
+    && echo "OK: patched HSA runtime installed, no deprecated-doorbell throw string present, patched libamdhip64 active." \
     && /opt/rocm/bin/hipconfig --version
 
 FROM ${ROCR_CLR_IMAGE} AS rocr-clr-export
@@ -437,15 +442,21 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocblas-ccache \
 # tested -- see patches/rocblas/sgemm-shim/gfx803_sgemm.h for the full
 # investigation. LD_PRELOAD shim that routes the standard-algo f32
 # rocblas_sgemm/rocblas_gemm_ex path to a correctness-verified replacement
-# kernel; the ENV enabling it lives in the final stage. Byte-identical to
-# rocm6.4.4/patches/rocblas/sgemm-shim/ today, kept as its own copy so this line
-# can change it without touching the 6.4.4 build (see the header).
+# kernel; the ENV enabling it lives in the final stage. This line also
+# intercepts rocblas_gemm_strided_batched_ex (small problems only) for the
+# batched attention dots MIGraphX lowers there -- rocm6.4.4 does NOT have
+# that interceptor yet. Kept as its own copy so this line can change without
+# touching the 6.4.4 build (see the header); the strided-batched takeover
+# fix is verified by the sb-takeover-no-algo-gate marker check below.
 RUN mkdir -p /opt/rocm-sgemm-shim
 COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
 RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
         /opt/rocm-sgemm-shim/sgemm_shim.cpp \
         -o /opt/rocm/lib/libgfx803_sgemm_shim.so \
         -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lrocblas -ldl \
+    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so 2>/dev/null | grep -q "sb-takeover-no-algo-gate"; then \
+        echo "FATAL: shim built without the strided-batched takeover fix (algo gate)." >&2; exit 1; \
+    fi \
     && rm -rf /opt/rocm-sgemm-shim
 
 FROM ${ROCBLAS_IMAGE} AS rocblas-export
@@ -971,7 +982,18 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 
-RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
+# The wholesale /opt/rocm copies above come from pre-built component images;
+# a stale cached export layer can silently re-point the libamdhip64.so.7
+# symlink back at the base image's stock unpatched build (seen in practice:
+# build succeeded, hipGetDeviceCount returned 0 with the patched lib sitting
+# right next to the active one). Check the RESOLVED library, not the symlink
+# target name, so this fails loudly if the active lib doesn't carry the gfx8
+# opencl patch marker regardless of which layer re-pointed it.
+RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig \
+    && if ! strings "$(readlink -f /opt/rocm/lib/libamdhip64.so)" 2>/dev/null | grep -q "Image extension queries failed"; then \
+        echo "FATAL: active libamdhip64.so does not carry the gfx8 opencl patch marker." >&2; \
+        exit 1; \
+    fi
 
 # libdrm2/libdrm-amdgpu1: every core ROCm lib built in this image
 # (libhsa-runtime64, libamdhip64, librocblas, libMIOpen, migraphx's python

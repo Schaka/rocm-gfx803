@@ -89,13 +89,17 @@ diffed and consciously merged back together -- see "Convergence" below.
   `rocminfo` enumerates the card as a real `KERNEL_DISPATCH` agent, and
   rocBLAS/MIOpen/MIGraphX/PyTorch/ORT have all done real GPU work on it. The
   full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean.
-  ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
-  against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
-  separate real regressions from generic upstream gaps -- one confirmed
-  regression remains open (`ConvTranspose`, traced to an upstream MIGraphX
-  bug, not gfx803-specific -- see `MIGRATION_NOTES.md`). Real-model
-  validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
-  HIP-accelerated) all pass with correct transcripts on real audio.
+ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
+   against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
+   separate real regressions from generic upstream gaps. One confirmed
+   gfx803-specific regression (the `attention_*_gqa_with_past_and_present_expanded`
+   tests, traced to the rocBLAS strided-batched gemm GSU workspace-reuse
+   miscompute) was root-caused and fixed via the sgemm-shim's new
+   strided-batched interceptor -- see `MIGRATION_NOTES.md`. One regression
+   remains open (`ConvTranspose`, traced to an upstream MIGraphX bug, not
+   gfx803-specific). Real-model
+   validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
+   HIP-accelerated) all pass with correct transcripts on real audio.
 - **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
   `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 - **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third

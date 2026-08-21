@@ -128,6 +128,40 @@ directly, that Dockerfile's `rocblas-builder` stage only calls
 `wgm-miscompute.sh` and `small-gemm-assembly-miscompute.sh`. Not wired
 into this line's `Dockerfile` either, for the same reason.
 
+### sgemm-shim strided-batched interceptor -- new for this line, attention GQA fix
+
+The blanket `libgfx803_sgemm_shim.so` (routes f32 rocBLAS sgemm/gemm_ex to
+the verified `gfx803_sgemm` kernel) left one broken path uncovered:
+`rocblas_gemm_strided_batched_ex`, which is what MIGraphX's batched
+`gpu::gemm` lowering calls for attention QK/QV dots (batch dims collapsed
+into the gemm's M/N). On 7.14 that path still hit the GSU workspace-reuse
+miscompute class (see `gfx803_sgemm.h` for the root cause), failing the
+two `attention_*_gqa_with_past_and_present_expanded_cpu` ORT tests with
+maxdiff up to ~4.5x.
+
+The fix is a third interceptor in `sgemm_shim.cpp` for
+`rocblas_gemm_strided_batched_ex`, looping `gfx803_sgemm` over the batch,
+scoped to max(m,n,k) <= 32 (large batched GEMMs stay on real rocBLAS).
+
+**The one thing that matters and is easy to get wrong**: the take-over gate
+must NOT require `algo == rocblas_gemm_algo_standard`. `rocblas_gemm_algo_standard`
+is 0, and MIGraphX passes `algo=1`, so that gate silently rejects every
+take-over and falls through to the broken real rocBLAS kernel -- exactly
+what happened during the investigation (the interceptor existed and looked
+engaged, but the gate never matched, so nothing was actually fixed). The
+shipped gate is `all_f32 && solution_index == 0 && c == d &&
+small_problem && stride_c == stride_d && ldc == ldd`, no algo check. A
+`sb-takeover-no-algo-gate` marker is embedded in the debug fprintf and the
+Dockerfile build guard greps the built `.so` for it, so a regressed build
+fails loudly instead of silently shipping a dead interceptor.
+
+Verified on real gfx803: both attention GQA tests pass, full ORT suite
+failures 13 -> 11 with exactly those two tests fixed and zero new
+failures. This line's shim now differs from `rocm6.4.4/`'s copy (which
+has no strided-batched interceptor) -- deliberate per the two-independent-
+copies rule; the 6.4.4 line should get the same fix when converged or
+independently re-verified.
+
 ## Layer 4: MIOpen
 
 Three patches from the 6.4.4 line evaluated: two ported clean, one

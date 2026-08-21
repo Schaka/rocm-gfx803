@@ -1,7 +1,8 @@
-// LD_PRELOAD shim: intercepts rocblas_sgemm / rocblas_gemm_ex and routes the
-// standard-algo fp32 path to gfx803_sgemm.h instead of rocBLAS/Tensile's own
-// kernels, which are unreliable on gfx803 for every shape tested so far --
-// see gfx803_sgemm.h's header comment for the full investigation.
+// LD_PRELOAD shim: intercepts rocblas_sgemm / rocblas_gemm_ex / 
+// rocblas_gemm_strided_batched_ex and routes the standard-algo fp32 path to
+// gfx803_sgemm.h instead of rocBLAS/Tensile's own kernels, which are
+// unreliable on gfx803 for every shape tested so far -- see gfx803_sgemm.h's
+// header comment for the full investigation.
 //
 // SCOPE: as of this patch, this intercepts ALL standard-algo f32
 // rocblas_sgemm/rocblas_gemm_ex calls, not just specific proven-broken
@@ -10,6 +11,15 @@
 // solution_index requests, non-standard algo) falls through untouched to
 // the real rocBLAS symbol via dlsym(RTLD_NEXT, ...), so this only affects
 // the path it has actually replaced and verified.
+//
+// rocblas_gemm_strided_batched_ex is intercepted too, but only for
+// max(m,n,k) <= 32 -- the small-problem region where gfx803's assembly
+// kernels are known-broken (the 6.4.4 sweep measured them correct from
+// ~48x48x48 up). Batched attention dots (QK/QV, batch collapsed into
+// m/n) land here and miscompute on 7.14; large batched GEMMs stay on
+// real rocBLAS because the simple kernel is correctness-verified but not
+// tuned, and routing 4096^3 through it would cost far more than the fix
+// is worth.
 //
 // NOTE 1: tools/rocblas_sweep.cpp's overnight matrix scan (see KERNEL_BUGS.md)
 // found that every explicitly-selected Tensile solution (via
@@ -64,8 +74,18 @@ typedef rocblas_status (*rocblas_gemm_ex_t)(rocblas_handle, rocblas_operation, r
                                             void*, rocblas_datatype, rocblas_int,
                                             rocblas_datatype, rocblas_gemm_algo, int32_t, uint32_t);
 
+typedef rocblas_status (*rocblas_gemm_strided_batched_ex_t)(
+    rocblas_handle, rocblas_operation, rocblas_operation,
+    rocblas_int, rocblas_int, rocblas_int,
+    const void*, const void*, rocblas_datatype, rocblas_int, rocblas_stride,
+    const void*, rocblas_datatype, rocblas_int, rocblas_stride,
+    const void*, const void*, rocblas_datatype, rocblas_int, rocblas_stride,
+    void*, rocblas_datatype, rocblas_int, rocblas_stride,
+    rocblas_int, rocblas_datatype, rocblas_gemm_algo, int32_t, uint32_t);
+
 static rocblas_sgemm_t real_rocblas_sgemm = nullptr;
 static rocblas_gemm_ex_t real_rocblas_gemm_ex = nullptr;
+static rocblas_gemm_strided_batched_ex_t real_rocblas_gemm_strided_batched_ex = nullptr;
 
 static void ensure_real_symbols() {
     if (!real_rocblas_sgemm) {
@@ -73,6 +93,10 @@ static void ensure_real_symbols() {
     }
     if (!real_rocblas_gemm_ex) {
         real_rocblas_gemm_ex = (rocblas_gemm_ex_t)dlsym(RTLD_NEXT, "rocblas_gemm_ex");
+    }
+    if (!real_rocblas_gemm_strided_batched_ex) {
+        real_rocblas_gemm_strided_batched_ex =
+            (rocblas_gemm_strided_batched_ex_t)dlsym(RTLD_NEXT, "rocblas_gemm_strided_batched_ex");
     }
 }
 
@@ -161,6 +185,93 @@ extern "C" rocblas_status rocblas_gemm_ex(rocblas_handle handle,
                                     a, a_type, lda, b, b_type, ldb, beta,
                                     c, c_type, ldc, d, d_type, ldd,
                                     compute_type, algo, solution_index, flags);
+    }
+    return rocblas_status_success;
+}
+
+extern "C" rocblas_status rocblas_gemm_strided_batched_ex(
+    rocblas_handle handle, rocblas_operation transA, rocblas_operation transB,
+    rocblas_int m, rocblas_int n, rocblas_int k,
+    const void* alpha,
+    const void* a, rocblas_datatype a_type, rocblas_int lda, rocblas_stride stride_a,
+    const void* b, rocblas_datatype b_type, rocblas_int ldb, rocblas_stride stride_b,
+    const void* beta,
+    const void* c, rocblas_datatype c_type, rocblas_int ldc, rocblas_stride stride_c,
+    void* d, rocblas_datatype d_type, rocblas_int ldd, rocblas_stride stride_d,
+    rocblas_int batch_count, rocblas_datatype compute_type, rocblas_gemm_algo algo,
+    int32_t solution_index, uint32_t flags) {
+    ensure_real_symbols();
+
+    bool all_f32 = (a_type == rocblas_datatype_f32_r && b_type == rocblas_datatype_f32_r &&
+                    c_type == rocblas_datatype_f32_r && d_type == rocblas_datatype_f32_r &&
+                    compute_type == rocblas_datatype_f32_r);
+    // Take-over contract: f32, default solution, in-place C==D, shim not
+    // disabled, scoped to the small-problem region where gfx803's Tensile
+    // assembly kernels are known unreliable. This is the strided-batched
+    // entry point that batched gpu::gemm lowering hits for attention QK/QV
+    // dots (batch dims collapsed into the gemm's M/N), which neither the
+    // blanket sgemm/gemm_ex shim nor the small-gemm patch's all-dims-<=8
+    // gate covers -- the GSU workspace-reuse race class from KERNEL_BUGS.md
+    // still miscomputes there on 7.14 (seen: attention GQA tests, wrong by
+    // up to ~4.5x). Large batched gemms stay on real rocBLAS: the simple
+    // kernel is correctness-verified but not tuned, and forcing e.g. 4096^3
+    // batched GEMMs through it would cost far more than the correctness fix
+    // is worth. The 6.4.4 sweep measured the assembly kernels correct from
+    // ~48x48x48 up, so max-dim <= 32 is safely inside the broken region.
+    bool small_problem = (m <= 32 && n <= 32 && k <= 32);
+    // NOTE: no algo == rocblas_gemm_algo_standard check here (unlike the
+    // gemm_ex interceptor above): MIGraphX's batched gemm lowering passes
+    // algo=rocblas_gemm_algo_1, not standard, so an algo gate would silently
+    // reject every take-over and fall through to the broken real rocBLAS
+    // kernel. The gfx803_sgemm kernel ignores the algo hint anyway -- it
+    // implements the standard semantic -- so restricting on it buys nothing
+    // here.
+    // Marker for the Dockerfile build guard (grep for
+    // "sb-takeover-no-algo-gate" in the built .so to confirm this fix is
+    // actually in the shipped binary). Carried in the debug fprintf's format
+    // string below so the literal survives into .rodata -- a plain unused
+    // const gets optimized away.
+    bool take_over = all_f32 && solution_index == 0 && !env_shim_disabled() && c == d
+                     && small_problem && stride_c == stride_d && ldc == ldd;
+    if (getenv("GFX803_SGEMM_SHIM_DEBUG")) {
+        fprintf(stderr,
+                "shim sb: m=%d n=%d k=%d batch=%d f32=%d algo=%d si=%d c==d=%d small=%d "
+                "sc==sd=%d ldc==ldd=%d disabled=%d [sb-takeover-no-algo-gate]\n",
+                m, n, k, batch_count, all_f32, (int)algo, solution_index, c == d,
+                small_problem, stride_c == stride_d, ldc == ldd, env_shim_disabled());
+    }
+
+    if (!take_over) {
+        return real_rocblas_gemm_strided_batched_ex(
+            handle, transA, transB, m, n, k, alpha,
+            a, a_type, lda, stride_a, b, b_type, ldb, stride_b, beta,
+            c, c_type, ldc, stride_c, d, d_type, ldd, stride_d,
+            batch_count, compute_type, algo, solution_index, flags);
+    }
+
+    hipStream_t stream = 0;
+    rocblas_get_stream(handle, &stream);
+
+    bool tA = (transA == rocblas_operation_transpose);
+    bool tB = (transB == rocblas_operation_transpose);
+
+    for (rocblas_int i = 0; i < batch_count; i++) {
+        gfx803_sgemm((int)m, (int)n, (int)k, *(const float*)alpha,
+                     (const float*)a + i * stride_a, (int)lda, tA,
+                     (const float*)b + i * stride_b, (int)ldb, tB,
+                     *(const float*)beta, (float*)d + i * stride_d, (int)ldd, stream);
+        hipError_t herr = hipGetLastError();
+        if (herr != hipSuccess) {
+            fprintf(stderr,
+                    "gfx803_sgemm_shim: strided_batched kernel launch failed (%s), "
+                    "falling back to rocBLAS\n",
+                    hipGetErrorString(herr));
+            return real_rocblas_gemm_strided_batched_ex(
+                handle, transA, transB, m, n, k, alpha,
+                a, a_type, lda, stride_a, b, b_type, ldb, stride_b, beta,
+                c, c_type, ldc, stride_c, d, d_type, ldd, stride_d,
+                batch_count, compute_type, algo, solution_index, flags);
+        }
     }
     return rocblas_status_success;
 }
