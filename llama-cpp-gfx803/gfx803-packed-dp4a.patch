@@ -1,0 +1,25 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d27d8ac..c6357f2 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -721,6 +721,20 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+         : "+v"(c), "=&v"(tmp1), "=&v"(tmp2)
+         : "v"(a), "v"(b)
+     );
++#elif defined(GCN4)
++    int p0, p1, p2, p3;
++    int tmp;
++    // gfx803 (GCN3) has no v_dot4 / v_add3_u32; build the packed 4-byte dot
++    // from v_mul_i32_i24 (byte-select) + plain v_add_u32_e32. Each add is a
++    // separate asm() statement so vcc carry-in is compiler-managed (0 at entry).
++    asm("v_mul_i32_i24 %0, sext(%1), sext(%2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:BYTE_0" : "=v"(p0) : "v"(a), "v"(b));
++    asm("v_mul_i32_i24 %0, sext(%1), sext(%2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:BYTE_1" : "=v"(p1) : "v"(a), "v"(b));
++    asm("v_mul_i32_i24 %0, sext(%1), sext(%2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2 src1_sel:BYTE_2" : "=v"(p2) : "v"(a), "v"(b));
++    asm("v_mul_i32_i24 %0, sext(%1), sext(%2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_3" : "=v"(p3) : "v"(a), "v"(b));
++    asm("v_add_u32_e32 %0, vcc, %1, %2" : "=v"(tmp) : "v"(p0), "v"(p1) : "vcc", "scc");
++    asm("v_add_u32_e32 %0, vcc, %1, %2" : "+v"(tmp) : "v"(p2) : "vcc", "scc");
++    asm("v_add_u32_e32 %0, vcc, %1, %2" : "+v"(tmp) : "v"(p3) : "vcc", "scc");
++    c += tmp;
+ #else
+     const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
+     const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
