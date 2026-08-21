@@ -1,0 +1,40 @@
+diff --git a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
+index a689fe438..f30b62643 100644
+--- a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
++++ b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
+@@ -8,6 +8,7 @@ namespace mlir::triton::AMD {
+ // A list of ISA families we care about.
+ enum class ISAFamily {
+   Unknown,
++  GCN3,
+   CDNA1,
+   CDNA2,
+   CDNA3,
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
+index 61bba58f1..2c20dd182 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
+@@ -71,6 +71,7 @@ llvm::AMDGPU::GPUKind TargetInfo::getGPUKind() const {
+ 
+ int TargetInfo::getWarpSize() const {
+   switch (getISAFamily()) {
++  case ISAFamily::GCN3:
+   case ISAFamily::CDNA1:
+   case ISAFamily::CDNA2:
+   case ISAFamily::CDNA3:
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
+index b79841ab5..e63f6ac67 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
+@@ -12,6 +12,11 @@ ISAFamily deduceISAFamily(llvm::StringRef arch) {
+   if (kind == llvm::AMDGPU::GK_GFX1250)
+     return ISAFamily::GFX1250;
+ 
++  // GCN ISA cases (pre-CDNA, pre-RDNA): GCN3 (gfx801-803) and GCN4 (gfx804/805)
++  // are all wave64, no v_dot, no MFMA. Group them as GCN3 for feature purposes.
++  if (kind >= llvm::AMDGPU::GK_GFX801 && kind <= llvm::AMDGPU::GK_GFX810)
++    return ISAFamily::GCN3;
++
+   // CDNA ISA cases
+   switch (kind) {
+   case llvm::AMDGPU::GK_GFX950:
