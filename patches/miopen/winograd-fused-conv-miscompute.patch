@@ -34,9 +34,7 @@ miopenCompileFusionPlan / miopenExecuteFusionPlan directly) reproduced
 the same systematic ~2% error (cos~0.98) for the 1x1 shape class chained
 through several of CLAP's real early-layer shapes in sequence on one
 MIOpen handle -- confirming a real defect in the padded-1x1 code path,
-not workspace reuse or session state (contrast
-patches/rocblas/gsu-workspace-not-zeroed.sh, where reused-but-unzeroed
-memory was the actual cause of a similarly silent miscompute).
+not workspace reuse or session state.
 
 Scoped, not blanket-disabled: the same standalone repro confirmed a
 genuine 3x3/stride=1/group=1 shape -- this kernel's actual designed case,

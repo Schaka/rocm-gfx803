@@ -225,7 +225,7 @@ itself (varying shape only, always `solution_index=0`), which is a different,
 not-yet-built tool. This is a real performance cost for fp32 GEMM
 specifically (our replacement is unoptimized), traded for correctness.
 
-### The actual root cause, and a real (failed) attempt to fix it at the source
+### The actual root cause
 
 Chasing the "first call correct, every call after wrong" signature further
 (rather than accepting the shim as final) found the real mechanism, not just
@@ -263,91 +263,18 @@ set once and never re-zeroed only partially helped (15/50, down from
 baseline's 20/50) -- proving it's specifically the missing re-zero, not some
 other side effect of user-managed memory mode.
 
-The workspace-management fix works when applied at the *shim* layer too, not
-just source-patched into rocBLAS: see
-[`patches/rocblas/sgemm-shim/sgemm_shim_privatehandle_reference.cpp`](patches/rocblas/sgemm-shim/sgemm_shim_privatehandle_reference.cpp)
-for a compiling, correctness-verified (0/N mismatches on every previously-broken
-shape) reference implementation -- kept as documentation of "freeing/zeroing
-workspace memory correctly fixes this," not shipped, because it benchmarked
-slower than the plain hand-written kernel in every case tested (see the
-file's own header for the numbers).
-
-**Patch attempt** (`patches/rocblas/gsu-workspace-not-zeroed.sh`): insert one
-`hipMemsetAsync` of the GSU workspace, sized to Tensile's own
-`solution->requiredWorkspaceSize()`, in `tensile_host.cpp` right after
-`gsu_malloc_by_size()` hands back the pointer and before the kernel launches
-that follows -- on the same stream, so no extra synchronization needed.
-Rebuilt rocBLAS from source with this patch (full Tensile kernel generation
-+ build, ~20-30 min on the test box) and tested against real hardware:
-
-| Shape | Zero-init patch alone |
-|---|---|
-| 40,72,800 (small) | **worse**: 499/500 broken, max error magnitude ~2.2 (vs ~1.4-2.2 unpatched) |
-| 768,768,3072 (large) | **fixed**: 0/50 clean |
-| 129,129,129 | **worse**: 99/100 broken, max error magnitude ~4.5 |
-
-Large shape genuinely fixed; small shapes got *worse*, with *larger* error
-magnitudes than the original bug ever produced -- a real regression, not
-noise. Reading `gsu_malloc_by_size()` again turned up a second, independent,
-pre-existing rocBLAS bug that would explain it:
-
-```cpp
-auto gsu_malloc_by_size(size_t requested_Workspace_Size)
-{
-    if(this->gsu_workspace) // Added to accomodate quant, remove comment after testing
-        return _gsu_malloc_by_size(this);
-    return _gsu_malloc_by_size(this, requested_Workspace_Size);
-};
-```
-
-The fast/reuse path hands back whatever workspace the handle already has
-**without checking it's actually big enough** for the current request. If an
-earlier call on the same handle needed less GSU workspace than the current
-one does, this returns an undersized buffer -- and our zero-init memset,
-sized to the *current* call's requirement, would then write past the end of
-it. That's consistent with the evidence: bigger error magnitudes than
-before, looks like real memory corruption rather than stale data.
-
-**Fixed this too** (also in `gsu-workspace-not-zeroed.sh`): guard the reuse
-path with `this->gsu_workspace_size >= requested_Workspace_Size`, falling
-through to a fresh correctly-sized allocation otherwise. Rebuilt and
-retested:
-
-| Shape | Zero-init + size-guard patch |
-|---|---|
-| 40,72,800 | still broken: 499/500, max error ~2.4 -- no real change |
-| 768,768,3072 | still fixed: 0/50 clean |
-| 129,129,129 | still broken: 99/100, max error ~3.9 -- no real change |
-
-**The size-guard fix made essentially no difference.** That disproves the
-theory of what was causing the small-shape regression -- and since neither
-patch touches anything for shapes that don't dispatch through a GSU-based
-solution in the first place, the most likely explanation is that the
-*default* solution-selection heuristic (`algo=standard, solution_index=0`,
-what every real caller uses) picks a **different kernel/dispatch path
-entirely** for small shapes than the GSU-workspace mechanism this patch
-fixes -- and that different path has its own, still-unidentified defect,
-never touched by either patch. The large shape happening to only ever
-select GSU-based solutions is presumably why it improved while small shapes
-didn't. This is the same "default dispatch doesn't match explicit solution
+A source-level fix (re-zero the GSU workspace before every GSU kernel
+launch, plus a size-guard on the pool-reuse path) was built, rebuilt
+rocBLAS, and tested on real hardware: it fixed large shapes (768x768x3072,
+0/50 clean) but small shapes stayed broken with a *worse* failure mode,
+through a separate default-dispatch-path defect the zeroing patch never
+touches -- the same "default dispatch doesn't match explicit solution
 enumeration" trap documented above for the sweep tool, encountered again
-here from a different angle.
-
-**Conclusion: reverted.** The source patch is real, mechanistically
-justified, and demonstrably fixes what it targets (confirmed clean on the
-one shape that exercises only that mechanism) -- but does not make rocBLAS
-correct overall, and applying it changes rather than removes the shim's
-necessity. Given no regression suite for this architecture and a live
-demonstration that a "small, well-understood" patch attempt still produced
-a *worse* failure mode on other shapes before the second bug was found (and
-no real improvement after), further blind iteration here is not a good use
-of time versus the already-verified, structurally-immune (no GSU/atomic
-reduction at all) hand-written kernel in
-[`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/). The patch
-script and this writeup are kept for future reference -- the zero-init fix
-in particular may still be a genuinely correct, worthwhile fix for AMD to
-apply upstream even though it isn't sufficient on its own for gfx803's
-default dispatch path.
+from a different angle. Reverted; fixing the workspace is necessary for
+correctness of any GSU-using solution but is not sufficient for gfx803's
+default path, and the structurally-immune (no GSU/atomic reduction at all)
+hand-written kernel in [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/)
+remains the shipped fix.
 
 Diagnostic tools built during this investigation, kept in
 [`tools/`](tools/) for reference: `malloc_tracer.cpp` (LD_PRELOAD

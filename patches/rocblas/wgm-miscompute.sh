@@ -51,13 +51,11 @@
 # precisely because this image builds ONE architecture: rmake.py runs with
 # -a gfx803, so no other GPU's kernels are generated from this tree.
 #
-# Stays a sed script rather than a .patch file (unlike
-# gsu-workspace-not-zeroed.sh / conv-direct-fwd-grouped-oob.sh, both now
-# git-apply-based): this is a tree-wide rewrite across every *.yaml file
-# under Logic/, count and file set unbounded, not a fixed insertion at one
-# or two known locations -- a unified diff for that would be enormous and
-# add nothing a sed pass with a before/after count check doesn't already
-# give.
+# Stays a sed script rather than a .patch file: this is a tree-wide rewrite
+# across every *.yaml file under Logic/, count and file set unbounded, not a
+# fixed insertion at one or two known locations -- a unified diff for that
+# would be enormous and add nothing a sed pass with a before/after count
+# check doesn't already give.
 set -eu
 
 SRC="${1:-/rocblas-src}"

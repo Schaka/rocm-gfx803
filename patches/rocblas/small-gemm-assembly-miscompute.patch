@@ -9,9 +9,8 @@ reference) -- unchanged from 6.4.4, reproduced here only for the WHAT.
 RE-DIFF NOTE (7.14): two real changes were needed, both confirmed by
 reading the actual current source, not assumed:
 
-1. Reindentation. tensile_host.cpp's runContractionProblem() gained the
-   same is_device_memory_size_query() branch noted in
-   gsu-workspace-not-zeroed.patch's re-diff note, which pushed the
+1. Reindentation. tensile_host.cpp's runContractionProblem() gained an
+   is_device_memory_size_query() branch, which pushed the
    `else { solution = library->findBestSolution(...); }` block this
    patch replaces one level deeper (16-space body indent instead of
    12-space). Purely cosmetic -- same surrounding control flow

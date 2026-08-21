@@ -120,14 +120,6 @@ Two real drifts found by reading the current source:
 Re-diffed patch applies clean (`patch -p1 --dry-run`, exact line match, no
 offset).
 
-### gsu-workspace-not-zeroed.patch -- not wired, matches 6.4.4
-
-Re-diffed for completeness (kept in `patches/rocblas/` for reference), but
-this patch was never wired into `rocm6.4.4/Dockerfile` either -- checked
-directly, that Dockerfile's `rocblas-builder` stage only calls
-`wgm-miscompute.sh` and `small-gemm-assembly-miscompute.sh`. Not wired
-into this line's `Dockerfile` either, for the same reason.
-
 ### sgemm-shim strided-batched interceptor -- new for this line, attention GQA fix
 
 The blanket `libgfx803_sgemm_shim.so` (routes f32 rocBLAS sgemm/gemm_ex to

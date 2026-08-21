@@ -6,8 +6,8 @@
 // hand-written replacement, by giving this shim its own PRIVATE
 // rocblas_handle (never the caller's) with a self-managed workspace that is
 // explicitly zeroed before every call -- correctly sidestepping the actual
-// root cause documented in KERNEL_BUGS.md ("The actual root cause, and a
-// real (failed) attempt to fix it at the source"): rocBLAS's internal
+// root cause documented in KERNEL_BUGS.md ("The actual root cause"):
+// rocBLAS's internal
 // device memory pool reuses GlobalSplitU (split-K) scratch space across
 // GEMM calls without re-zeroing it, and gfx803's GSU-reduction kernels
 // (software compare-and-swap loops, since gfx803/Polaris has no native
