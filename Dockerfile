@@ -816,7 +816,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
         "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         MAX_JOBS=$jobs USE_MKLDNN=0 USE_CCACHE=1 USE_NINJA=1 \
         USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
-        USE_DISTRIBUTED=0 USE_ROCM_CK_GEMM=0 \
+        USE_DISTRIBUTED=1 USE_ROCM_CK_GEMM=0 \
         BUILD_TEST=0 \
         python3 setup.py bdist_wheel
 
