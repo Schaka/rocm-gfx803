@@ -77,11 +77,51 @@ of the doorbell_type_ != 2 branch. See
 hsa-agent-rejects-legacy-doorbell.sh for how this is applied and
 verified at build time.
 
+UPDATE (2026-08-24): missing _mm_sfence() in the legacy StoreRelaxed
+branch -- HIP graph-replay hang root-caused to this
+----------------------------------------------------------------------
+vLLM HIP graph replay hangs indefinitely on this hardware (`replay()`
+spins forever in VirtualGPU::WaitForQueueSlot). Root-caused via real
+hardware MQD register dump (`/sys/kernel/debug/kfd/mqds`, cross-checked
+against `/proc/<pid>/mem` ring contents) to a genuine CP (compute-pipe)
+stall: cp_hqd_pq_wptr correctly advances (confirms the queue's software
+write-index proxy, cp_hqd_pq_wptr_poll_addr -> max_legacy_doorbell_dispatch_id_plus_1,
+is being read correctly -- this patch's queue_rsrc wiring is not at
+fault), but cp_hqd_pq_rptr freezes on a slot whose AQL packet header is
+still HSA_PACKET_TYPE_INVALID (1) -- the exact value rocclr's
+appendPacketToFlatBuffer() stages there before the real header is
+released. CP is correctly obeying the AQL protocol (spin-wait until a
+slot's header goes valid); the header write from rocclr's
+packet_store_release() (rocvirtual.cpp) simply never became visible
+before the doorbell woke the CP.
+
+The type-2 doorbell path this patch left untouched calls _mm_sfence()
+immediately before its doorbell write, specifically to drain the CPU's
+write-combining buffers for the AQL ring memory before the (separately
+mapped, confirmed pgprot_noncached/UC via the amdkfd doorbell mmap
+handler) doorbell BAR write executes -- UC writes are strongly ordered
+against each other but NOT automatically ordered after a still-buffered
+WC write from a different mapping without an explicit fence (x86 SDM
+11.3.1). The legacy branch added by this patch reproduces every other
+part of the deleted watermark protocol but dropped this fence entirely.
+On an idle consumer thread (exactly graph replay's pattern: ring the
+doorbell, then wait) there is no other memory traffic to force the WC
+buffer to drain, so the gap is not a transient delay -- it is a stall
+with no natural end, matching the observed permanent hang exactly.
+
+Fix: add the same _mm_sfence() to the legacy branch, before either
+memory-order-release store that becomes visible to the GPU (the
+wptr-proxy field write and/or the doorbell-pointer write). One line.
+NOT YET RE-VERIFIED ON REAL HARDWARE as of this patch text -- see
+tools/rocr-novad-rebuild/ for the standalone ROCR-Runtime rebuild used
+to test this without a full image rebuild, and SESSION_HANDOFF.md for
+the verification result once run.
+
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-index b53752cba2..30a81231d2 100644
+index 8125565318..7685bcc5c3 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-@@ -296,6 +296,9 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
+@@ -331,6 +331,9 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
    // Indicates if queue is active
    std::atomic<bool> active_;
  
@@ -92,10 +132,10 @@ index b53752cba2..30a81231d2 100644
    GpuAgent* agent_;
  
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-index ccc20b8d19..3d885d90aa 100644
+index 42d946bd0c..62bcd92bfc 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-@@ -100,6 +100,9 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+@@ -102,6 +102,9 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
        priority_(HSA::HSA_AMD_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
  
@@ -105,7 +145,7 @@ index ccc20b8d19..3d885d90aa 100644
    // Queue size is a function of several restrictions.
    const uint32_t min_pkts = ComputeRingBufferMinPkts();
    const uint32_t max_pkts = ComputeRingBufferMaxPkts();
-@@ -132,8 +135,13 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+@@ -137,8 +140,13 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
    HsaQueueResource queue_rsrc = {0};
    queue_rsrc.Queue_read_ptr_aql = (uint64_t*)&amd_queue_.read_dispatch_id;
  
@@ -121,7 +161,7 @@ index ccc20b8d19..3d885d90aa 100644
  
    // Populate amd_queue_ structure.
    amd_queue_.hsa_queue.type = HSA_QUEUE_TYPE_MULTI;
-@@ -146,8 +154,8 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+@@ -151,8 +159,8 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
        uintptr_t(&amd_queue_.read_dispatch_id) - uintptr_t(&amd_queue_));
    // Initialize the doorbell signal structure.
    memset(&signal_, 0, sizeof(signal_));
@@ -132,7 +172,7 @@ index ccc20b8d19..3d885d90aa 100644
    signal_.queue_ptr = &amd_queue_;
  
    const auto& props = agent->properties();
-@@ -279,7 +287,11 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+@@ -288,7 +296,11 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
      throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
                               "Queue create failed\n");
    // Complete populating the doorbell signal structure.
@@ -145,7 +185,7 @@ index ccc20b8d19..3d885d90aa 100644
  
    // Bind Id of Queue such that is unique i.e. it is not re-used by another
    // queue (AQL, HOST) in the same process during its lifetime.
-@@ -469,16 +481,57 @@ uint64_t AqlQueue::AddWriteIndexRelease(uint64_t value) {
+@@ -480,16 +492,63 @@ uint64_t AqlQueue::AddWriteIndexRelease(uint64_t value) {
  }
  
  void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
@@ -154,9 +194,6 @@ index ccc20b8d19..3d885d90aa 100644
 -    HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
 -  } else {
 -    // Hardware doorbell supports AQL semantics.
--    _mm_sfence();
--    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
--    /* signal_ is allocated as uncached so we do not need read-back to flush WC */
 +  if (doorbell_type_ == 2) {
 +    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
 +          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
@@ -168,8 +205,7 @@ index ccc20b8d19..3d885d90aa 100644
 +      /* signal_ is allocated as uncached so we do not need read-back to flush WC */
 +    }
 +    return;
-   }
--  return;
++  }
 +
 +  // Acquire spinlock protecting the legacy doorbell.
 +  while (atomic::Cas(&amd_queue_.legacy_doorbell_lock, 1U, 0U,
@@ -188,6 +224,14 @@ index ccc20b8d19..3d885d90aa 100644
 +
 +  // Discard backwards and duplicate doorbells.
 +  if (legacy_dispatch_id > amd_queue_.max_legacy_doorbell_dispatch_id_plus_1) {
++    // Flush WC-buffered AQL packet header writes (packet_store_release, in
++    // rocclr) before either write below becomes visible to the GPU. The
++    // type-2 path above does this before its doorbell write for the same
++    // reason; this branch was missing it entirely, letting CP observe the
++    // wptr-proxy/doorbell update before the packet header it describes.
+     _mm_sfence();
+-    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
+-    /* signal_ is allocated as uncached so we do not need read-back to flush WC */
 +    atomic::Store(&amd_queue_.max_legacy_doorbell_dispatch_id_plus_1,
 +                  legacy_dispatch_id, std::memory_order_release);
 +
@@ -204,7 +248,8 @@ index ccc20b8d19..3d885d90aa 100644
 +    } else {
 +      assert(false && "Agent has unsupported doorbell semantics");
 +    }
-+  }
+   }
+-  return;
 +
 +  // Release spinlock protecting the legacy doorbell.
 +  atomic::Store(&amd_queue_.legacy_doorbell_lock, 0U,
@@ -212,7 +257,7 @@ index ccc20b8d19..3d885d90aa 100644
  }
  
  void AqlQueue::StoreRelease(hsa_signal_value_t value) {
-@@ -492,8 +545,11 @@ hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value
+@@ -517,8 +576,11 @@ hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value
        *(reinterpret_cast<hsa_agent_t*>(value)) = agent_->public_handle();
        break;
      case HSA_AMD_QUEUE_INFO_DOORBELL_ID:
@@ -227,10 +272,10 @@ index ccc20b8d19..3d885d90aa 100644
      case HSA_QUEUE_INFO_USE_COUNT:
        if (!is_counted_queue) {
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
-index 4cff385f25..14d1a108b9 100644
+index 2caa1456f9..e78dd3c2c6 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
-@@ -123,9 +123,6 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
+@@ -132,9 +132,6 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
    const bool is_apu_node = (properties_.NumCPUCores > 0);
    profile_ = (is_apu_node) ? HSA_PROFILE_FULL : HSA_PROFILE_BASE;
  
@@ -252,4 +297,3 @@ index 12e1c08157..cc81a32067 100644
      volatile uint64_t* hardware_doorbell_ptr;
    };
    uint64_t event_mailbox_ptr;
-

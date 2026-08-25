@@ -1,0 +1,66 @@
+DIAGNOSTIC ONLY -- not a fix, not meant to ship. Instruments the two
+`amd::Os::yield()` spin sites in rocvirtual.hpp closest matching the
+strace evidence for the HIP-graph-replay deadlock on gfx803 (see
+SESSION_HANDOFF.md section on the graph-replay investigation): a live
+repro's stuck thread spins on `sched_yield()` every ~35-40us, zero other
+syscalls, forever. `VirtualGPU::WaitForQueueSlot()` (hardware-queue
+read-index spin, no per-iteration blocking call) matches that cadence;
+`WaitForSignal()`'s active-wait loop (each iteration blocks up to 4s
+inside `signal_wait_scacquire` before it can even reach the yield) does
+not, but is instrumented too for confirmation since it costs nothing.
+
+Prints every 5,000,000 spins (WaitForQueueSlot) / every 5 loops
+(WaitForSignal, ~20s at its ~4s-per-iteration cadence) to stderr with
+the diagnostic state (queue read/write index, capacity, signal handle),
+so a stuck repro's container logs identify which site is actually
+spinning without needing amd-dbgapi/rocgdb (unavailable in this
+container, see SESSION_HANDOFF.md section 9/11).
+
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.hpp b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+index 2254068dbd..472e77999a 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+@@ -15,6 +15,7 @@
+ #include "rocsched.hpp"
+ #include "device/device.hpp"
+ #include "os/os.hpp"
++#include <cstdio>
+ #include <atomic>
+ #include <condition_variable>
+ #include <mutex>
+@@ -74,6 +75,13 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool yi
+         return true;
+       }
+       if (yield && wait_state == HSA_WAIT_STATE_ACTIVE) {
++        static std::atomic<uint64_t> diag_signal_spin_count{0};
++        if (++diag_signal_spin_count % 5 == 0) {
++          fprintf(stderr,
++                  "[DIAG WaitForSignal] stuck: signal=0x%lx loops=%lu (each ~4s)\n",
++                  (unsigned long)signal.handle, (unsigned long)diag_signal_spin_count.load());
++          fflush(stderr);
++        }
+         amd::Os::yield();
+       }
+     }
+@@ -761,11 +769,21 @@ class VirtualGPU : public device::VirtualDevice {
+     if ((write_index - cached_read_dispatch_id_) < capacity) {
+       return;
+     }
++    uint64_t diag_spin_count = 0;
+     do {
+       cached_read_dispatch_id_ = Hsa::queue_load_read_index_scacquire(gpu_queue_);
+       if ((write_index - cached_read_dispatch_id_) < capacity) {
+         return;
+       }
++      if (++diag_spin_count % 5000000 == 0) {
++        fprintf(stderr,
++                "[DIAG WaitForQueueSlot] stuck: write_index=%lu cached_read=%lu "
++                "capacity=%u queue_size=%u queue=%p spins=%lu\n",
++                (unsigned long)write_index, (unsigned long)cached_read_dispatch_id_,
++                capacity, gpu_queue_ ? gpu_queue_->size : 0, (void*)gpu_queue_,
++                (unsigned long)diag_spin_count);
++        fflush(stderr);
++      }
+       amd::Os::yield();
+     } while (true);
+   }

@@ -1,0 +1,97 @@
+CLR (HIP runtime): clamp the HIP-graph-replay flat-buffer dispatch's chunk
+size to the actual hardware queue's capacity, instead of trusting
+DEBUG_HIP_GRAPH_BATCH_SIZE's default (256) unconditionally.
+
+WHY
+---
+vLLM (and any workload relying on `hipGraphLaunch`/CUDA-graph replay) hung
+indefinitely on gfx803 -- `replay()` spun forever in
+`VirtualGPU::WaitForQueueSlot`. Root-caused via real-hardware MQD register
+inspection (`/sys/kernel/debug/kfd/mqds`, cross-checked against
+`/proc/<pid>/mem` ring contents) down to `rocvirtual.cpp`'s
+`dispatchAqlPacketBatchFlat` -- the fast-path batched dispatch HIP graph
+replay uses to submit an entire captured graph with a single wptr bump
+instead of one AQL enqueue per node.
+
+That function submits packets in `kPeriod`-sized chunks
+(`kPeriod = DEBUG_HIP_GRAPH_BATCH_SIZE`, a flag defaulting to 256), so that
+graphs larger than the ring can still be replayed: the GPU drains earlier
+chunks while the CPU writes later ones. This only works if a single chunk
+never needs more in-flight ring capacity than the ring actually has.
+`WaitForQueueSlot(write_index, capacity)`'s condition is
+`(write_index - cached_read) < capacity` -- resolving it requires the CP to
+have processed packets up to `write_index - capacity`. For a chunk's own
+`WaitForQueueSlot` call, those are packets from THIS SAME CHUNK, which have
+not been written or doorbell-rung yet (that happens after the wait
+succeeds). If the chunk size ever exceeds the ring's usable capacity
+(`sw_queue_size`, i.e. `queueMask`), the wait can never resolve by
+construction -- no amount of draining by already-committed earlier work can
+free room that only this chunk's own unwritten packets would occupy.
+
+`kPeriod` was never clamped against the live queue's actual size anywhere
+in this function. On every board this code has been exercised against, the
+HW queue is far bigger than 256 packets (`HSA_AGENT_INFO_QUEUE_MAX_SIZE` on
+this same gfx803 system reports 131072, matching normal boards), so the
+assumption silently held everywhere -- until gfx803, whose
+`hsa_queue_create` fails for every requested size above the hard floor of
+64 packets (`Device::acquireQueue`'s halving retry loop in rocdevice.cpp
+gives up at `queue_size < 64`), for reasons not yet root-caused at the
+kernel/KFD level (confirmed via direct `hsa_queue_create` probing and
+strace: the ioctl reaches the kernel and returns EINVAL from somewhere
+past `set_queue_properties_from_user`'s validation, silently, not from a
+struct-ABI mismatch or the power-of-2/minimum-size checks -- both
+confirmed fine). A single graph-replay batch of 337 packets against a
+64-slot ring (`capacity=63`) reproduced this deterministically, matching
+the original diagnostic's `write_index=3257` exactly.
+
+Restoring ROCm 6.4.4's GFXIP7/8 ring-buffer "queue_full_workaround_"
+double-mapping mechanism was considered and ruled out as a fix for this:
+that mechanism *halves* the theoretical max ring size when active
+(`ComputeRingBufferMaxPkts`), it exists to let the CP address a write
+index that wraps past one full queue length without losing track via the
+doorbell, not to give the ring more usable capacity -- and it is further
+gated to `HSA_PROFILE_FULL` (APU) agents only in the original 6.4.4 source,
+which a discrete card (`HSA_PROFILE_BASE`) never qualifies for regardless.
+It would not have changed this queue's size.
+
+Not gfx803-specific in mechanism -- the fix is a generic dynamic clamp
+against the queue's own live capacity (`gpu_queue_->size`, already computed
+in this function as `sw_queue_size`), not an ISA/arch gate. It is a no-op
+on every board whose queue ends up bigger than `DEBUG_HIP_GRAPH_BATCH_SIZE`
+packets, which today is every board except gfx803.
+
+WHAT
+----
+- rocvirtual.cpp: clamp `kPeriod` to `min(DEBUG_HIP_GRAPH_BATCH_SIZE,
+  sw_queue_size)` in `dispatchAqlPacketBatchFlat`.
+
+Applies to: CLR @ rocm-systems commit release/therock-7.14 (same pin as
+hsa-agent-rejects-legacy-doorbell.patch). Verified on real gfx803 hardware:
+before this fix, the scoped vLLM graph-replay repro
+(`--cudagraph-capture-sizes 1`) hung deterministically every run at
+identical `write_index`/`cached_read` values; after, the same repro
+completes all iterations and reports real latency numbers, repeatably.
+
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+index 5ee4938aab..656aae4415 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -1505,7 +1505,17 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPack
+   }
+   fence_state_ = static_cast<Device::CacheState>(expected_fence_state);
+ 
+-  const size_t kPeriod = DEBUG_HIP_GRAPH_BATCH_SIZE;
++  // Chunk size must not exceed the HW queue's own capacity: WaitForQueueSlot
++  // below waits for `cached_read` to advance past this chunk's own packets,
++  // but those packets aren't written/doorbell-rung until AFTER the wait
++  // succeeds. A chunk larger than the ring can ever hold in flight deadlocks
++  // unconditionally -- no amount of draining by already-committed work can
++  // satisfy it. DEBUG_HIP_GRAPH_BATCH_SIZE's default (256) assumes a queue
++  // comfortably larger than that, true for every board whose HSA_AGENT_INFO_
++  // QUEUE_MAX_SIZE/hsa_queue_create succeeds at a normal size; not true for a
++  // board where queue creation degrades to the hard floor (Device::
++  // acquireQueue's halving retry loop, rocdevice.cpp).
++  const size_t kPeriod = std::min<size_t>(DEBUG_HIP_GRAPH_BATCH_SIZE, sw_queue_size);
+   auto* first_loc = reinterpret_cast<uint32_t*>(
+       queueBase + (startIndex & queueMask) * kPacketSize);
+ 

@@ -1,0 +1,152 @@
+ROCR-Runtime (optional, NOT applied by the main Dockerfile -- see WHY):
+report double the real AQL ring size to KFD for GFX7/8 compute queues, so
+`hsa_queue_create` can actually get the sizes it asks for instead of
+silently degrading to the 64-packet floor.
+
+REQUIRES A PAIRED, OUT-OF-TREE KERNEL PATCH. Without it, this patch alone
+produces a real GPU hardware fault under load (`Memory access fault...
+Page not present`, `HW Exception ... reason: GPU Hang`) -- confirmed on
+real hardware, not theoretical. See the "Kernel-side companion" section
+below for exactly what that patch is and why it's not shipped in this
+repo. This is why this patch is optional and unwired: this repo's build
+pipeline produces a Docker image that runs against whatever kernel the
+host already has, and this repo does not build/ship kernel modules (see
+AGENTS.md's standing rule -- driver changes belong outside this repo).
+Apply this patch, and its kernel companion, together, by hand, only if
+you specifically want gfx803's larger queue and are willing to maintain
+an out-of-tree kernel module for it.
+
+WHY
+---
+gfx803's `hsa_queue_create` fails with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`
+for every requested queue size except the hard floor of 64 AQL packets
+(`Device::acquireQueue`'s halving retry loop in `rocdevice.cpp` gives up
+there). `HSA_AGENT_INFO_QUEUE_MAX_SIZE` on this same hardware reports a
+normal 131072 -- the agent isn't the thing capping it.
+
+Root-caused via a standalone `hsa_queue_create` probe plus `strace` and
+kernel dynamic-debug tracing (`kfd_queue_acquire_buffers`,
+`set_queue_properties_from_user`, `kfd_ioctl_create_queue`,
+`pqm_create_queue`) to `kfd_queue_buffer_get()`
+(`drivers/gpu/drm/amd/amdkfd/kfd_queue.c`): it requires an *exact* size
+match between the ring size userspace reports via the `hsa_queue_create`
+ioctl and the actual VM-mapped buffer backing it. For GFX7/8 AQL compute
+queues specifically, `kfd_queue_acquire_buffers()` computes
+`expected_queue_size = PAGE_ALIGN(properties->queue_size / 2)` before that
+check -- the kernel's own comment: "AQL queues on GFX7 and GFX8 appear
+twice their actual size". Since this patched ROCr allocates and reports
+the *same* value for both, the halved kernel expectation only
+coincidentally matches at exactly 1 page (64 packets, where
+`PAGE_ALIGN(size/2)` rounds back up to `size`); above that they diverge
+and the exact-match check fails every time.
+
+Fix (userspace half): report `ring_size * 2` to the `hsa_queue_create`
+ioctl for GFX7/8 AQL compute queues, so KFD's halving lands back on our
+real allocation. The physical `ring_buf_` allocation and all AQL packet
+indexing elsewhere in this codebase (`queueMask` etc, `rocvirtual.cpp`)
+are untouched -- they keep using the real, unscaled `queue_size_pkts`,
+which is correct (this exact queue size already worked correctly for
+ordinary dispatch before this patch, confirmed via real-hardware MQD
+register inspection in this repo's SESSION_HANDOFF.md).
+
+Kernel-side companion (REQUIRED, not included here)
+----------------------------------------------------
+Reporting the doubled size alone is NOT sufficient and is actively
+dangerous: `set_queue_properties_from_user()` (`kfd_chardev.c`) copies the
+*raw* (doubled) `args->ring_size` into `q_properties->queue_size` with no
+GFX7/8-specific adjustment, and `kfd_mqd_manager_vi.c`'s `update_mqd()`
+later reads that same raw value to program the actual hardware
+`CP_HQD_PQ_CONTROL` queue-size field and `wptr_mask`. Confirmed on real
+hardware: applying only this userspace patch, `hsa_queue_create` succeeds
+at full size, but the GPU faults under real dispatch load (`Memory access
+fault... Page not present`, `HW Exception ... reason: GPU Hang`) --
+hardware wraparound is being programmed from the doubled value while the
+real backing buffer and software's own index masking are still sized for
+the true (unscaled) capacity.
+
+The companion fix: `kfd_queue_acquire_buffers()` already computes the
+correct halved value (`expected_queue_size`) for its own VA-size
+validation on GFX7/8 AQL queues -- it just never writes that value back.
+Making it do so (`properties->queue_size = expected_queue_size;` inside
+the existing GFX7/8+AQL+COMPUTE branch, after the halving computation,
+before the `kfd_queue_buffer_get()` validation calls) closes the gap:
+`pqm_create_queue()` and all hardware MQD programming downstream then see
+the same true, unscaled size real backing memory actually has. Verified
+end-to-end on real gfx803 hardware, applied to a custom out-of-tree
+`amdgpu.ko` built from Fedora's `kernel-7.1.9-200.fc44` source (see this
+repo's SESSION_HANDOFF.md for the full out-of-tree build recipe, same one
+used for the `pqm_debugfs_mqds` NULL-deref fix): `hsa_queue_create`
+succeeds at the full 131072-packet max, and vLLM's HIP-graph-replay
+`bench latency` repro completes cleanly and repeatably with the enlarged
+queue, no hang, no fault -- a 2048x increase over the 64-packet floor.
+
+This kernel patch is not included in this repo on purpose -- it's a
+modification to `drivers/gpu/drm/amd/amdkfd/kfd_queue.c` in the upstream
+`amdgpu`/`amdkfd` driver, not something this repo's Docker-image build can
+apply or ship (it builds a userspace ROCm stack against whatever kernel
+the host already has; it does not build kernel modules). Worth reporting
+upstream to `gitlab.freedesktop.org/drm/amd/-/issues` alongside the
+`pqm_debugfs_mqds` NULL-deref bug already documented in this repo (both
+are the same class of gap: legacy/GFX7-8-specific code paths that clearly
+haven't been exercised by anyone in a long time).
+
+Status: WORKING, verified on real hardware, paired with the (undocumented
+here, out-of-tree) kernel patch above. Kept optional/unwired specifically
+because the kernel half can't travel with this repo -- applying only this
+half is worse than applying neither (it trades a safe, low queue size for
+a GPU-fault risk under load). If you want gfx803's larger queue, build and
+load the kernel companion first, confirm it with a real dispatch (not just
+`hsa_queue_create` succeeding) before trusting this patch in anything that
+matters.
+
+Applies to: ROCR-Runtime @ rocm-systems commit release/therock-7.14 (same
+pin as hsa-agent-rejects-legacy-doorbell.patch, applied on top of it).
+
+WHAT
+----
+- amd_aql_queue.cpp: report `ring_buf_alloc_bytes_ * 2` (instead of
+  `ring_buf_alloc_bytes_`) as the `hsa_queue_create` ioctl's ring-size
+  argument, for GFX7/8 agents only. No other file changed.
+
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+index 62bcd92bfc..d4bbca3f0f 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+@@ -278,17 +278,35 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+   // is a KFD queue. The debugger may access the aperture addresses, queue
+   // scratch base, and queue type.
+ 
++  // KFD's kfd_queue_acquire_buffers() halves the reported ring_size before
++  // validating it against the actual VM-mapped buffer for GFX7/8 AQL compute
++  // queues ("AQL queues on GFX7 and GFX8 appear twice their actual size",
++  // kfd_queue.c) -- report double our real allocation so that halved value
++  // matches what we actually allocated. The physical ring_buf_ allocation
++  // and all AQL packet indexing (queueMask etc, elsewhere in this codebase)
++  // stay based on the real, unscaled queue_size_pkts; only the size KFD is
++  // told about needs doubling. REQUIRES a paired kernel-side fix (see
++  // graph-replay-queue-size-cap.patch's header) -- without it, KFD's own
++  // MQD/HQD hardware programming reads this same doubled value raw for
++  // CP_HQD_PQ_CONTROL/wptr_mask, desyncing hardware wraparound from the
++  // real backing buffer and producing a GPU memory-access fault under load.
++  uint64_t reported_ring_size_bytes = ring_buf_alloc_bytes_;
++  if (agent_->supported_isas()[0]->GetMajorVersion() == 7 ||
++      agent_->supported_isas()[0]->GetMajorVersion() == 8) {
++    reported_ring_size_bytes = ring_buf_alloc_bytes_ * 2;
++  }
++
+   hsa_status_t status;
+   if (core::Runtime::runtime_singleton_->KfdVersion().supports_exception_debugging) {
+     queue_rsrc.ErrorReason = &exception_signal_->signal_.value;
+     status =
+         agent->driver().CreateQueue(node_id, HSA_QUEUE_COMPUTE_AQL, 100, priority_, 0,
+-                                    ring_buf_, ring_buf_alloc_bytes_,
++                                    ring_buf_, reported_ring_size_bytes,
+                                     ring_buf_metadata_alloc_bytes_,
+                                     queue_event(), queue_rsrc);
+   } else {
+     status = agent->driver().CreateQueue(node_id, HSA_QUEUE_COMPUTE_AQL, 100, priority_, 0,
+-                                         ring_buf_, ring_buf_alloc_bytes_,
++                                         ring_buf_, reported_ring_size_bytes,
+                                          ring_buf_metadata_alloc_bytes_,
+                                          NULL, queue_rsrc);
+   }

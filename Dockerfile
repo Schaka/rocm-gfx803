@@ -231,6 +231,15 @@ RUN sh /rocm-systems-patches/opencl-gfx8-hardcoded-rejection.sh /rocm-systems-sr
 # 52-shape harness") for the validation data.
 RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 
+# HIP graph-replay batch dispatch deadlock: gfx803's HW queue caps out at
+# 64 packets (see graph-replay-batch-chunk-deadlock.patch's WHY -- root
+# cause of the small queue itself still under investigation), far below
+# DEBUG_HIP_GRAPH_BATCH_SIZE's default chunk size of 256, which made every
+# HIP-graph replay of more than a few dozen packets deadlock permanently.
+# Verified fix on real hardware: vLLM's graph-replay repro went from a
+# deterministic hang to completing every run.
+RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-src
+
 # ROCR-Runtime first: CLR's HIP build links against it, so the patched
 # runtime has to be installed into /opt/rocm before CLR configures.
 WORKDIR /rocm-systems-src/projects/rocr-runtime
@@ -361,6 +370,20 @@ RUN sh /rocblas-patches/wgm-miscompute-source.sh /rocblas-src-root
 # plus a real template-signature change, TiA/TiB collapsed to Ti; see the
 # patch header for both). NOT yet re-verified on real hardware against 7.14.
 RUN sh /rocblas-patches/small-gemm-assembly-miscompute.sh "${ROCBLAS_SRC}"
+
+# fp16 (non-HPA) GEMM kernels for gfx803. Tensile's fp16 codegen used only
+# d16/packed-fp16 instructions (GFX9+ only), so gfx803 had no fp16 kernels
+# and every fp16 GEMM fell through to the slow _fallback_ kernel. The patch
+# adds an unpacked codegen path (HasD16/halfNoD16) plus fixes a gfx803-only
+# WGM-division register clobber that made the first working kernels silently
+# miscompute. The HB logic file makes the Tensile library generation emit
+# fp16 kernels for gfx803 (verified: generates, assembles, validates and
+# benchmarks ~1.3-1.4x over the fallback on an RX 470 -- see the patch
+# header and TENSILE_GFX803_FP16_TODO.md). HPA (fp32-accumulate) fp16 stays
+# impossible on this hardware (no v_pk_fma_f16); this is non-HPA only.
+RUN sh /rocblas-patches/tensile-gfx803-fp16-nond16.sh /rocblas-src-root \
+    && cp /rocblas-patches/r9nano_Cijk_Ailk_Bljk_HB.yaml \
+        /rocblas-src-root/projects/rocblas/library/src/blas3/Tensile/Logic/asm_full/r9nano/
 
 WORKDIR ${ROCBLAS_SRC}
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocblas-ccache \

@@ -6,6 +6,16 @@ parts that aren't obvious from the code or the patch headers alone.
 
 ## Standing philosophy
 
+- **Build locally, never push.** All work in this repo builds locally (the
+  host or the box at 192.168.1.214) -- never trigger remote CI, never push,
+  never commit, unless the user explicitly instructed that specific commit
+  or push. Committing and pushing are the user's tasks. A remote workflow
+  run builds whatever is on the remote branch at that moment, so pushing is
+  a prerequisite to any remote build anyway -- but the rule is simpler than
+  that: don't. Build locally, verify locally, hand the user the diff or the
+  local build, and let them decide about commit/push. This includes `gh
+  workflow run` -- dispatching a remote run without being told is the same
+  violation as pushing.
 - **Fix at the source. No workarounds.** A gfx803 bug gets fixed where it
   actually lives -- the broken Tensile logic, the broken MIOpen solver, the
   broken MIGraphX pass -- not papered over with a retry loop, a narrower
