@@ -1,0 +1,101 @@
+ROCR-Runtime (pinned commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350,
+therock-7.14 / ROCm 7.14.0): add the missing _mm_sfence() to
+SdmaQueue::RingDoorbell()'s legacy-doorbell publish sequence, fixing an
+intermittent hang in any hipMemcpyWithStream (or other SDMA-routed async
+copy) on gfx803.
+
+WHY
+---
+Reproduced via a real vLLM workload (Qwen3.5-2B load, torch.compile's
+_sfdp_init doing a small .to(device) tensor copy) hanging non-
+deterministically: identical retries sometimes hung at this exact call,
+sometimes sailed through it and hung nowhere else. py-spy --native on the
+stuck process showed the host spinning in
+rocr::core::BusyWaitSignal::WaitRelaxed -> hsa_signal_wait_scacquire,
+reached via hipMemcpyWithStream, forever -- `rocm-smi --showuse` read 0%
+GPU busy the whole time and dmesg logged no fault, ring hang, or VM
+fault. So the doorbell write was reaching the queue submission path (no
+enumeration/setup failure) but the GPU never signaled completion for that
+submission: consistent with the SDMA engine picking up a wptr/doorbell
+update before the packet descriptor it names was actually visible in
+memory, and either faulting silently, dropping the packet, or stalling
+on a corrupt descriptor -- with no hardware-visible fault.
+
+SdmaQueue::RingDoorbell (amd_sdma_queue.cpp) publishes a submission with:
+
+    atomic::Store(&amd_queue_.write_dispatch_id, write_index, release);
+    atomic::Store(queue_wptr_, write_index, release);
+    std::atomic_thread_fence(std::memory_order_release);
+    *queue_doorbell_ = write_index;
+
+std::atomic_thread_fence(release) is a compiler barrier plus, on x86, an
+ordinary store fence -- per the x86 SDM (11.3.1), it does not order or
+drain write-combining (WC) stores, which are explicitly exempted from
+the normal store-ordering guarantees other memory types get for free.
+queue_start_addr_ (the ring the caller wrote the SDMA copy descriptor
+into, allocated via GpuAgent::system_allocator()/coarsegrain_allocator()
+with AllocateExecutable, same as the AQL ring buffer) and queue_wptr_ are
+WC-mapped GPU-visible host memory. Only SFENCE (or MFENCE) actually
+orders WC stores against a later UC/strongly-ordered store such as the
+doorbell BAR write immediately below it.
+
+This is the identical bug class this repo already root-caused and fixed
+once, in the neighboring AQL compute-queue path: see
+hsa-agent-rejects-legacy-doorbell.patch's 2026-08-24 UPDATE, where
+AqlQueue::StoreRelaxed's legacy-doorbell branch was found to be missing
+the same _mm_sfence() the type-2 (DoorbellType==2) branch already has,
+root-caused via a stuck HIP-graph-replay repro and a live MQD register
+dump. That fix's own comment states the type-2 path calls _mm_sfence()
+specifically "to drain the CPU's write-combining buffers for the AQL
+ring memory before the ... doorbell BAR write executes" -- the exact
+same hazard applies to SdmaQueue::RingDoorbell, which was never given
+the equivalent fix because it is a separate class from AqlQueue and
+wasn't touched by that patch.
+
+The non-determinism itself is diagnostic: a hard, always-reproducing
+deadlock (like the graph-replay batch-chunk bug this repo also fixed)
+would hang at the identical byte offset every run. A missing-fence race
+depends on when the CPU's WC buffer happens to flush for unrelated
+reasons (cache pressure, an intervening serializing instruction, timing
+noise) -- which matches the observed behavior exactly: reproduced
+hanging at this call on one run, then completing torch.compile cleanly
+on an immediate retry with no code change.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE as of this patch text beyond the
+initial reproduction runs above -- see tools/rocr-novad-rebuild/ for the
+standalone ROCR-Runtime rebuild used to test this without a full image
+rebuild, and SESSION_HANDOFF.md for the verification result once run
+(repeated retries needed, since the bug is intermittent -- a single
+clean run does not confirm the fix any more than a single hang confirmed
+the bug).
+
+WHAT
+----
+- amd_sdma_queue.cpp: add _mm_sfence() in SdmaQueue::RingDoorbell(),
+  immediately before the doorbell write, after the existing (necessary
+  but insufficient) std::atomic_thread_fence(std::memory_order_release).
+
+Applies to: ROCR-Runtime @ rocm-systems commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350
+(therock-7.14 / ROCm 7.14.0 pin). Not gfx803-specific in the sense of
+touching arch-gated code -- generic SDMA dispatch-protocol logic on any
+board whose queue/doorbell memory is WC-mapped. gfx803 is simply where
+this repo found it, via the legacy-doorbell board this repo already
+carries the sibling AQL fix for.
+
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
+index 1111111111..2222222222 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
+@@ -222,6 +222,12 @@ hsa_status_t SdmaQueue::RingDoorbell(uint64_t write_index) {
+   atomic::Store(&amd_queue_.write_dispatch_id, write_index, std::memory_order_release);
+   atomic::Store(queue_wptr_, write_index, std::memory_order_release);
+   std::atomic_thread_fence(std::memory_order_release);
++  // A release fence is a compiler barrier plus, on x86, an ordinary store
++  // fence -- it does not drain the write-combining buffers that
++  // queue_start_addr_/queue_wptr_ (WC-mapped GPU-visible host memory) go
++  // through. Only SFENCE orders WC stores against the doorbell write below,
++  // same reasoning as amd_aql_queue.cpp's StoreRelaxed type-2 path.
++  _mm_sfence();
+   *queue_doorbell_ = write_index;
+
+   if (core::Runtime::runtime_singleton_->thunkLoader()->IsDXG() ||

@@ -186,6 +186,18 @@ re-diffing:
    against the new binaries. Don't assume a clean apply means the original
    bug is still handled correctly.
 
+## Host BIOS setting: keep PCIe ASPM off
+
+On at least one gfx803 host, PCIe ASPM (link power management) being enabled
+in the BIOS caused rare, extremely hard-to-diagnose stalls/hangs under GPU
+load -- the kind that look like a driver or kernel bug and burn hours of
+debugging before the actual cause turns out to be a power-management setting
+outside the software stack entirely. Keep ASPM disabled in BIOS (and via
+`setpci`/kernel cmdline if the board won't hand OS-level control to Linux)
+on any gfx803 host until proven otherwise on that specific board. See
+`tools/host-setup/` for a working `setpci`-based systemd unit for boards
+where BIOS/firmware won't actually hand ASPM control to Linux.
+
 ## What needs real gfx803 hardware to validate, and what doesn't
 
 - **Needs the real card**: anything that dispatches a GPU kernel --

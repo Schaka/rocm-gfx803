@@ -1,0 +1,11 @@
+[Unit]
+Description=Disable PCIe ASPM on RX470 (gfx803) -- BIOS/FADT denies OS ASPM control on this board, so the setpci write must be reapplied every boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/setpci -s 00:01.1 CAP_EXP+10.w=0c40
+ExecStart=/usr/bin/setpci -s 02:00.0 CAP_EXP+10.w=0040
+
+[Install]
+WantedBy=multi-user.target

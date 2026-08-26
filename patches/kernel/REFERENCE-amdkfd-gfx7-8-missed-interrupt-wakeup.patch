@@ -1,0 +1,120 @@
+REFERENCE ONLY -- NOT built, applied, or shipped by this repo. Out-of-tree
+kernel (amdgpu/amdkfd) driver source, not a userspace ROCm component this
+repo's Docker image build touches. Per AGENTS.md's standing rule, driver
+changes belong outside this repo -- this file exists purely as documentation
+for a real, hardware-verified kernel bug found and fixed while chasing a
+severe vLLM engine-startup hang. See SESSION_HANDOFF.md for the full
+investigation.
+
+WHY: a thread could block forever inside
+rocr::core::InterruptSignal::WaitRelaxed() (via
+BlitKernel::SubmitLinearCopyCommand -> RegionMemory::Freeze() ->
+ExecutableImpl::Freeze(), i.e. every compiled-kernel-binary "load into GPU"
+operation) with zero dmesg activity and zero GPU ring timeout -- the GPU had
+genuinely finished the copy, but the completion wakeup never reached the
+waiting userspace thread. Confirmed via live native gdb backtraces (17+
+minutes parked in this exact call) and full unfiltered `dmesg -T` showing no
+corroborating driver-level event on any ring/watchdog.
+
+Root cause: kfd_events.c's kfd_signal_event_interrupt() ->
+lookup_signaled_event_by_partial_id() has a fast path that, for interrupt
+sources with a wide-enough id bit-width (bits > 31, always true for
+gfx7/8's 28-bit context_id), calls idr_find(&p->event_idr, id) directly --
+trusting the interrupt payload's context_id as an exact event ID -- unless
+signal_mailbox_updated is true AND the event's signal-page slot reads as
+UNSIGNALED_EVENT_SLOT, in which case it correctly returns NULL and falls
+through to the caller's safe exhaustive-scan fallback.
+
+The bug: cik_event_interrupt.c (gfx7/8's own interrupt handler) hardcodes
+signal_mailbox_updated=true for CIK_INTSRC_CP_END_OF_PIPE and
+CIK_INTSRC_SDMA_TRAP interrupts, even though this hardware generation has no
+real firmware mailbox-confirmation mechanism -- the function's own upstream
+comment documents gfx7/8's context_id/event IDs as unreliable ("old ASICs
+that don't have the event ID or event IDs are incorrect in the IH
+payload"). Trusting a coincidentally-signaled-looking slot for a possibly-
+garbage context_id means the fast path can silently drop the real target
+event's completion interrupt (permanent missed wakeup -- the waiter hangs
+forever) or wake an unrelated event that happens to share the same numeric
+slot, all without ever reaching the safe scan.
+
+This traces to upstream commit de844846f72b152119faaef1b363448dc8ea368f
+("drm/amdkfd: Improve signal event slow path", Philip Yang, 2024-12-19),
+which introduced this fast-path shape as a `goto out_unlock` early exit;
+kernel 7.1.9's source has since refactored the same logic into
+lookup_signaled_event_by_partial_id(), but the underlying trust-the-ID-
+without-real-confirmation flaw persists unchanged. An independently-filed
+freedesktop.org/amd-gfx regression report ("[REGRESSION] RX-580 (gfx803)
+GPU hangs since ~v6.14.1") bisected the same symptom to this same commit.
+AMD has explicitly declined to investigate gfx803/RX580 issues on kernels
+above 6.11 (EOL card, unsupported) -- see ROCm/ROCm#4965.
+
+WHAT: in lookup_signaled_event_by_partial_id(), bail to the safe fallback
+whenever signal_mailbox_updated is false (previously only checked the
+UNSIGNALED_EVENT_SLOT case); in cik_event_interrupt.c, pass
+signal_mailbox_updated=false for all three kfd_signal_event_interrupt()
+call sites in cik_event_interrupt_wq() (was hardcoded true), accurately
+reflecting that gfx7/8 has no real mailbox confirmation.
+
+Applies to: drivers/gpu/drm/amd/amdkfd/kfd_events.c (function
+lookup_signaled_event_by_partial_id()) and
+drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c (function
+cik_event_interrupt_wq()), against Fedora's kernel-7.1.9-200.fc44 source.
+Built as a standalone out-of-tree amdgpu.ko module against the box's
+running 7.1.8-200.fc44 headers (same recipe as this repo's other
+REFERENCE- kernel patches; the aggregate Fedora/RHEL patch between 7.1.8
+and 7.1.9 touches zero files under drivers/gpu/drm/amd), installed over the
+stock module, rebooted. Confirmed fixed: the hang that previously
+reproduced on ~10 separate attempts over several hours did not recur across
+repeated vLLM engine-startup runs after installing this build; engine init
+dropped from 60-90+ minutes (or indefinite hangs) to ~22 seconds.
+
+Worth reporting upstream to gitlab.freedesktop.org/drm/amd/-/issues (the
+freedesktop.org thread referenced above already has the bisection; this
+patch is a candidate fix, not yet submitted).
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -748,10 +748,20 @@ static struct kfd_event *lookup_signaled_event_by_partial_id(
+ 	struct kfd_event *ev;
+
+ 	if (id >= KFD_SIGNAL_EVENT_LIMIT)
+ 		return NULL;
+
+ 	if (bits > 31 || (1U << bits) >= KFD_SIGNAL_EVENT_LIMIT) {
++		/* Without a firmware-confirmed mailbox update, the ID is not
++		 * trustworthy on hardware whose IH payload event ID is known
++		 * to be unreliable (gfx7/8 -- see cik_event_interrupt.c, which
++		 * passes signal_mailbox_updated=false for exactly this reason).
++		 * Fall back to the caller's exhaustive scan instead of risking
++		 * a lookup against a garbage ID: that can either silently drop
++		 * the real signaled event (permanent missed wakeup, hangs the
++		 * waiter forever) or wake an unrelated event that happens to
++		 * share the same numeric slot.
++		 */
++		if (!signal_mailbox_updated)
++			return NULL;
++
+ 		if (signal_mailbox_updated &&
+ 		    page_slots(p->signal_page)[id] == UNSIGNALED_EVENT_SLOT)
+ 			return NULL;
+
+--- a/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/cik_event_interrupt.c
+@@ -.. cik_event_interrupt_wq() ..@@
++	/* signal_mailbox_updated=false: gfx7/8's IH payload event ID is not
++	 * reliable (this is the hardware class the exhaustive-scan slow path
++	 * in kfd_signal_event_interrupt/lookup_signaled_event_by_partial_id
++	 * exists for). Trusting it directly here intermittently drops the
++	 * real completion event or wakes the wrong one -- root-caused via a
++	 * hung SubmitLinearCopyCommand/InterruptSignal::WaitRelaxed wait that
++	 * never returned despite the GPU having completed the copy.
++	 */
+ 	if (ihre->source_id == CIK_INTSRC_CP_END_OF_PIPE)
+-		kfd_signal_event_interrupt(pasid, context_id, 28, true);
++		kfd_signal_event_interrupt(pasid, context_id, 28, false);
+ 	else if (ihre->source_id == CIK_INTSRC_SDMA_TRAP)
+-		kfd_signal_event_interrupt(pasid, context_id, 28, true);
++		kfd_signal_event_interrupt(pasid, context_id, 28, false);
+ 	else if (ihre->source_id == CIK_INTSRC_SQ_INTERRUPT_MSG)
+-		kfd_signal_event_interrupt(pasid, context_id & 0xff, 8, true);
++		kfd_signal_event_interrupt(pasid, context_id & 0xff, 8, false);
