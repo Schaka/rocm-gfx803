@@ -1,0 +1,139 @@
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.hpp b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+index 2254068dbd..bdcad683e6 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+@@ -16,7 +16,9 @@
+ #include "device/device.hpp"
+ #include "os/os.hpp"
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
++#include <cstdlib>
+ #include <mutex>
+ #include <stack>
+ #include <string>
+@@ -38,6 +40,39 @@ constexpr static uint64_t kInvalidQueueIndex = std::numeric_limits<uint64_t>::ma
+ 
+ constexpr static uint64_t kTimeout4Secs = 4 * M;
+ 
++// gfx7/8 EOP-completion erratum mitigation -- see the WHY comment in
++// rocr-runtime's amd_blit_kernel.cpp for the full story (same underlying
++// hardware issue: an AQL dispatch's completion notification can be lost
++// even though the GPU genuinely finished the work). This is the shared
++// signal-wait helper behind HIP memcpy (hipMemcpyWithStream et al.) and
++// other ROCclr dispatch waits on gfx8 -- unlike the narrower rocr-runtime
++// fixes, there's no size/duration context here to auto-pick a safe
++// timeout, so this stays off by default and opt-in via
++// ROCR_GFX8_EOP_MITIGATION=1 (shared master switch with the rocr-runtime
++// side). ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US (default 5000, i.e. 5ms)
++// needs to comfortably exceed your workload's genuinely slowest
++// individual dispatch through this path -- tune it up if you have long-
++// running kernels, since this function is shared with real kernel-
++// dispatch completion waits, not just small copies. On timeout this
++// returns true (proceed) exactly the way this function already does for
++// a device reported unstable below -- callers already treat that return
++// value as normal completion, so this doesn't change any caller
++// contract, and every test this session where that path fired still
++// produced correct output: the GPU had genuinely finished, software just
++// never observed it.
++static bool Gfx8EopMitigationEnabled() {
++  static const bool enabled = (getenv("ROCR_GFX8_EOP_MITIGATION") != nullptr);
++  return enabled;
++}
++
++static uint64_t Gfx8EopMitigationHipTimeoutUs() {
++  static const uint64_t v = []() -> uint64_t {
++    const char* env = getenv("ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US");
++    return env ? uint64_t(atoll(env)) : 5000ull;
++  }();
++  return v;
++}
++
+ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool yield = false) {
+   hsa_wait_state_t wait_state = HSA_WAIT_STATE_BLOCKED;
+   if (active_wait) {
+@@ -62,6 +97,10 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool yi
+       }
+     }
+ 
++    const bool eop_mitigation_enabled = Gfx8EopMitigationEnabled();
++    const auto eop_mitigation_start = eop_mitigation_enabled ? std::chrono::steady_clock::now()
++                                                              : std::chrono::steady_clock::time_point{};
++
+     // This is unlimited wait, but we wait for 4 secs and check if the device is
+     // unstable, if so we return, otherwise we continue to wait in the while loop.
+     while (Hsa::signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
+@@ -73,6 +112,17 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool yi
+                 signal.handle, kTimeout4Secs);
+         return true;
+       }
++      if (eop_mitigation_enabled) {
++        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - eop_mitigation_start).count();
++        if (uint64_t(elapsed_us) >= Gfx8EopMitigationHipTimeoutUs()) {
++          ClPrint(amd::LOG_ERROR, amd::LOG_SIG,
++                  "ROCR_GFX8_EOP_MITIGATION: signal wait (0x%lx) exceeded "
++                  "%lluus -- proceeding without confirmation.",
++                  signal.handle, (unsigned long long)Gfx8EopMitigationHipTimeoutUs());
++          return true;
++        }
++      }
+       if (yield && wait_state == HSA_WAIT_STATE_ACTIVE) {
+         amd::Os::yield();
+       }
+@@ -694,40 +744,21 @@ class VirtualGPU : public device::VirtualDevice {
+   //! Resets the current queue state. Note: should be called after AQL queue becomes idle
+   void ResetQueueStates();
+ 
+-  //! Track the progress of the queue based on the last write index and completion signal.
+-  //! When skip_signal is true, only the write index is advanced and the completion signal
+-  //! is cleared. Used for graph pre-patched dispatches whose signals are externally
+-  //! managed and freed after graph completion.
++  //! Record the last write index and whether the last packet is idle-trackable. Only tracker-owned
++  //! signals (from Barriers().ActiveSignal()) qualify; set skip_signal for externally-provided or
++  //! absent completion signals. IsQueueIdle() reads the tracker-owned signal at check time.
+   template <typename AqlPacket>
+   inline void TrackQueueProgress(const AqlPacket& packet, uint64_t index,
+                                  bool skip_signal = false) {
+     last_write_index_ = index;
+-    if (skip_signal) {
+-      last_completion_signal_.handle = 0;
+-    } else if (packet.completion_signal.handle != 0) {
++    if (!skip_signal && packet.completion_signal.handle != 0) {
+       last_packet_with_signal_index_ = index;
+-      last_completion_signal_ = packet.completion_signal;
+     }
+   }
+ 
+-  //! Returns true if the queue is considered as idle. That means all submitted packets are
+-  //! complete. Note: it doesn't track the state of caches
+-  bool IsQueueIdle() const {
+-    if (gpu_queue_ == nullptr) {
+-      return true;
+-    }
+-
+-    // Make sure the last packet contained a completion signal
+-    if (last_packet_with_signal_index_ == last_write_index_) {
+-      if ((last_write_index_ == kInvalidQueueIndex) && (last_completion_signal_.handle == 0)) {
+-        return true;
+-      } else {
+-        return (Hsa::signal_load_relaxed(last_completion_signal_) == 0);
+-      }
+-    }
+-
+-    return false;
+-  }
++  //! Returns true if the queue is considered as idle, i.e. all submitted packets are complete.
++  //! Note: it doesn't track the state of caches.
++  bool IsQueueIdle() const;
+ 
+   //! True if this marker records the same event as the preceding barrier with no
+   //! intervening dispatch or sync. Caller must hold the execution() lock.
+@@ -862,7 +893,6 @@ class VirtualGPU : public device::VirtualDevice {
+   uint64_t last_write_index_ = kInvalidQueueIndex; //!< The last HW queue write index for any packet
+   uint64_t last_packet_with_signal_index_ = kInvalidQueueIndex; //!< The last HW queue write index for a packet
+                                               //!< with a completion signal
+-  hsa_signal_t last_completion_signal_{};     //!< The last completion signal
+ 
+   //! SDMA engine affinity tracking for this VirtualGPU/stream
+   uint32_t assigned_sdma_engine_ = 0;           //!< Assigned SDMA engine mask for all operations

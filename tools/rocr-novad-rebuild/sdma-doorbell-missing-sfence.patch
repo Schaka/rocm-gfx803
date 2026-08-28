@@ -64,7 +64,7 @@ on an immediate retry with no code change.
 NOT YET RE-VERIFIED ON REAL HARDWARE as of this patch text beyond the
 initial reproduction runs above -- see tools/rocr-novad-rebuild/ for the
 standalone ROCR-Runtime rebuild used to test this without a full image
-rebuild, and SESSION_HANDOFF.md for the verification result once run
+rebuild, and vllm-gfx803/NOTES.md for the verification result once run
 (repeated retries needed, since the bug is intermittent -- a single
 clean run does not confirm the fix any more than a single hang confirmed
 the bug).

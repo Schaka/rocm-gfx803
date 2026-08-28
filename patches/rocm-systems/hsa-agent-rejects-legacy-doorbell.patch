@@ -114,7 +114,7 @@ memory-order-release store that becomes visible to the GPU (the
 wptr-proxy field write and/or the doorbell-pointer write). One line.
 NOT YET RE-VERIFIED ON REAL HARDWARE as of this patch text -- see
 tools/rocr-novad-rebuild/ for the standalone ROCR-Runtime rebuild used
-to test this without a full image rebuild, and SESSION_HANDOFF.md for
+to test this without a full image rebuild, and vllm-gfx803/NOTES.md for
 the verification result once run.
 
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h

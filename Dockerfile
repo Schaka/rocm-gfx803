@@ -221,6 +221,17 @@ COPY patches/rocm-systems/ /rocm-systems-patches/
 RUN sh /rocm-systems-patches/hsa-agent-rejects-legacy-doorbell.sh /rocm-systems-src
 RUN sh /rocm-systems-patches/opencl-gfx8-hardcoded-rejection.sh /rocm-systems-src
 
+# Missing _mm_sfence() before SdmaQueue::RingDoorbell()'s doorbell write --
+# same bug class as hsa-agent-rejects-legacy-doorbell.patch's 2026-08-24
+# AQL-side fix (a release fence doesn't drain WC stores; only SFENCE
+# orders them against the doorbell BAR write). Fixes an intermittent
+# hipMemcpyWithStream hang reproduced via a real vLLM workload. See
+# patches/rocm-systems/sdma-doorbell-missing-sfence.patch for the full
+# WHY -- NOT YET CONFIRMED to be the only cause of hangs on this class of
+# call (a separate, still-open investigation exists for AQL dispatch
+# completion notifications going missing even with fences correct).
+RUN sh /rocm-systems-patches/sdma-doorbell-missing-sfence.sh /rocm-systems-src
+
 # VA-reuse defer, re-diffed from the shipped 6.4.4 fix
 # (rocm6.4.4/patches/rocr/va-reuse-defer.patch). Confirmed still needed on
 # 7.14 and confirmed effective via the actual 52-shape reduce-harness
@@ -239,6 +250,21 @@ RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 # Verified fix on real hardware: vLLM's graph-replay repro went from a
 # deterministic hang to completing every run.
 RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-src
+
+# Defensive mitigation for the gfx7/8 EOP-completion-notification-loss
+# issue referenced above (root cause: undocumented firmware behavior,
+# not reachable from software -- confirmed via live kernel-fence
+# tracing showing the GPU genuinely finished the work while its specific
+# completion interrupt never arrives; see patches/rocm-systems/
+# blit-kernel-eop-interrupt-retry.patch's header for the full
+# investigation). Off by default, matching pristine upstream behavior --
+# on a system with a correctly-sized PCIe BAR (Resizable BAR / Above 4G
+# Decoding enabled, see README's hardware requirements), code-object
+# loads route around the erratum-prone path entirely and this rarely if
+# ever triggers. Opt in at runtime with ROCR_GFX8_EOP_MITIGATION=1 (see
+# the patch header for the full set of tuning env vars) on a system that
+# still sees it.
+RUN sh /rocm-systems-patches/blit-kernel-eop-interrupt-retry.sh /rocm-systems-src
 
 # ROCR-Runtime first: CLR's HIP build links against it, so the patched
 # runtime has to be installed into /opt/rocm before CLR configures.
@@ -1005,14 +1031,21 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 
-# The wholesale /opt/rocm copies above come from pre-built component images;
-# a stale cached export layer can silently re-point the libamdhip64.so.7
-# symlink back at the base image's stock unpatched build (seen in practice:
-# build succeeded, hipGetDeviceCount returned 0 with the patched lib sitting
-# right next to the active one). Check the RESOLVED library, not the symlink
-# target name, so this fails loudly if the active lib doesn't carry the gfx8
-# opencl patch marker regardless of which layer re-pointed it.
-RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig \
+# The base image ships its own stock "-0000000"-suffixed build of
+# libamdhip64/libhiprtc/libhiprtc-builtins side by side with the
+# "-<commit>"-suffixed ones CLR's `make install` adds -- both are real
+# regular files sharing the same SONAME, not a symlink pair. `ldconfig`
+# picks which one the SONAME symlink resolves to by its own version
+# comparison, and it prefers "-0000000" over a commit-hash suffix
+# (reproduced directly: `ldconfig` alone, no cache/copy involved, rewrites
+# libamdhip64.so.7 from the patched file back to the stock one). Deleting
+# the stock file before `ldconfig` runs removes the ambiguity instead of
+# hoping the version comparison goes our way -- the patched file is the
+# only one that should ever ship in this image regardless. Check the
+# RESOLVED library, not the symlink target name, so this still fails loudly
+# if a future stock/patched filename pair confuses this again.
+RUN cd /opt/rocm/lib && rm -f libamdhip64.so.*-0000000 libhiprtc.so.*-0000000 libhiprtc-builtins.so.*-0000000 \
+    && echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig \
     && if ! strings "$(readlink -f /opt/rocm/lib/libamdhip64.so)" 2>/dev/null | grep -q "Image extension queries failed"; then \
         echo "FATAL: active libamdhip64.so does not carry the gfx8 opencl patch marker." >&2; \
         exit 1; \

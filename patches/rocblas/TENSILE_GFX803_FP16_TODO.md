@@ -27,12 +27,13 @@ benchmark-tuned for this architecture at all.
 This repo has already worked around this for the M=1 (decode) case via
 hand-written kernels (`patches/vllm/gfx803_gemv.py` -- `ops.LLMM1` /
 `gfx803_triton_gemv`) and confirmed **decode now surpasses
-llama.cpp-Vulkan** (see `SESSION_HANDOFF.md` §24-25). Prefill's M>1 GEMM
-shapes are a different problem: unlike decode's pathological M=1-through-
-a-128-row-tile waste, Tensile's `_fallback_` kernel is already a
-legitimately competent tiled GEMM at M=128-512 (confirmed directly: a
-naive from-scratch Triton GEMM lost to it by 3.5-5x, see
-`SESSION_HANDOFF.md` §27). Beating it requires either (a) a properly
+llama.cpp-Vulkan** (see `vllm-gfx803/NOTES.md`'s "Final numbers" table).
+Prefill's M>1 GEMM shapes are a different problem: unlike decode's
+pathological M=1-through-a-128-row-tile waste, Tensile's `_fallback_`
+kernel is already a legitimately competent tiled GEMM at M=128-512
+(confirmed directly: a naive from-scratch Triton GEMM lost to it by
+3.5-5x, see `vllm-gfx803/NOTES.md`'s "Dead ends" section). Beating it
+requires either (a) a properly
 engineered Triton GEMM with real software pipelining -- the path this
 session is pursuing instead of this document's task -- or (b) getting
 Tensile's own mature, already-pipelined assembly kernel generator to
@@ -517,8 +518,8 @@ crashes.
    not just "ran without crashing."
 3. **Independently re-verify against `torch.nn.functional.linear`**,
    the same way every other kernel this session was checked (see
-   `patches/vllm/gfx803_gemv.py`'s module docstring, `SESSION_HANDOFF.md`
-   §16-27 throughout for the exact pattern): once a working kernel
+   `patches/vllm/gfx803_gemv.py`'s module docstring and `vllm-gfx803/
+   NOTES.md`'s "How to reproduce" section for the exact pattern): once a working kernel
    library is produced, call it via ctypes/torch and diff against a
    float32 reference implementation at the real shapes this model uses
    (K=1536 and K=8960 for Qwen2.5-1.5B; see `gfx803_gemv.py`'s docstring
@@ -538,10 +539,10 @@ crashes.
    `_fallback_` kernel, and `gfx803_triton_gemv`/LLMM1 for the shapes
    they already cover) -- this whole effort is only worth shipping if it
    actually wins. Use the same rigor as every other benchmark this
-   session: median of repeated trials, not a single run (see
-   `SESSION_HANDOFF.md`'s repeated "single-trial sweeps are noisy enough
-   to reverse conclusions" lesson from the `rows_per_block` investigation
-   in §16-18).
+   session: median of repeated trials, not a single run -- a single-trial
+   `rows_per_block` sweep once produced a conclusion that reversed under
+   proper 3x200-iteration re-measurement (see `vllm-gfx803/NOTES.md`'s
+   "Custom kernels" section).
 6. **End-to-end correctness in the real model**: once wired into a real
    dispatch path (mirroring how `gfx803_gemv.py`/`gfx803_split_attn.py`
    are wired into vLLM), run `sanity_gen.py` (`/data/sanity_gen.py` on

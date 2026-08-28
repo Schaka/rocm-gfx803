@@ -15,7 +15,7 @@ program grid-stride-loop over its assigned rows
 ternary-search `while` loop per row. On gfx803 this kernel launches, then
 the GPU pegs at 100%/boosted clocks and never returns -- dmesg shows a
 real hardware `ring gfx timeout` -> BACO reset, not a soft hang. See
-rocm-gfx803 repo SESSION_HANDOFF.md section 8 item 2 for the full
+rocm-gfx803 repo vllm-gfx803/NOTES.md for the full
 debugging saga (killing the host process does not release the GPU; the
 comm name is truncated to "VLLM::EngineCor", `pkill -f EngineCore` misses
 it).

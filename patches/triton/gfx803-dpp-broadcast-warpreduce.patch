@@ -8,8 +8,8 @@ not exist on gfx803 -- confirmed with `llvm-mc -mcpu=gfx803`, error
 GCN3, which is neither CDNA nor RDNA) fell into the permlanex16 branch and
 failed to compile any kernel exercising a >16-lane warpReduce, surfacing
 as `LLVM ERROR: Cannot select: %llvm.amdgcn.permlanex16` (hit via vLLM's
-_topk_topp_kernel, see rocm-gfx803 repo SESSION_HANDOFF.md section 8 item
-6, and rocm-gfx803/patches/triton/README.md).
+_topk_topp_kernel, see rocm-gfx803 repo vllm-gfx803/NOTES.md, and
+rocm-gfx803/patches/triton/README.md).
 
 WHAT
 ----
@@ -31,7 +31,7 @@ FoldTrueCmpI fix in this same directory, vLLM's `_topk_topp_kernel`
 -    if (isCDNA(getISAFamily())) {
 +    // gfx803 (GCN3) has DPP broadcast (FeatureDPP, BCAST15/31 both valid)
 +    // but lacks v_permlanex16 (GFX10+ only) -- confirmed on real hardware,
-+    // see rocm-gfx803 repo SESSION_HANDOFF.md section 8 item 6.
++    // see rocm-gfx803 repo vllm-gfx803/NOTES.md.
 +    if (isCDNA(getISAFamily()) || getISAFamily() == ISAFamily::GCN3) {
        // row_bcast:15 row_mask:0xa
        buf = createDppReduxOpWithBoundCtrl(

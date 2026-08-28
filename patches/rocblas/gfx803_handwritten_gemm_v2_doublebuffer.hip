@@ -54,7 +54,7 @@ __device__ __forceinline__ float2 load_b_tile(const half* __restrict__ B, int K,
 
 // __launch_bounds__(256, 1): without this, the compiler caps this kernel
 // at a lower VGPR budget and forces spilling (confirmed via llvm-readobj
-// on the compiled gfx803 code object -- see SESSION_HANDOFF.md section 30
+// on the compiled gfx803 code object -- see vllm-gfx803/NOTES.md
 // for the full investigation, including how to extract and inspect the
 // actual compiled ISA). 1 block/CU is enough register budget for zero
 // spilling here (.vgpr_count=114, .vgpr_spill_count=0) -- combined with
@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
             // rocblas_gemm_ex when run in isolation) that eventually
             // crashes with a GPU memory access fault and no further
             // output. Workaround used throughout this investigation: one
-            // shape+M combination per process. See SESSION_HANDOFF.md
+            // shape+M combination per process. See vllm-gfx803/NOTES.md
             // sections 29-30 before trusting a multi-config run of this
             // file end-to-end.
             hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dC_ref);

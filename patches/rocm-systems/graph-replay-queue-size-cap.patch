@@ -47,7 +47,7 @@ indexing elsewhere in this codebase (`queueMask` etc, `rocvirtual.cpp`)
 are untouched -- they keep using the real, unscaled `queue_size_pkts`,
 which is correct (this exact queue size already worked correctly for
 ordinary dispatch before this patch, confirmed via real-hardware MQD
-register inspection in this repo's SESSION_HANDOFF.md).
+register inspection in this repo's vllm-gfx803/NOTES.md).
 
 Kernel-side companion (REQUIRED, not included here)
 ----------------------------------------------------
@@ -74,7 +74,7 @@ before the `kfd_queue_buffer_get()` validation calls) closes the gap:
 the same true, unscaled size real backing memory actually has. Verified
 end-to-end on real gfx803 hardware, applied to a custom out-of-tree
 `amdgpu.ko` built from Fedora's `kernel-7.1.9-200.fc44` source (see this
-repo's SESSION_HANDOFF.md for the full out-of-tree build recipe, same one
+repo's vllm-gfx803/NOTES.md for the full out-of-tree build recipe, same one
 used for the `pqm_debugfs_mqds` NULL-deref fix): `hsa_queue_create`
 succeeds at the full 131072-packet max, and vLLM's HIP-graph-replay
 `bench latency` repro completes cleanly and repeatably with the enlarged

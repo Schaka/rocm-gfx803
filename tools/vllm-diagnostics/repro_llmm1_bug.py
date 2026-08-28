@@ -14,7 +14,8 @@ catastrophic, not fp16 noise); K=8960 (down_proj's real shape in
 Qwen2.5-1.5B) doesn't even launch -- `hipErrorInvalidConfiguration`.
 
 LIKELY root cause (strong circumstantial evidence, not yet confirmed by
-disassembly/profiling -- see SESSION_HANDOFF.md and gfx803_gemv.py's
+disassembly/profiling -- see vllm-gfx803/NOTES.md's "Root-caused bugs"
+section and gfx803_gemv.py's
 module docstring in this repo for the fuller writeup): skinny_gemms.cu's
 LLMM1() host launcher computes
     NUM_THREADS = ceil_to_multiple_of(WARP_SIZE, K * 2 / 16)

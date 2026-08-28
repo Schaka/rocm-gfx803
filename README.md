@@ -88,7 +88,14 @@ diffed and consciously merged back together -- see "Convergence" below.
 - **rocm7**: builds end-to-end, confirmed on real gfx803 hardware --
   `rocminfo` enumerates the card as a real `KERNEL_DISPATCH` agent, and
   rocBLAS/MIOpen/MIGraphX/PyTorch/ORT have all done real GPU work on it. The
-  full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean.
+  full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean,
+  including `pool_sweep`, which used to crash intermittently (~50% of runs)
+  with a real GPU VM fault. Root-caused to a **hardware** issue, not
+  software: this card's mining-tuned VBIOS ran VRAM at 2100MHz, above its
+  actual correctness margin. Reflashing to a non-mining VBIOS running VRAM
+  at 1750MHz fixed it outright -- 20/20 clean runs, vs ~50% crashing before.
+  See "Host VBIOS setting" below and `LAST_REMAINING_PROBLEMS.md` for the
+  full investigation.
 ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
    against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
    separate real regressions from generic upstream gaps. One confirmed
@@ -100,6 +107,30 @@ ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
    gfx803-specific). Real-model
    validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
    HIP-accelerated) all pass with correct transcripts on real audio.
+- **vLLM on gfx803: deprioritized/discontinued.** A long investigation
+  into intermittent hangs (gfx7/8 EOP-completion-notification-loss
+  erratum, mitigated with a bounded retry gated behind
+  `ROCR_GFX8_EOP_MITIGATION=1`; a separate missing-SFENCE doorbell bug,
+  fixed unconditionally via `sdma-doorbell-missing-sfence.patch`) still
+  leaves one call path (`hipMemcpyWithStream` / ROCclr's `WaitForSignal`)
+  hanging with no safe mitigation available without a real ROCclr
+  refactor. See `MIGRATION_NOTES.md` for the full investigation, and
+  `LAST_REMAINING_PROBLEMS.md` problem 1 for the deepest dive (exact
+  packet-level localization of the hang, and the investigation's closing
+  status). **Do not enable `ROCR_GFX8_EOP_MITIGATION=1` outside a
+  disposable test environment**: caught in a follow-up session causing a
+  full, unrecoverable GPU bus death (`device lost from bus`, box needed a
+  hard reboot) via `hipMemcpy` racing ahead of a still-in-flight SDMA job;
+  a later attempt at the same fix idea against a different call site
+  (`ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`, an untracked patch) caused a
+  *worse* failure -- a full system hard lockup with no network response
+  at all, reproduced twice, requiring physical power-cycles to recover
+  both times. This hang is currently unresolved with no known safe
+  mitigation; the investigation into it is closed for now.
+  `llama.cpp`/HIP remains the recommended, working inference path on this
+  hardware -- confirmed via a rebuild against the latest patch chain and
+  clean `llama-bench` runs (no hangs across 3 runs), without this
+  mitigation enabled.
 - **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
   `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 - **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third
@@ -197,6 +228,25 @@ outside the software stack entirely. Keep ASPM disabled in BIOS (and via
 on any gfx803 host until proven otherwise on that specific board. See
 `tools/host-setup/` for a working `setpci`-based systemd unit for boards
 where BIOS/firmware won't actually hand ASPM control to Linux.
+
+## Host VBIOS setting: mining-tuned VRAM clocks cause random GPU VM faults
+
+At least one gfx803 card in use with this repo shipped with a mining-tuned
+VBIOS running VRAM (MCLK) at 2100MHz. Under a correctness-checked compute
+workload (`tools/correctness-suite/pool_sweep`) this produced an
+intermittent (~50% of runs), deterministic-address GPU VM fault that took
+hours of software-level investigation (ioctl tracing, PM4 dispatch
+tracing, kernel-side TLB-flush review, delay-based mitigation across three
+orders of magnitude) to correctly rule out as a driver/software bug --
+mining workloads tolerate occasional VRAM bit errors that a
+correctness-checked one won't surface until it's already returned wrong
+results or faulted. Reflashing to a non-mining VBIOS running VRAM at
+1750MHz (via `amdvbflash`'s force-flash mode -- see
+`LAST_REMAINING_PROBLEMS.md` for the exact ROM and flash procedure)
+resolved it completely: 20/20 clean runs afterward, vs ~50% crashing
+before. Check VRAM clock (`cat
+/sys/class/drm/card*/device/pp_dpm_mclk`) against the card's actual rated
+spec before assuming a gfx803 GPU-fault report is a software bug.
 
 ## What needs real gfx803 hardware to validate, and what doesn't
 

@@ -84,8 +84,7 @@ These were found by three rebuilds; they are not optional:
   enabled (no pytorch-fallback stopgap): coherent output, clean shutdown.
 
 See `fold-true-cmpi-while-nested-in-for-hang.patch`'s own header for the
-full root-cause writeup and `rocm-gfx803` repo `SESSION_HANDOFF.md`
-section 9 for the session narrative.
+full root-cause writeup.
 
 ## Known limitations
 

@@ -29,7 +29,7 @@ Verified by building this as a standalone out-of-tree module from
 Fedora's kernel-7.1.9-200.fc44 source (matching the box's running
 7.1.8-200.fc44 headers -- confirmed safe since the Fedora/RHEL aggregate
 patch between those two versions touches zero files under
-drivers/gpu/drm/amd; same build recipe as this repo's SESSION_HANDOFF.md
+drivers/gpu/drm/amd; same build recipe as this repo's vllm-gfx803/NOTES.md
 documents for the unrelated pqm_debugfs_mqds NULL-deref fix), installing
 it over the stock module, and rebooting.
 

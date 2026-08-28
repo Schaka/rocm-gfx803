@@ -298,3 +298,219 @@ Carried over from 6.4.4 and wired into the `Dockerfile`
 (`patches/rocr/va-reuse-defer.patch`) -- confirmed still needed on stock
 ROCm 7.14 gfx803 via `rocm6.4.4/tools/reduce-harness/`'s 52-shape sweep,
 at the same failure rate as 6.4.4 (~6-10/52) unpatched, 0/52 patched.
+
+## gfx7/8 EOP-completion-notification-loss, vLLM hang investigation, and
+## the decision to deprioritize vLLM on gfx803
+
+Long investigation, starting from an intermittent Qwen3.5-2B hang under
+vLLM. Full chain:
+
+1. **BAR stuck at 256MB.** A `nocrs` kernel boot flag was holding the
+   card's PCIe BAR down to 256MB instead of a real 8GB Resizable BAR.
+   Removing it enabled the full BAR -- but this *exposed* two hang sites
+   that the small-BAR code path had apparently been routing around,
+   rather than fixing anything on its own.
+2. **`BlitKernel::SubmitLinearCopyCommand` and `AqlQueue::ExecutePM4`
+   hangs.** Root cause: an undocumented gfx7/8 firmware erratum -- the
+   GPU genuinely finishes the dispatched work, but the completion
+   interrupt for that specific dispatch never arrives. Confirmed via live
+   kernel-fence tracing showing real completion with no corresponding
+   notification. Not reachable/fixable from software (no register or
+   driver-level workaround found), so the fix is a bounded-retry
+   mitigation, not a real fix: `patches/rocm-systems/
+   blit-kernel-eop-interrupt-retry.patch`, gated behind
+   `ROCR_GFX8_EOP_MITIGATION=1` (off/pristine by default -- on a system
+   with a real Resizable BAR, code-object loads mostly route around the
+   erratum-prone path anyway). Settled defaults after extensive sweep
+   testing (with real output-correctness validation via greedy-decode
+   text diffing against a known-good baseline, not just "didn't hang"):
+   `ROCR_GFX8_EOP_MITIGATION_TIMEOUT_US=250`,
+   `ROCR_GFX8_EOP_MITIGATION_MAX_ATTEMPTS=1`. Applied to both
+   `BlitKernel::SubmitLinearCopyCommand` (size-scaled timeout, since a
+   copy size is known there) and `AqlQueue::ExecutePM4`'s gfx8 branch
+   (flat timeout -- no size context available at that call site).
+3. **`sdma-doorbell-missing-sfence.patch` wired into the main
+   Dockerfile.** A real, separate bug found and fixed independently:
+   `SdmaQueue::RingDoorbell()` was missing an `_mm_sfence()` before its
+   doorbell BAR write -- a release fence alone doesn't drain
+   write-combined stores, only SFENCE orders them against the doorbell
+   write. Same *bug class* as an existing fix in
+   `hsa-agent-rejects-legacy-doorbell.patch`'s legacy-doorbell branch
+   (missing SFENCE around a doorbell write), but a genuinely different
+   bug: that one is CPU-write-ordering-before-the-doorbell-is-rung; the
+   EOP mitigation above is GPU-finishes-but-the-completion-notification-
+   never-arrives. Confirmed via code-path tracing that they don't share a
+   root cause before shipping this as a separate patch rather than folding
+   it into the EOP mitigation.
+4. **Still-open, deliberately unmitigated: `hipMemcpyWithStream` /
+   ROCclr's `WaitForSignal`.** This call path hangs too, but bypasses
+   both of the mitigations above entirely -- it goes through the raw
+   6-argument `SubmitLinearCopyCommand` overload with no built-in wait, so
+   there's no size context to thread a safe timeout through without a
+   real refactor of ROCclr's `Barriers`/signal-tracking architecture. A
+   naive flat-timeout attempt was tried and caused a genuine GPU page
+   fault on a large tensor copy (reverted immediately, `libamdhip64.so`
+   restored to the pristine backup). Left unmitigated -- fixing this
+   properly is a bigger task than one session, and shipping an unsafe
+   mitigation here would trade a hang for a worse failure mode (silent
+   corruption / page fault) on exactly the path that most needs to be
+   trustworthy.
+5. **`HSA_ENABLE_INTERRUPT=0` tested and ruled out.** Some profiling
+   tools default to this (software/busy-poll signal waiting instead of
+   hardware-interrupt-based) to sidestep unrelated deadlock classes.
+   Tested via a 6-run batch with the EOP mitigation active: 0/6 clean,
+   6/6 wedged -- no better than (and possibly worse than) the known
+   ~30-35% clean-run baseline with the mitigation alone. Not shipped.
+
+6. **Follow-up session: `ROCR_GFX8_EOP_MITIGATION=1` caught causing a
+   full GPU bus death, worse than the hang it mitigates.** After a
+   separate hardware fix (mining-VBIOS VRAM marginality -- see the
+   `pool_sweep` section above and `LAST_REMAINING_PROBLEMS.md` problem 2),
+   re-verified whether this mitigation was still needed. It is -- the hang
+   reproduced cleanly with it off, live `gdb` backtrace confirming the
+   exact `BlitKernel::SubmitLinearCopyCommand` call site. But testing with
+   the mitigation *on* went worse: its bounded give-up-and-proceed logic
+   let a `hipMemcpy` return early while its SDMA job was still genuinely
+   in flight; the calling process then exited and closed its device fd,
+   and the *kernel's own* `drm_sched_entity_flush` wait (unrelated to and
+   not bounded by this userspace mitigation) blocked on that same
+   still-outstanding job. Enough real time passed for the kernel's own
+   ring-timeout watchdog to fire a GPU reset, which failed repeatedly
+   (`device lost from bus`, `GPU Recovery Failed: -19`, 405+ times) until
+   the GPU was permanently wedged off the PCIe bus, unrecoverable short of
+   a full reboot. Full trace and reasoning in `LAST_REMAINING_PROBLEMS.md`
+   problem 1. Doesn't retract the mitigation (it's still off by default,
+   and item 5 above already validated it against real vLLM traffic) but
+   does mean "settled defaults" oversold how safe this is against every
+   call pattern -- specifically anything doing a blocking copy shortly
+   before process/context teardown.
+
+**Decision: vLLM support for gfx803 is being deprioritized/discontinued.**
+The accumulated hang/fault surface across `BlitKernel`, `AqlQueue`, and
+`hipMemcpyWithStream` -- one of which (item 4) can't be safely mitigated
+without a real ROCclr refactor -- makes vLLM not reliably usable on this
+hardware. `llama.cpp` remains a viable, working inference path (see final
+regression pass below) and is the recommended path forward for gfx803
+going forward. This was an explicit decision made with the repo owner,
+not a unilateral call -- if vLLM support is ever revisited, start from
+item 4 above.
+
+## ldconfig silently reverting the patched libamdhip64/libhiprtc/
+## libhiprtc-builtins back to stock
+
+Found during this session's final regression pass, in the main
+`Dockerfile`'s final stage. The stock ROCm dev base image ships its own
+`-0000000`-suffixed build of `libamdhip64.so`/`libhiprtc.so`/
+`libhiprtc-builtins.so` (three real regular files, not symlinks) sitting
+in the same directory as the `-<commit>`-suffixed ones CLR's `make
+install` adds -- both share the same SONAME (`libamdhip64.so.7`, etc.),
+so which one the SONAME symlink actually resolves to is `ldconfig`'s call,
+not a fixed fact about the image.
+
+`ldconfig`'s version-comparison algorithm prefers the stock `-0000000`
+suffix over a git-commit-hash suffix like `-ca887ee80a` -- reproduced
+directly and minimally: run *only* `ldconfig` (no COPY, no cache, no
+Docker layering involved) against a directory containing both files, and
+`libamdhip64.so.7`'s symlink flips from the patched target to the stock
+one. The final stage's own pre-existing verification check (grep for the
+gfx8 opencl patch marker string in the *resolved* library, not the
+symlink name) caught this for `libamdhip64` -- but `libhiprtc.so` and
+`libhiprtc-builtins.so` have the identical stock/patched duplicate-file
+problem with **no verification at all**, so a silent revert of those two
+would have shipped undetected.
+
+Fixed at the source: delete the stock `-0000000` duplicates immediately
+before `ldconfig` runs in the final stage (`Dockerfile`, ~line 1041),
+removing the ambiguity instead of hoping `ldconfig`'s version comparison
+goes the right way. Not a new problem introduced this session -- this bug
+would have hit any from-scratch build of this Dockerfile; it was
+undetected purely because no prior build had reached this exact
+final-stage check with the corrected patch chain from a fresh cache
+state until this session's regression pass forced a real rebuild.
+
+## `tools/correctness-suite/pool_sweep`: pre-existing GPU VM fault, not a
+## regression -- RESOLVED, root cause was hardware (mining VBIOS VRAM clock)
+
+Found during this session's regression pass: `pool_sweep` (MIOpen
+pooling-forward correctness sweep) crashes with a real GPU VM fault --
+not a soft miscompute -- on its very first, simplest test case (Max
+pooling, C=8 H=16 W=16, kernel 2x2 stride 2 pad 0). `dmesg` on the box:
+
+```
+amdgpu 0000:02:00.0: GPU fault detected: 146 0x0ab8040c
+amdgpu 0000:02:00.0:  Process pool_sweep pid 34658 thread pool_sweep pid 34658
+amdgpu 0000:02:00.0:   VM_CONTEXT1_PROTECTION_FAULT_ADDR   0x009347FF
+amdgpu 0000:02:00.0:   VM_CONTEXT1_PROTECTION_FAULT_STATUS 0x100C400C
+amdgpu 0000:02:00.0: VM fault (0x0c, vmid 8, pasid 1116) at page 9652223, read from 'TC3' (0x54433300) (196)
+```
+
+Same fault address every single run (`0x9347ff000`/`0x934800000`),
+deterministic, not flaky. Reproduces identically with
+`ROCR_GFX8_EOP_MITIGATION=1` set, so it is **not** the EOP-completion-
+notification-loss erratum this session's mitigations target -- it's a
+different, unrelated bug.
+
+**Confirmed pre-existing, not a regression from this session's changes**,
+via two independent checks: (1) the identical fault, at the identical
+address, reproduces against the currently-published
+`ghcr.io/schaka/rocm-migraphx-ort-torch-builder:latest-gfx803` image --
+i.e. the image this repo has been shipping, untouched by anything from
+this session; (2) `dmesg` shows the exact same fault class (`VM fault ...
+read from 'TC3'`, `IH ring buffer overflow`) already hit by a real vLLM
+workload (`Process VLLM::EngineCor`) earlier in this session, at a nearby
+but different address (`0x00A751AB`) -- establishing this as a recurring,
+pre-existing fault class on this hardware, not something newly
+introduced. `README.md`'s Status section has been corrected to note this
+exception to the previously-claimed clean 23/23 pass.
+
+**Root cause identified in a follow-up session: hardware, not software.**
+Extensive tracing (ioctl-level, PM4-dispatch-level, kernel TLB-flush
+review, delay-based mitigation) ruled out every software explanation --
+see `LAST_REMAINING_PROBLEMS.md` problem 2 for the full investigation.
+The actual cause: this card's mining-tuned VBIOS ran VRAM (MCLK) at
+2100MHz, above its real correctness margin -- a clock mining workloads
+tolerate occasional bit errors at, but this correctness-checked workload
+does not. Reflashing to a non-mining VBIOS running VRAM at 1750MHz fixed
+it completely: 20/20 clean runs afterward, vs ~50% crashing on the mining
+VBIOS. No software fix exists in this repo for this issue because there
+was never a software bug -- see `README.md`'s "Host VBIOS setting"
+section.
+
+## Final regression pass (this session, before vLLM deprioritization)
+
+Run against `rocm-gfx803:rocm7-regression`, a rebuild of the main
+Dockerfile (with the ldconfig fix above, `sdma-doorbell-missing-sfence`,
+and `blit-kernel-eop-interrupt-retry` all wired in) built against the
+*live* `release/therock-7.14` branch tip, not a frozen commit -- per this
+repo's own branch-pin convention. PyTorch/torchvision/torchaudio stages
+were deliberately excluded from this particular build (via a build-only,
+not-committed Dockerfile variant) since nothing in this regression pass
+tests against them and skipping them saved substantial build time; the
+tracked `Dockerfile` itself is unchanged in that respect.
+
+- `tools/correctness-suite/`: 22/23 sweeps clean. `pool_sweep` exception
+  documented above (pre-existing, unrelated).
+- `verify.py`'s non-torch-dependent checks (ONNX Runtime MIGraphX EP
+  provider check + Relu inference, and the static WGM8 kernel-name symbol
+  scan for the historically dangerous silent-rocBLAS-miscompute class):
+  all clean. The torch-based GEMM/MIOpen-conv numeric checks in
+  `verify.py` were not run this pass (no PyTorch in this particular
+  build) -- a known, deliberate gap in this one regression pass, not a
+  claim that those checks now pass or fail.
+- ORT's `onnx_backend_test_series.py`: attempted but not completed --
+  blocked on a chain of missing pip dependencies for `onnx`'s own pytest
+  report plugin (`pytest`, then `tabulate`), and even once collection
+  succeeded, the script's test-case generation (`globals().update(...)`
+  at module scope) doesn't populate any test items when invoked via a
+  bare `pytest <file>` -- it expects to be driven through its own CLI
+  entrypoint, not pytest's collector. Not investigated further given time
+  budget; deferred. The historical 3-way diff against the 6.4.4 and
+  gfx1201 lines documented earlier in `README.md`'s Status section is
+  unaffected by this -- that was prior work, not redone or invalidated
+  this session.
+- `llama-cpp-gfx803` rebuilt (base config, no `gfx803-packed-dp4a.patch`
+  performance patch) against `rocm-gfx803:rocm7-regression` as its base
+  image. 3/3 `llama-bench` runs against
+  `qwen2.5-0.5b-instruct-q4_k_m.gguf`: clean, no hangs, no crashes,
+  consistent numbers each run (~506 t/s pp128, ~141 t/s tg64). Confirms
+  llama.cpp/HIP remains a working path on this hardware post-patch-chain.

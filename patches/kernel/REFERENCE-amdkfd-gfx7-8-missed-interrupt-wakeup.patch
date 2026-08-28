@@ -3,7 +3,7 @@ kernel (amdgpu/amdkfd) driver source, not a userspace ROCm component this
 repo's Docker image build touches. Per AGENTS.md's standing rule, driver
 changes belong outside this repo -- this file exists purely as documentation
 for a real, hardware-verified kernel bug found and fixed while chasing a
-severe vLLM engine-startup hang. See SESSION_HANDOFF.md for the full
+severe vLLM engine-startup hang. See vllm-gfx803/NOTES.md for the full
 investigation.
 
 WHY: a thread could block forever inside

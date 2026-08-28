@@ -33,7 +33,7 @@
 // Telling it 1 block/CU is enough (trading occupancy for register budget)
 // lets it use 110 VGPRs/thread with .vgpr_spill_count=0 -- this alone is
 // the difference between losing to rocBLAS by 2-4x and beating it by
-// 1.03-1.26x at every shape/M this model uses. See SESSION_HANDOFF.md
+// 1.03-1.26x at every shape/M this model uses. See vllm-gfx803/NOTES.md
 // section 29 for the full investigation.
 __global__ __launch_bounds__(256, 1) void gemm_tiled_kernel(
     const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C,
@@ -258,7 +258,7 @@ int main() {
             // eventually crashes with a GPU memory access fault and no
             // further output. Workaround used throughout this
             // investigation: one shape+M combination per process. See
-            // SESSION_HANDOFF.md section 29 before trusting a multi-shape
+            // vllm-gfx803/NOTES.md before trusting a multi-shape
             // run of this file end-to-end.
             hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dC_ref);
         }
