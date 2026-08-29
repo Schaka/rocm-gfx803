@@ -161,13 +161,28 @@ diffed and consciously merged back together -- see "Convergence" below.
   once the card's VRAM clock is confirmed within spec (see "Host VBIOS
   setting").
 
-  **Still open, unrelated to the above**: a hybrid Mamba/GDN-attention model
-  (Qwen3.5-2B) hangs vLLM's engine-init memory-profiling pass on this same
-  box -- confirmed *not* the GPU hang (GPU stays 0% busy throughout, unlike
-  every instance of the real wedge, which sits at 100% busy and needs a
-  reboot). Looks like a host-side deadlock in the Triton GDN kernel's
-  JIT/launch path, specific to this model's architecture and this
-  `vllm-mobydick` checkout. Untouched by this investigation; next up.
+  **RESOLVED -- not a hang, a one-time slow cold-compile.** A hybrid
+  Mamba/GDN-attention model (Qwen3.5-2B) appeared to hang vLLM's engine-init
+  memory-profiling pass on this same box: GPU stayed at 0% busy for
+  minutes, which is why it looked like a deadlock rather than the real GPU
+  wedge (which sits at 100% busy and needs a reboot). `py-spy dump --native`
+  on the live process caught the real cause: it was actively burning CPU
+  inside LLVM's AMDGPU backend (bundled in Triton's `libtriton.so`),
+  compiling the model's GDN chunked-attention kernel. Isolated to the
+  kernel's `num_warps=4` autotune configs specifically -- `num_warps=2`
+  configs for the same kernel compile in under 2s on this box, but each
+  `num_warps=4` config took 19-67s, and cold end-to-end engine init took
+  389s. Confirmed gfx803-specific by compiling the identical kernel/configs
+  with the target arch string patched to `gfx942` on the same box (compile
+  only, never dispatched to real hardware): all 12 configs together took
+  14.86s, against 203s for the same 12 on `gfx803`. Once compiled, Triton's
+  on-disk kernel cache (`~/.triton/cache`) makes this a strictly one-time
+  cost per unique kernel/shape combination -- a second run against the same
+  model completed engine init in 13.45s and produced clean
+  `prefill_tok_s=77.8` / `decode_tok_s=56.1` numbers. First run against any
+  new model or new prompt/batch shape on this hardware should be expected
+  to take several extra minutes; that is Triton/LLVM compiling, not a stuck
+  process -- give it time rather than killing it.
 - **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
   `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 - **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third

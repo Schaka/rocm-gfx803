@@ -438,6 +438,55 @@ workaround above for the one real software fix that came out of this
 investigation (does not fix this hang, but is a correct fix in its own
 right).
 
+### Qwen3.5-2B "hang": LLVM AMDGPU cold-compile is slow on gfx803, not stuck
+
+Looked identical to a real GPU wedge at first glance: vLLM's engine-init
+memory-profiling pass for this model would sit for minutes with the GPU at
+0% busy. Every confirmed real gfx803 hang in this repo's history sits at
+100% GPU busy (wave parked, needs a reboot) -- 0% busy for minutes pointed
+somewhere else, so `py-spy dump --native --pid <pid>` was used to read the
+live process's actual native stack rather than guessing.
+
+That showed the process genuinely busy, not blocked: two threads pegged at
+~200% combined CPU, native stack rooted in
+`llvm::SLPVectorizerPass`/`SIFixSGPRCopies` inside Triton's bundled
+`libtriton.so`, called from `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`
+(vLLM's GDN chunked-attention kernel, `vllm/model_executor/layers/fla/ops/
+chunk_delta_h.py`) via its `@triton.autotune` config sweep.
+
+Isolated per autotune config (`num_warps` in `[2, 4]`, `num_stages` in `[2,
+3, 4]`, `BV` in `[32, 64]`, 12 configs total), compiled standalone via the
+kernel's own `.warmup()` (`triton.runtime.autotuner.Autotuner.warmup`,
+reached through `kernel.fn` -- calling `.warmup()` on `kernel` itself hits
+the outer `Heuristics` wrapper, whose `.warmup()` forwards into
+`Autotuner.run(warmup=True)`, which still calls `do_bench()` and dispatches
+real launches; going through `.fn` avoids that, needed here since a
+target-patched compile must never be dispatched onto real gfx803 silicon):
+
+| num_warps | compile time (this box) |
+|---|---|
+| 2 | 0.00 - 1.54s per config |
+| 4 | 19.18 - 66.51s per config |
+
+Confirmed gfx803-specific, not just this kernel being generically expensive
+to compile, by monkeypatching `triton.runtime.driver.active.get_current_target`
+to report `gfx942` for a compile-only run (same box, same Triton/LLVM
+build, same CPU, `.fn.warmup()` throughout so nothing reaches real
+hardware): all 12 configs together compiled in 14.86s, against 203.4s for
+the same 12 on `gfx803`. GCN's narrower SGPR file relative to gfx9+ is the
+likely reason `num_warps=4` (256 threads/workgroup, more simultaneous live
+ranges) blows up register-copy legalization and vectorization search cost
+in LLVM's AMDGPU backend -- this is upstream LLVM/Triton compile-time
+scaling, not a bug in anything this repo ships or patches.
+
+Triton caches compiled kernels to disk (`~/.triton/cache`) keyed by
+kernel/config/shape, so the cost is paid once per unique combination, not
+every run: a cold `qwen35_2b_bench.py` run measured `init engine ... took
+389.23 s`; an immediately following warm run (same box, same cache)
+measured `13.45 s` and produced clean `prefill_tok_s=77.8` /
+`decode_tok_s=56.1`. See README.md's Qwen3.5-2B status entry for the
+user-facing summary.
+
 ## ldconfig silently reverting the patched libamdhip64/libhiprtc/
 ## libhiprtc-builtins back to stock
 
