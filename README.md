@@ -85,106 +85,17 @@ diffed and consciously merged back together -- see "Convergence" below.
 
 ## Status
 
-- **rocm7**: builds end-to-end, confirmed on real gfx803 hardware --
-  `rocminfo` enumerates the card as a real `KERNEL_DISPATCH` agent, and
-  rocBLAS/MIOpen/MIGraphX/PyTorch/ORT have all done real GPU work on it. The
-  full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean,
-  including `pool_sweep`, which used to crash intermittently (~50% of runs)
-  with a real GPU VM fault. Root-caused to a **hardware** issue, not
-  software: this card's mining-tuned VBIOS ran VRAM above its actual rated
-  speed. Capping VRAM clock to 1750MHz fixed it outright -- 20/20 clean
-  runs, vs ~50% crashing before, later reconfirmed at 75/75 with a
-  correct-vendor VBIOS flash. This same root cause also explained the
-  long-standing vLLM hang -- see "Host VBIOS setting" below and
-  `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full investigation.
-
-  ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
-  against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
-  separate real regressions from generic upstream gaps. One confirmed
-  gfx803-specific regression (the `attention_*_gqa_with_past_and_present_expanded`
-  tests, traced to the rocBLAS strided-batched gemm GSU workspace-reuse
-  miscompute) was root-caused and fixed via the sgemm-shim's new
-  strided-batched interceptor -- see `MIGRATION_NOTES.md`. One regression
-  remains open (`ConvTranspose`, traced to an upstream MIGraphX bug, not
-  gfx803-specific). Real-model
-  validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
-  HIP-accelerated) all pass with correct transcripts on real audio.
-- **vLLM on gfx803: RESOLVED -- same VRAM-clock marginality as `pool_sweep`
-  above, not a software bug.** Months of investigation had refuted three
-  proposed software mechanisms (lost EOP completion interrupt; missing
-  `_mm_sfence()`/write-combining ring; and, on hardware, the missing GFXIP
-  7/8 ring double-map) without finding the real cause. It turned out to be
-  the same mining-VBIOS VRAM clock as `pool_sweep`'s crash, just manifesting
-  as a hang (a GPU-side wave parked in `s_waitcnt vmcnt(0)`, waiting on a
-  vector-memory op that never returns) instead of a fault. Confirmed on
-  hardware two independent ways: dropping MCLK from 2000MHz to 1750MHz via
-  core overdrive on the mining VBIOS (64/64 clean, vs. repeated same-boot
-  hangs before), and flashing a correct-vendor Hynix-strapped VBIOS at its
-  stock 1750MHz ceiling, no overdrive needed (75/75 clean). See "Host VBIOS
-  setting" below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full
-  investigation and the shader-side wave-state capture that finally
-  localized it.
-
-  Confirmed under real vLLM load, not just the correctness-suite: 30/30
-  fresh-process launches of a real `vllm-mobydick` model (Qwen2.5-1.5B)
-  against the VRAM-clock-fixed card, versus a documented ~30-35% per-launch
-  wedge rate before. Getting there also required two unrelated build-time
-  fixes in that vLLM checkout, worth knowing about if you hit them
-  independently of any GPU issue: its prebuilt `libgfx803gemm.so` was
-  missing an explicit link to `libamdhip64.so` (`undefined symbol:
-  __hipPopCallConfiguration` at dlopen) -- recompile from
-  `gfx803_gemm_lib_final.hip` with the ROCm 7.14 `hipcc`, not the stray
-  system one; and `librocblas.so` needs `LD_LIBRARY_PATH=/opt/rocm/core-7.14/
-  lib` since it isn't on the default search path in that environment.
-
-  **Fixed along the way, and worth having on its own even though it did not
-  turn out to be the hang's cause:** the AQL ring really was missing its
-  GFXIP 7/8 double mapping, which is why `hsa_queue_create` was capped at 64
-  packets. `patches/rocm-systems/aql-ring-queue-full-workaround.patch`
-  restores it -- verified on hardware, 64 -> 131072 packets, a 2048x
-  increase, which also removes the constraint behind
-  `graph-replay-batch-chunk-deadlock.patch`. It requires a kernel WITHOUT
-  `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and must never be combined
-  with `graph-replay-queue-size-cap.patch`.
-
-  **Do not enable `ROCR_GFX8_EOP_MITIGATION=1` or
-  `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`.** They give up on a packet the
-  CP has not consumed. Caught causing a full unrecoverable GPU bus death
-  (`device lost from bus`), and the HIP-timeout variant hard-locked the whole
-  box with no network response, twice, needing physical power-cycles. That
-  finding stands regardless of the VRAM-clock fix -- both remain a real way
-  to lose the whole box, not just the one process.
-
-  `llama.cpp`/HIP remains a working, well-tested inference path on this
-  hardware -- confirmed via a rebuild against the latest patch chain and
-  clean `llama-bench` runs (no hangs across 3 runs). vLLM is now also viable
-  once the card's VRAM clock is confirmed within spec (see "Host VBIOS
-  setting").
-
-  **RESOLVED -- not a hang, a one-time slow cold-compile.** A hybrid
-  Mamba/GDN-attention model (Qwen3.5-2B) appeared to hang vLLM's engine-init
-  memory-profiling pass on this same box: GPU stayed at 0% busy for
-  minutes, which is why it looked like a deadlock rather than the real GPU
-  wedge (which sits at 100% busy and needs a reboot). `py-spy dump --native`
-  on the live process caught the real cause: it was actively burning CPU
-  inside LLVM's AMDGPU backend (bundled in Triton's `libtriton.so`),
-  compiling the model's GDN chunked-attention kernel. Isolated to the
-  kernel's `num_warps=4` autotune configs specifically -- `num_warps=2`
-  configs for the same kernel compile in under 2s on this box, but each
-  `num_warps=4` config took 19-67s, and cold end-to-end engine init took
-  389s. Confirmed gfx803-specific by compiling the identical kernel/configs
-  with the target arch string patched to `gfx942` on the same box (compile
-  only, never dispatched to real hardware): all 12 configs together took
-  14.86s, against 203s for the same 12 on `gfx803`. Once compiled, Triton's
-  on-disk kernel cache (`~/.triton/cache`) makes this a strictly one-time
-  cost per unique kernel/shape combination -- a second run against the same
-  model completed engine init in 13.45s and produced clean
-  `prefill_tok_s=77.8` / `decode_tok_s=56.1` numbers. First run against any
-  new model or new prompt/batch shape on this hardware should be expected
-  to take several extra minutes; that is Triton/LLVM compiling, not a stuck
-  process -- give it time rather than killing it.
-- **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
-  `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
+- **rocm7 (this repo's root)**: builds end-to-end and is hardware-verified.
+  `rocminfo` enumerates the card as a real `KERNEL_DISPATCH` agent;
+  rocBLAS/MIOpen/MIGraphX/PyTorch/ORT all do real GPU work on it. The full
+  `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean.
+  ORT's `onnx_backend_test_series.py` (3828 tests) has one open,
+  non-gfx803-specific regression (`ConvTranspose`, an upstream MIGraphX
+  bug -- reported upstream, not patched here). Real-model validation
+  (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp) passes with
+  correct transcripts on real audio.
+- **rocm6.4.4**: hardware-verified, the older and longer-running of the two
+  lines. See `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 - **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third
   independent line. Builds gfx803 through TheRock's own build
   orchestration (`fetch_sources.py --patch-tag` + `cmake
@@ -192,6 +103,229 @@ diffed and consciously merged back together -- see "Convergence" below.
   Dockerfile, to test whether this repo's patches survive AMD's own build
   system -- see `therock-experimental/README.md` and
   `ROCM_UPSTREAM_ANALYSIS.md`.
+
+### Required host setup
+
+- **VBIOS/VRAM clock**: this card's VRAM must run within its rated speed
+  ceiling (1750MHz on the mining-tuned VBIOS this box shipped with,
+  confirmed via core overdrive; a stock/correct-vendor VBIOS needs no
+  overdrive). Running VRAM above spec causes real GPU VM faults under
+  MIOpen (`pool_sweep`) and GPU hangs under vLLM -- both the same
+  hardware-level root cause, not a software bug. See "Host VBIOS setting"
+  below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the
+  investigation.
+- **Never set `ROCR_GFX8_EOP_MITIGATION=1` or
+  `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`.** Both give up on a packet the
+  CP has not consumed. Confirmed causing full unrecoverable GPU bus death
+  (`device lost from bus`); the HIP-timeout variant hard-locked the whole
+  box twice, needing physical power-cycles. This holds regardless of the
+  VRAM-clock fix above.
+- `patches/rocm-systems/aql-ring-queue-full-workaround.patch` restores the
+  AQL ring's GFXIP 7/8 double mapping (64 -> 131072 packets, a 2048x
+  increase over the unpatched cap) and is required for
+  `graph-replay-batch-chunk-deadlock.patch` to be unnecessary. Needs a
+  kernel WITHOUT `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and must
+  never be combined with `graph-replay-queue-size-cap.patch`.
+
+### vLLM on gfx803
+
+Working end-to-end, including hybrid Mamba/GDN-attention models
+(Qwen3.5-2B). Two build-time fixes are required in a vLLM checkout beyond
+the VBIOS setting above: the prebuilt `libgfx803gemm.so` needs an explicit
+link to `libamdhip64.so` (recompile from `gfx803_gemm_lib_final.hip` with
+the ROCm 7.14 `hipcc`, not the system one, if you hit `undefined symbol:
+__hipPopCallConfiguration` at dlopen); and `librocblas.so` needs
+`LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`, since it isn't on the default
+search path.
+
+**First run against any new model or new prompt/batch shape is slow --
+this is expected, not a hang.** Triton/LLVM's AMDGPU backend compiles
+noticeably slower on gfx803 than on modern archs for some kernel configs
+(`num_warps=4` autotune configs measured 19-67s each here, vs <2s for
+`num_warps=2`); a hybrid model's first engine-init can take several
+minutes of 0%-GPU-busy CPU compilation. Triton's on-disk kernel cache
+(`~/.triton/cache`) makes this strictly one-time per unique
+kernel/shape combination -- give it time rather than killing the process.
+gfx803 has no matrix cores (MFMA), so attention always falls back to
+vLLM's Triton paged-attention kernel rather than the ROCm custom one --
+a real, understood cost on this hardware, not a bug. **Don't pass
+`enforce_eager=True`** -- CUDA-graph capture works cleanly on this
+hardware (confirmed: captures without error, output stays correct,
++7% decode throughput from cutting per-op launch overhead) and earlier
+benchmarking in this repo's history used `enforce_eager=True` out of
+habit from initial exploratory scripts, not because graphs don't work
+here.
+
+**gfx803 GEMM kernel** (`gfx803_prefill_gemm.py`/`gfx803_gemm_lib_final.hip`):
+a hand-written, register-blocked HIP kernel used for prefill's linear
+layers, alongside rocBLAS's hand-written GEMV kernel for decode's M=1
+shape. Tuned to 57 VGPRs/thread (partial K-tile unroll, `#pragma unroll
+8`) for double the occupancy of a naively fully-unrolled version. Its
+transposed-weight cache is capped by `VLLM_GFX803_GEMM_CACHE_MB` (env
+var, default 768 = ~10% of an 8GB card's VRAM) -- this cache is populated
+during the model's first real forward pass, before vLLM's KV-cache memory
+profiling settles, so a larger value buys more prefill-path coverage at
+the direct cost of available KV cache. Measured on this box (Qwen3.5-2B,
+RX 470 8GB, 2101-token prompt, `gpu_memory_utilization=0.98`,
+single-request batch=1, metrics-based per-request timing):
+
+| `VLLM_GFX803_GEMM_CACHE_MB` | prefill tok/s | decode tok/s | KV cache |
+|---|---|---|---|
+| 768 (default) | 352.7 | 42.0 | 0.66 GiB / ~39k tok |
+| 1200 | 365.1 | 42.1 | 0.4 GiB / ~24k tok |
+| 1350 | 366.6 | 42.0 | 0.26 GiB / ~16k tok |
+| 1536+ | OOM at `gpu_memory_utilization=0.98` on this 8GB card | | |
+
+Decode throughput is unaffected by this cache in every configuration
+measured -- it's bounded by the split-attention and GEMV kernels above,
+neither of which this cache touches. This card can safely run
+`gpu_memory_utilization` up to ~0.98 (no unrelated processes hold VRAM on
+a dedicated box).
+
+**Routing was originally gated to `gate_up_proj`-shaped weights only**
+(out_features >= 8192), on the belief that Tensile's kernel won at
+`qkv_proj`/`o_proj`/`down_proj`'s smaller shapes. That claim was never
+re-verified after this session's earlier measurement-methodology fixes
+(see the split-KV attention section above for the same pattern) and
+turned out false: `rocprofv3` traced the Tensile kernel actually
+dispatched at those shapes to Tensile's **untuned fallback library**
+(`TensileLibrary_..._fallback_gfx803.hsaco` -- this repo's rocBLAS patch
+tunes a different kernel type, not this one), and head-to-head
+benchmarking at real shapes (qkv_proj K=2048/N=2560, o_proj K=2048/N=2048,
+down_proj K=6144/N=2048, M=128-2101) found this kernel wins every single
+case, 20-95% faster (down_proj nearly 2x at M=2101). The gate is now just
+`N % 64 == 0` (this kernel's tile width; not verified below that, every
+real shape in this model satisfies it) -- no shape-name allowlist.
+
+That fallback dispatch isn't a missed-tuning-opportunity gap this repo's
+rocBLAS patch could still close, either: the shapes hit here use fp16
+**HPA** (high-precision/fp32-accumulate) contraction, and
+`patches/rocblas/TENSILE_GFX803_FP16_TODO.md` (from the investigation
+behind `tensile-gfx803-fp16-nond16.patch`) confirms fp16-HPA Tensile
+kernels are structurally impossible on gfx803 -- traced to AMD's own 2020
+Tensile commit history: `AsmCaps.py`'s gfx803 entry hardcodes
+`v_pk_fma_f16`/`v_mad_mix_f32`/`v_fma_mix_f32` all `False` (Polaris
+predates the packed/mixed-precision fp16 hardware those need, which
+shipped starting Vega/gfx900), and the commit that moved fp16 codegen
+into components carries the maintainers' own comment: `# No HPA on 803,
+every other combination should work though.` The patch that *is* shipped
+only unlocks non-HPA fp16 -- a different `HighPrecisionAccumulate: False`
+kernel variant Tensile can generate correctly on this hardware, but not
+the one these prefill shapes need. This is the real reason the hand-written
+HIP kernel above wins so decisively here: it isn't competing against a
+merely-undertuned Tensile kernel, it's doing something Tensile cannot
+express in its codegen on this silicon at all.
+
+**The realized gain is much smaller than that 20-95% kernel-level number**
+because the cache stores each weight **twice** -- the original layout
+plus a transposed copy -- so a VRAM budget that respects the ~10% ceiling
+only fits a fraction of the now-much-larger set of eligible weights (most
+still decline-to-cache and fall back to Tensile, unchanged from before
+this widening). Confirmed real but modest: 352.6 -> 352.7 tok/s at the
+unchanged 768MB default (most newly-eligible weights don't fit),
+352.6 -> 365-367 tok/s (+4%) at 1200-1350MB before hitting VRAM OOM on
+this card. Two follow-up ideas were tried and did **not** pan out, kept
+here so they aren't retried blind:
+
+- **Replace the original weight storage with the transposed copy** (drop
+  the double storage entirely) -- doesn't work. Decode's M=1 path
+  (`gfx803_skinny_linear` -> `LLGemm1_kernel`, `csrc/rocm/skinny_gemms.cu`)
+  reads every weight in its native `[N, K]` row-major layout for
+  coalesced `float4` loads; every weight is used by decode, not just the
+  ones prefill routes through this kernel, so both layouts are genuinely
+  needed at once, not redundant duplication to eliminate. Doing this
+  safely would mean rewriting `LLGemm1_kernel` to also work from the
+  transposed layout -- real scope on an already-tuned, already-verified
+  critical path, not attempted.
+- **Populate the cache at model-load time** (`process_weights_after_loading`)
+  instead of lazily on first forward call -- tried, reverted, real
+  regression (352.6 -> ~342 tok/s, reproduced twice). Cause: Qwen3.5-2B is
+  multimodal (`vision_config`), and this hook fires for every linear layer
+  including the vision tower's, which text-only generation never
+  exercises. Eager population filled the entire 768MB budget with
+  never-used vision weights (confirmed directly: cache dump showed 100%
+  vision-shaped tensors, zero text-decoder weights) before a single real
+  layer got cached. The original lazy, execution-order-driven design was
+  quietly doing something right by never caching weights that are never
+  actually called -- fixing the load-time version would need real
+  vision-vs-text layer detection, not attempted tonight.
+
+Our own GEMM kernel's occupancy was re-checked too (same VGPR-extraction
+technique that found attention's problem): 57 VGPR, 0 spills, unchanged
+from earlier tuning -- already solid, no further easy win there.
+
+**gfx803 split-KV decode attention** (`gfx803_split_attn.py`): decode's
+Triton paged-attention fallback (no MFMA hardware means no ROCm custom
+attention kernel) launches only `num_seqs * num_kv_heads` threadblocks --
+2 on this model's 32-CU RX 470, each looping serially over the whole KV
+sequence. This kernel splits that loop across a `NUM_KV_SPLITS` grid
+dimension instead. That split count was hardcoded to 2, tuned only
+against a ~192-token context; at this model's actual ~2229-token decode
+context it left 42.6% of decode's GPU time in this one kernel. Sweeping
+`{2,4,8,16,32}` on real hardware at the real context length found 16
+fastest (31.1 tok/s vs 22.6 at the old fixed 2, +37%; confirmed via
+`rocprofv3`: this kernel's own GPU-time share dropped from 42.6% to
+17.6%). Now scales with `max_seq_len` at the call site in
+`chunked_prefill_paged_decode.py` instead of a fixed constant -- see that
+function's inline comment for the exact formula and its (thin, two-point)
+justification.
+
+**The split kernel itself was then replaced with a hand-written HIP
+kernel** (`gfx803_attn_split.hip`/`libgfx803attn.so`, ctypes-bridged, same
+pattern as `gfx803_prefill_gemm.py`; toggle back to Triton with
+`VLLM_GFX803_ATTN_HIP_KERNEL=0`). Pulling the Triton kernel's compiled
+ISA straight from `~/.triton/cache` found it pinned at 256/256 VGPR with
+**637 spilled registers** at this model's HEAD_SIZE_PADDED=256 -- Triton
+materializes a full-width K/V tile and accumulator per iteration with no
+way to chunk the head dimension in its frontend (list comprehensions,
+tensor slicing, and loop-carried tensor collections were all tried and
+all rejected by Triton's compiler -- a real language limitation, not a
+bug to work around). The HIP kernel processes one KV token at a time with
+a wavefront-cooperative `__shfl_xor` dot-product reduction instead of a
+tile load, so per-thread state never exceeds a handful of floats: 61
+VGPR, **0 spills**. Verified against the Triton kernel bit-for-bit at
+fp32-rounding level (<3e-5 max abs diff) across seq_len 1-4096 and
+NUM_KV_SPLITS 1-32 via an isolated harness before ever touching the real
+model. Real-hardware result: the kernel's own GPU time dropped from
+2190ms to 242ms for the same 762 calls (9x, via `rocprofv3`), decode
+throughput 33.5 -> 42.0 tok/s (+25%) -- **surpassing llama.cpp's 40.42
+tok/s** on this exact comparison.
+
+**Decode's GEMV kernel (`LLGemm1_kernel`, `csrc/rocm/skinny_gemms.cu`) is
+already close to this card's memory-bandwidth ceiling** -- checked
+directly, not assumed: isolated per-shape benchmarking of every decode-path
+GEMV shape in this model measures ~200-213 GB/s against this card's
+~211 GB/s theoretical peak (rows_per_block=2, the current hardcoded value,
+already ties or beats 4/8/16 on every shape checked). `lm_head`'s call
+alone (vocab_size=248320, tied embeddings, ~970MB weight matrix, once per
+decode step) accounts for ~640ms of decode's ~2000ms GEMV total at ~92%
+of peak bandwidth -- a real hardware ceiling, not a kernel gap. Enabling
+CUDA-graph capture (see below) gave a real but modest +7% decode gain from
+cutting CPU-side dispatch gaps between kernel launches; profiling
+confirmed the GEMV kernels' own GPU execution time is unchanged before and
+after (120.5us vs 121us average) -- the win was in the gaps between
+launches, not the kernels themselves.
+
+**For comparison, `llama.cpp`/Vulkan (RADV) on the same card, same model,
+no quantization** (`Qwen3.5-2B-BF16.gguf`, `llama-bench -ngl 99`, 3 reps):
+
+| test | vLLM (CUDA graphs, HIP attention kernel) | llama.cpp/Vulkan (BF16) |
+|---|---|---|
+| prefill, 2101 tok | 352.6 tok/s | 760.42 tok/s |
+| decode (tg128) | **42.0 tok/s** | 40.42 tok/s |
+
+Decode now beats llama.cpp/Vulkan on this card. Getting there confirmed
+the gap was never a hardware wall -- RADV reports `matrix cores: none`
+on this card too, same as ROCm; llama.cpp's edge was llama.cpp's Vulkan
+flash-attention kernel (`ggml-vulkan/vulkan-shaders/flash_attn.comp`)
+being a hand-tuned scalar (non-coopmat) shader with explicit `AMD_GCN`
+occupancy control that vLLM's generic Triton kernel didn't have; writing
+a real occupancy-controlled kernel of our own (the HIP split-attention
+kernel above) closed it. Decode's remaining headroom is now mostly GEMV
+memory bandwidth (measured near this card's ~211 GB/s ceiling already,
+not much left there). Prefill's remaining ~2.2x gap hasn't been
+investigated with the same rigor yet -- likely the next place to look if
+pushing further.
 
 ## Building
 
