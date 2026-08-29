@@ -1,0 +1,277 @@
+name: Build gfx803 (rocm10, main)
+
+# Manual-only, same reasoning as the other line workflows: every version in
+# this repo's root Dockerfile is pinned to an immutable ref (a TheRock
+# meta-release tag plus exact rocm-systems/rocm-libraries commit SHAs, a
+# MIGraphX tag, a torch ref, an ORT tag), so a nightly run would rebuild
+# byte-identical inputs and republish the same image. Run it when a pin
+# changes, or when something needs re-verifying on hardware.
+#
+# Chain: rocr-clr -> {rocblas, miopen} -> migraphx -> {pytorch, ort} ->
+# {torchvision, torchaudio} -> final. rocr-clr (patched ROCR-Runtime/CLR:
+# legacy-doorbell restore, VA-reuse defer) is needed by both rocblas and
+# miopen, which both build from it in parallel. migraphx needs BOTH rocblas
+# and miopen -- it links rocBLAS, and it's configured with
+# -DMIGRAPHX_USE_MIOPEN=On and genuinely links libMIOpen.so too, not just a
+# runtime dlopen, so it has to build against the gfx803-patched MIOpen from
+# the start rather than the base image's stock one with the patch spliced in
+# only at final. pytorch and ort both build from migraphx's /opt/rocm (not
+# rocblas/miopen directly), and are independent of each other, so they run in
+# parallel. torchvision and torchaudio each build from the pytorch wheel, in
+# their own job/image, same reasoning as the mainline repo's per-component
+# split -- no prebuilt wheel exists for gfx803 on either, so both always take
+# the from-source path. final assembles migraphx + miopen + pytorch +
+# torchvision + torchaudio + ort.
+#
+# This produces the *unsuffixed* :latest-gfx803/:gfx803/:cache-gfx803 tags --
+# rocm10 is this repo's main line. rocm7.14 (the line this one superseded,
+# see gfx803-rocm7.14.yml) and rocm6.4.4 (the older classic-tag line) publish
+# under a -rocm7.14 / -rocm6.4.4 suffix instead, see gfx803-rocm7.14.yml and
+# gfx803-rocm6.4.4.yml.
+#
+# Each component is individually skippable -- these builds are long and the
+# inputs rarely all change at once. A skipped component's downstream jobs
+# reuse whatever that component last published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-rocr-clr:
+        description: 'Build patched ROCR-Runtime/CLR (legacy-doorbell restore, VA-reuse defer) for gfx803 (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-rocblas:
+        description: 'Build rocBLAS for gfx803 (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-miopen:
+        description: 'Build MIOpen for gfx803 (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-migraphx:
+        description: 'Build MIGraphX'
+        type: boolean
+        required: false
+        default: true
+      build-pytorch:
+        description: 'Build PyTorch (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-torchvision:
+        description: 'Build torchvision (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-torchaudio:
+        description: 'Build torchaudio (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-ort:
+        description: 'Build ONNX Runtime'
+        type: boolean
+        required: false
+        default: true
+      pytorch-ref:
+        description: 'Override PYTORCH_REF. Leave empty for the Dockerfile default.'
+        required: false
+        default: ''
+      torchvision-ref:
+        description: 'Override TORCHVISION_REF. Leave empty for the Dockerfile default.'
+        required: false
+        default: ''
+      torchaudio-ref:
+        description: 'Override TORCHAUDIO_REF. Leave empty for the Dockerfile default.'
+        required: false
+        default: ''
+      debug:
+        description: 'Open an SSH debug session (tmate) into the runner for the duration of the build'
+        type: boolean
+        required: false
+        default: false
+      no-cache:
+        description: 'Force a fully fresh build, ignoring the registry build cache (use if a component is suspected stale/corrupted)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  rocr-clr:
+    if: ${{ inputs.build-rocr-clr }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: rocr-clr
+      target: rocr-clr-builder
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  # `needs` + a skipped dependency: GitHub reports result == 'skipped' both
+  # when a job's own `if` was false because the user unchecked its input, AND
+  # when it was false because an upstream dependency failed -- the two are
+  # indistinguishable from `result` alone. Every gate below is written
+  # `success || (skipped && !inputs.build-X)` specifically to keep those
+  # apart: a skip only counts as "safe to proceed, reuse the last published
+  # image" when it's the user's own unchecked input for THAT job. Without the
+  # `!inputs.build-X` guard, a real upstream failure reports as 'skipped' too,
+  # and every downstream gate would wrongly wave it through as if the user
+  # had deliberately opted out -- building on top of an image that was never
+  # actually rebuilt.
+  rocblas:
+    needs: rocr-clr
+    if: ${{ !cancelled() && inputs.build-rocblas && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: rocblas
+      target: rocblas-builder
+      with-rocr-clr-image: true
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  miopen:
+    needs: rocr-clr
+    if: ${{ !cancelled() && inputs.build-miopen && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: miopen
+      target: miopen-builder
+      with-rocr-clr-image: true
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  # migraphx builds with -DMIGRAPHX_USE_MIOPEN=On and genuinely links against
+  # libMIOpen.so, not just a runtime dlopen -- so it needs the gfx803-patched
+  # MIOpen image at build time too, same reasoning as its rocblas dependency.
+  migraphx:
+    needs: [rocblas, miopen]
+    if: ${{ !cancelled() && inputs.build-migraphx
+      && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: migraphx
+      target: migraphx-builder
+      with-rocblas-image: true
+      with-miopen-image: true
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  pytorch:
+    needs: migraphx
+    if: ${{ !cancelled() && inputs.build-pytorch && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: pytorch
+      target: pytorch-builder
+      with-migraphx-image: true
+      pytorch-ref: ${{ inputs.pytorch-ref }}
+      # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
+      # RSS and multiple hours regardless of hardware; -O1 for just this
+      # file clears it in under a minute -- confirmed on both a 4-vCPU/16GB
+      # CI runner and a 24-core/30GB workstation.
+      tensor-topk-opt-level: '-O1'
+      swap-size-gb: '24'
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  # torchvision and torchaudio each get their own job/image rather than
+  # building inside pytorch's, same as the mainline repo's per-component
+  # split -- both build from source against the PyTorch wheel above; no
+  # prebuilt wheel exists for gfx803 on either, so there is no tier to pick
+  # between.
+  torchvision:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchvision && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: torchvision
+      target: torchvision-builder
+      with-pytorch-image: true
+      torchvision-ref: ${{ inputs.torchvision-ref }}
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  torchaudio:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchaudio && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: torchaudio
+      target: torchaudio-builder
+      with-pytorch-image: true
+      torchaudio-ref: ${{ inputs.torchaudio-ref }}
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  ort:
+    needs: migraphx
+    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: ort
+      target: ort-builder
+      with-migraphx-image: true
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  final:
+    needs: [migraphx, miopen, pytorch, torchvision, torchaudio, ort]
+    if: ${{ !cancelled()
+      && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
+      && (needs.torchvision.result == 'success' || (needs.torchvision.result == 'skipped' && !inputs.build-torchvision))
+      && (needs.torchaudio.result == 'success' || (needs.torchaudio.result == 'skipped' && !inputs.build-torchaudio))
+      && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: final
+      final: true
+      with-migraphx-image: true
+      with-miopen-image: true
+      with-pytorch-image: true
+      with-torchvision-image: true
+      with-torchaudio-image: true
+      with-ort-image: true
+      release-tag: rocm10.0
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}

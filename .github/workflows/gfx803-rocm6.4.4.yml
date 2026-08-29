@@ -5,9 +5,9 @@ name: Build gfx803 (rocm6.4.4, archived line)
 # release/rocm-rel-6.4, a torch release branch, an ORT tag), so a nightly run
 # would rebuild byte-identical inputs and republish the same image.
 #
-# This line is archived, not actively developed: rocm7 (this repo's root
-# line, see gfx803-rocm7.yml) is where new investigation happens now that
-# ROCm 7.14 support is confirmed working. rocm6.4.4 stays hardware-verified
+# This line is archived, not actively developed: rocm10 (this repo's root
+# line, see gfx803-rocm10.yml) is where new investigation happens now that
+# ROCm 10.0 is the main line. rocm6.4.4 stays hardware-verified
 # and buildable, but only gets re-run when a pin needs updating or something
 # needs re-verifying, not as ongoing development.
 #
@@ -46,7 +46,7 @@ name: Build gfx803 (rocm6.4.4, archived line)
 # missing/stale component.
 #
 # Publishes under a -rocm6.4.4 tag suffix (:latest-gfx803-rocm6.4.4 etc) --
-# rocm7 owns the unsuffixed :latest-gfx803/:gfx803 tags now that it's this
+# rocm10 owns the unsuffixed :latest-gfx803/:gfx803 tags now that it's this
 # repo's main line. The final image's release-tag (:rocm6.4.4-gfx803) is
 # unaffected either way, since the release name already disambiguates it.
 

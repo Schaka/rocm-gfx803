@@ -147,21 +147,27 @@ approach work in this repo:
 - Every `.sh` driver verifies its own result after applying -- greps for a
   marker string, fails loudly (`exit 1`) if it's missing. Don't add a
   driver that trusts the patch tool's exit code alone.
-- The two lines (`rocm7`/root and `rocm6.4.4/`) are independent copies on
-  purpose. Do not make one reference the other's `patches/`/`tools/` --
-  both are under active development and a shared file risks a
+- The three lines (`rocm10`/root, `rocm7.14/`, `rocm6.4.4/`) are
+  independent copies on purpose. Do not make one line reference another's
+  `patches/` -- the root, `rocm7.14/` and `rocm6.4.4/` each carry their own
+  patch set, all under active development, and a shared file risks a
   bug-in-progress on one reaching the hardware-verified state of the
   other. Copy, don't link, until the deliberate convergence step (see
-  README's "Convergence" section) is actually happening.
+  README's "Convergence" section) is actually happening. `tools/` is the
+  deliberate exception: it's hardware/arch-level tooling (host-setup,
+  correctness-suite), not version-specific, so it lives once at the root
+  and all three lines use it from there.
 
 ## Component ref pinning -- branches, not commit SHAs, no nightlies
 
 Every upstream component this repo builds from source (`ROCM_SYSTEMS_REF`,
 `ROCM_LIBRARIES_REF`, `MIGRAPHX_REF`, `PYTORCH_REF`, etc. in the Dockerfile)
-is pinned to a named release *branch* -- `release/therock-7.14`,
-`release/rocm-rel-7.14`, and so on -- not a frozen commit SHA and not a
+is pinned to a named release *branch* -- `release/therock-10.0`,
+`release/rocm-rel-10.0`, and so on -- not a frozen commit SHA and not a
 per-run resolution of `develop`/`main`. Same convention the mainline
-(`rocm-migraphx-ort-builder`) repo's `release.yml` uses.
+(`rocm-migraphx-ort-builder`) repo's `release.yml` uses. (The `rocm7.14/`
+line uses the corresponding `release/therock-7.14` / `release/rocm-rel-7.14`
+branches.)
 
 This works only because CI here is manual-dispatch only, with no schedule --
 there's no nightly job re-running against a moving branch tip unattended. A
@@ -179,11 +185,11 @@ upstream only tags releases rather than branching them), pin that one to an
 exact commit SHA instead and say so explicitly in the Dockerfile comment --
 don't default to `develop`/`main` to avoid the question.
 
-## vLLM support lives in vllm/ as a hard fork -- not patch files, not a submodule
+## vLLM support lives in rocm7.14/vllm/ as a hard fork -- not patch files, not a submodule
 
-`vllm/` in this repo is a **hard fork**: upstream gfx906 vLLM support,
-taken and adjusted for gfx803, tracked directly by this repo's own git
-history as of 2026-08-29. It started life as a separate checkout with its
+`rocm7.14/vllm/` in this repo is a **hard fork**: upstream gfx906 vLLM
+support, taken and adjusted for gfx803, tracked directly by this repo's own
+git history as of 2026-08-29. It started life as a separate checkout with its
 own `.git` (remote `ai-infos/vllm-gfx906-mobydick`) and was deliberately
 un-forked from that -- `.git` removed, no `.gitmodules`, no gitlink, no
 independent history, no relationship to that upstream repo going forward.
@@ -194,53 +200,64 @@ value in maintaining a separate history to eventually reconcile. Don't
 `git submodule add` it or try to reconnect it to that remote without
 being told to.
 
+The fork currently lives with the **rocm7.14 line** (its prebuilt
+`libgfx803gemm.so` links the 7.14 `hipcc`, and `librocblas.so` is picked up
+via `LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`) -- it moved there when the
+7.14 line was archived under `rocm7.14/`. It is **not** yet re-targeted to
+the 10.0 root line: the box's editable vLLM install tracks whichever ROCm
+stack the box runs, so re-targeting happens when the box moves to 10.0. When
+it does, move the fork (or re-import it) into the new root `vllm/` the same
+way the 7.14 line carried it, and re-verify on hardware -- the `.so` linkage
+is stack-specific.
+
 **It is not built from this repo's Dockerfile** (vLLM runs as a box-only
 editable install), and it is **not documented via `.patch.md` files under
 `patches/vllm/`** -- that convention existed once, for a version of this
 repo that didn't vendor vLLM at all, and was deliberately removed
 (commit `a8485b4`, "[Build] Bring working vLLM in"). It must not be
 revived now either. Whatever gets figured out for gfx803 in vLLM goes
-directly into the real source files in `vllm/`, the same way any other
-fix in this repo lands in real code, not a doc describing a hypothetical
-patch.
+directly into the real source files in `rocm7.14/vllm/`, the same way any
+other fix in this repo lands in real code, not a doc describing a
+hypothetical patch.
 
-**Gotcha: `vllm/` is double-nested.** `vllm/` itself is the fork's own
-root (has its own `AGENTS.md`, `README.md`, `benchmarks/`, etc. --
-`vllm/AGENTS.md` is upstream's *own* contribution-policy doc, about
+**Gotcha: `vllm/` is double-nested.** `rocm7.14/vllm/` itself is the fork's
+own root (has its own `AGENTS.md`, `README.md`, `benchmarks/`, etc. --
+`rocm7.14/vllm/AGENTS.md` is upstream's *own* contribution-policy doc, about
 submitting PRs to `vllm-project/vllm`; irrelevant here, ignore it, we are
 never upstreaming); the actual importable `vllm` package is one level
-deeper, at `vllm/vllm/` (`vllm/vllm/model_executor/layers/...`,
-`vllm/vllm/v1/attention/ops/...`). Writing to `vllm/model_executor/...`
-instead of `vllm/vllm/model_executor/...` silently lands nothing (or the
+deeper, at `rocm7.14/vllm/vllm/` (`rocm7.14/vllm/vllm/model_executor/
+layers/...`, `rocm7.14/vllm/vllm/v1/attention/ops/...`). Writing to
+`rocm7.14/vllm/model_executor/...` instead of
+`rocm7.14/vllm/vllm/model_executor/...` silently lands nothing (or the
 wrong thing) and is easy to do by accident if the shell's cwd has drifted
 (this tool's working directory persists between commands in a session) --
 verify with an absolute path, not a relative guess, when in doubt.
 
-**Hand-written gfx803 HIP kernel source lives in `vllm/vllm/gfx803_kernels/`**
-(`gfx803_gemm_lib.hip`, `gfx803_attn_split.hip`), a dedicated folder, not
-alongside the Python loaders that `ctypes`-load their compiled output.
-`vllm/.gitignore` blanket-excludes `*.hip` repo-wide with the comment
-"hip files generated by PyTorch" -- true for upstream's actual hipify
-output (auto-translated from `.cu` CUDA source as a build step) but wrong
-for these two, which are hand-written originals with no `.cu` to
-regenerate from. `gfx803_kernels/` is explicitly whitelisted back
-(`!/vllm/gfx803_kernels/*.hip` in `vllm/.gitignore`) instead of routinely
-force-adding files past the blanket rule -- put any new hand-written
-gfx803 `.hip` kernel source there and it tracks normally. The compiled
-`.so` still needs to land next to its Python loader (e.g.
-`vllm/vllm/model_executor/layers/libgfx803gemm.so`) for that loader's
-`__file__`-relative ctypes path to find it -- only the source moved, the
-`hipcc -o` output path did not; see the loader's own docstring for the
-exact compile invocation.
+**Hand-written gfx803 HIP kernel source lives in `rocm7.14/vllm/vllm/
+gfx803_kernels/`** (`gfx803_gemm_lib.hip`, `gfx803_attn_split.hip`), a
+dedicated folder, not alongside the Python loaders that `ctypes`-load their
+compiled output. `rocm7.14/vllm/.gitignore` blanket-excludes `*.hip`
+repo-wide with the comment "hip files generated by PyTorch" -- true for
+upstream's actual hipify output (auto-translated from `.cu` CUDA source as a
+build step) but wrong for these two, which are hand-written originals with
+no `.cu` to regenerate from. `gfx803_kernels/` is explicitly whitelisted
+back (`!/vllm/gfx803_kernels/*.hip` in `vllm/.gitignore`) instead of
+routinely force-adding files past the blanket rule -- put any new
+hand-written gfx803 `.hip` kernel source there and it tracks normally. The
+compiled `.so` still needs to land next to its Python loader (e.g.
+`rocm7.14/vllm/vllm/model_executor/layers/libgfx803gemm.so`) for that
+loader's `__file__`-relative ctypes path to find it -- only the source
+moved, the `hipcc -o` output path did not; see the loader's own docstring
+for the exact compile invocation.
 
 **Syncing box-only work back**: real gfx803 vLLM fixes get iterated and
 verified live on the box at 192.168.1.214 (`/data/vllm-mobydick/`, see
 "Hardware access" below), then the actual changed/new files get copied
-back into this local `vllm/vllm/...` checkout so the real diff lands
-here -- not summarized into a separate document. The usual commit/push
-rule applies same as everywhere else in this repo: build and stage
-locally, never commit or push without being told to for that specific
-commit.
+back into this local `rocm7.14/vllm/vllm/...` checkout so the real diff
+lands here -- not summarized into a separate document. The usual
+commit/push rule applies same as everywhere else in this repo: build and
+stage locally, never commit or push without being told to for that
+specific commit.
 
 ## Hardware access
 

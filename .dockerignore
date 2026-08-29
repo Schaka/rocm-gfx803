@@ -1,12 +1,13 @@
 # Build context for this Dockerfile is the repo root. Only patches/ is ever
 # COPYed from it; the rest is documentation, host-side tooling, investigation
 # output (ORT backend-test logs run tens of megabytes), and the entire
-# rocm6.4.4/ line, none of which belongs in a context transfer. Mirrors
-# rocm6.4.4/.dockerignore.
+# rocm7.14/ and rocm6.4.4/ lines, none of which belongs in a context transfer.
 #
 # This does not affect layer caching: BuildKit keys a COPY on the checksums of
 # the files it actually copies, not on the whole context.
 *.md
 *.log
 tools/
+rocm7.14/
 rocm6.4.4/
+llama-cpp-gfx803/

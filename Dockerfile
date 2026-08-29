@@ -1,91 +1,101 @@
 # syntax=docker/dockerfile:1
-# Polaris / gfx803 on ROCm 7.14 -- this repo's main line. See README.md for
-# current status (what's verified vs. what's untested) and MIGRATION_NOTES.md
-# for the full source-level evaluation this Dockerfile implements.
+# Polaris / gfx803 on ROCm 10.0 (TheRock) -- this repo's main line. See
+# README.md for current status (what's verified vs. what's untested) and
+# MIGRATION_NOTES.md for the full source-level evaluation this Dockerfile
+# implements.
 #
-# Separate from rocm6.4.4/Dockerfile (the older, archived-but-still-buildable
-# ROCm 6.4.4 line) on purpose -- ROCm 7's ROCR-Runtime rejects Polaris at HSA
-# agent creation (legacy/pre-1.0 doorbell type), which 6.4.4 never had to work
-# around. Getting past that wall needs a source-level ROCR-Runtime + CLR
-# rebuild that rocm6.4.4/Dockerfile has no equivalent of.
+# Separate from rocm7.14/Dockerfile and rocm6.4.4/Dockerfile (the older,
+# archived-but-still-buildable ROCm 7.14 / 6.4.4 lines) on purpose -- ROCm 7
+# and up rejects Polaris at HSA agent creation (legacy/pre-1.0 doorbell
+# type), which 6.4.4 never had to work around. Getting past that wall needs
+# a source-level ROCR-Runtime + CLR rebuild that rocm6.4.4/Dockerfile has no
+# equivalent of.
+#
+# This line is a pin-bump of rocm7.14/Dockerfile to TheRock 10.0: same
+# gfx803 patch set, same build stages, refs moved to the 10.0 release
+# branches and the mainline (gfx900+) repo's current ORT/PyTorch pins
+# (ORT v1.29.0, PyTorch release/2.14). NONE of it has been built or run on
+# real gfx803 hardware against the 10.0 refs yet -- every patch here applies
+# as-copied from the 7.14 line un-re-verified; the self-verifying patch
+# drivers and build gates below fail the build loudly if any of them no
+# longer applies, but a clean apply is NOT a correctness confirmation. Do
+# not report this line as verified until verify.py + tools/correctness-suite/
+# have been re-run against a 10.0 image on a real card (see README.md).
 #
 # What has to be rebuilt from source, and why (see MIGRATION_NOTES.md for the
 # full per-layer investigation):
 #
-#   ROCR-Runtime + CLR -- NEW for this line. ROCm 7's GpuAgent constructor
-#                throws for any HSA agent whose DoorbellType != 2; Polaris
-#                reports 0 or 1 ("legacy" doorbell). Restoring enumeration
-#                AND real dispatch (not just enumeration) needs the full
-#                legacy-doorbell code path an AMD engineer's from-source
-#                TheRock build restored and verified on real Polaris
-#                hardware -- see patches/rocm-systems/.
-#   rocBLAS   -- same story as 6.4.4: gfx803 dropped from the default
+#   ROCR-Runtime + CLR -- same as the 7.14 line: ROCm 7+'s GpuAgent
+#                constructor throws for any HSA agent whose DoorbellType
+#                != 2; Polaris reports 0 or 1 ("legacy" doorbell). Restoring
+#                enumeration AND real dispatch (not just enumeration) needs
+#                the full legacy-doorbell code path -- see
+#                patches/rocm-systems/.
+#   rocBLAS   -- same story as 7.14: gfx803 dropped from the default
 #                TARGET_LIST at ROCm 6.0 but the Tensile logic
 #                (Logic/asm_full/r9nano/*.yaml) is still in the tree, so
-#                `rmake.py -a gfx803` builds it back. rocBLAS moved into the
-#                ROCm/rocm-libraries monorepo since 6.4.4; this tracks its
-#                release/therock-7.14 branch (see ROCM_LIBRARIES_REF below),
+#                `rmake.py -a gfx803` builds it back. rocBLAS lives in the
+#                ROCm/rocm-libraries monorepo; this tracks its
+#                release/therock-10.0 branch (see ROCM_LIBRARIES_REF below),
 #                not a per-component release tag -- rocm-libraries stopped
 #                cutting rocm-rel-X.Y tags/branches after 7.2.
 #   MIGraphX  -- prebuilt for gfx900+ only, same as the main image. Still a
 #                standalone repo (not folded into rocm-libraries); tracks its
-#                release/rocm-rel-7.14 branch, same convention the main repo's
+#                release/rocm-rel-10.0 branch, same convention the main repo's
 #                release.yml uses for MIGRAPHX_REF.
-#   PyTorch   -- no gfx803 wheel has ever been published.
-#   ORT       -- v1.28.0, MIGraphX EP only, matching the main (gfx900+)
-#                build exactly -- NOT the 6.4.4 line's v1.22.2 ROCm-EP
-#                pin. Tried keeping ROCm EP alive here too (the 6.4.4
-#                line's reasoning: MIGraphX EP alone has no CK/MLIR to
-#                fuse with on gfx803, so the ROCm EP fallback matters
-#                more here than on gfx900+) -- v1.22.2's ROCm EP source
-#                doesn't compile against ROCm 7.14's HIP headers at all
-#                (a HIP API change unrelated to gfx803), and --use_rocm
-#                is gone from ORT's own build flags as of 1.28 regardless.
+#   PyTorch   -- no gfx803 wheel has ever been published. release/2.14,
+#                matching the main (gfx900+) repo's pytorch_version default
+#                for the 10.0 line.
+#   ORT       -- v1.29.0, MIGraphX EP only, matching the main (gfx900+)
+#                build exactly. --use_rocm is gone from ORT's own build
+#                flags as of 1.28 regardless, so the 6.4.4 line's ROCm-EP
+#                fallback (v1.22.2) is unportable to any newer line.
 #                Accepted cost: the CK/MLIR-fusion gap the 6.4.4 line's
 #                ROCm EP fallback existed to soften is unsoftened here.
-#                See MIGRATION_NOTES.md.
-#   MIOpen    -- same story as 6.4.4: still lists gfx803 in
+#   MIOpen    -- same story as 7.14: still lists gfx803 in
 #                ALL_GPU_DATABASES and keeps its Ellesmere/Baffin/Polaris
 #                device-name gating. Moved into rocm-libraries too.
 #
-# What's DIFFERENT from 6.4.4's known-good state, not yet re-verified on real
-# hardware (see README.md "Status" for the current list):
+# What's DIFFERENT from rocm7.14/'s known-good state, not yet re-verified on
+# real hardware (see README.md "Status" for the current list):
 #
+#   - EVERYTHING. The whole patch set is carried over un-re-diffed from the
+#     7.14 line against the 10.0 refs, and the pinned upstream sources have
+#     moved in between. Each patch driver is self-verifying (greps a marker
+#     string, fails the build if absent), so a patch that no longer applies
+#     fails loudly rather than silently shipping -- but a patch that still
+#     applies cleanly may target code whose surrounding behavior changed.
+#     The 7.14 line was hardware-verified; this line inherits that patch
+#     set but must be re-verified independently (verify.py +
+#     tools/correctness-suite/ on a real card) before it counts as fixed.
 #   - MIOpen's ConvOclDirectFwd/ConvOclDirectFwdFused solver (the one
 #     rocm6.4.4/patches/miopen/conv-direct-fwd-grouped-oob.sh targets) was
-#     REMOVED from MIOpen upstream between 6.4.4 and 7.14 -- replaced by a
-#     new ConvHipDirectFwd (HIP-source, not OpenCL-source). Whether the
-#     grouped-conv out-of-bounds read this patch fixed still exists in the
-#     new solver is UNKNOWN; the fix cannot be safely ported without
-#     re-running the original repro against the new solver on real gfx803
-#     hardware first. NOT applied here. If the same symptom (OOB on grouped
-#     convs) resurfaces during 7.14 validation, move the investigation over
-#     to conv_hip_dir2Dfwd.cpp rather than assuming the old patch still
-#     applies.
-#   - Every other ported patch (rocBLAS's WGM and small-GEMM fixes, MIOpen's
-#     Winograd-fused and Reduce-Prod fixes) applies cleanly to the pinned
-#     7.14 source and has been read against the surrounding code to confirm
-#     the fix still lands in the right place -- but NONE of them have been
-#     re-run against real gfx803 hardware yet. Re-diffing restores
-#     compilability, it does not substitute for re-running
-#     KERNEL_BUGS.md's methodology against 7.14 binaries.
+#     REMOVED upstream between 6.4.4 and 7.14 -- replaced by a new
+#     ConvHipDirectFwd (HIP-source, not OpenCL-source). Whether the
+#     grouped-conv out-of-bounds read that patch fixed still exists in the
+#     new solver is UNKNOWN (was already unknown on the 7.14 line); the fix
+#     cannot be safely ported without re-running the original repro against
+#     the new solver on real gfx803 hardware first. NOT applied here. If the
+#     same symptom (OOB on grouped convs) resurfaces during 10.0 validation,
+#     move the investigation over to conv_hip_dir2Dfwd.cpp rather than
+#     assuming the old patch still applies.
 #
 # What is switched off, because no version of it has ever supported gfx8
-# (unchanged from 6.4.4 -- see rocm6.4.4/Dockerfile for the same reasoning):
+# (unchanged from the 7.14/6.4.4 lines -- see rocm7.14/Dockerfile for the
+# same reasoning):
 #
 #   rocMLIR, Composable Kernel, hipBLASLt.
 #
 # Build context is this directory, and everything this build needs lives under
 # it -- patches/, including its own copy of the sgemm-shim, and tools/. That
-# duplication against rocm6.4.4/ is deliberate, not an oversight: both lines
-# are still actively changing, and this one started as a copy of 6.4.4 that
-# can be worked on in isolation without any edit here being able to reach the
-# hardware-verified 6.4.4 build. Fold the two back together once gfx803 on
-# 7.14 is fully confirmed working, not before -- see README.md's
-# "Convergence" section.
+# duplication against rocm7.14/ and rocm6.4.4/ is deliberate, not an
+# oversight: all three lines are independent copies that can be worked on in
+# isolation without any edit here being able to reach the hardware-verified
+# 7.14 or 6.4.4 builds. Fold them back together once gfx803 on 10.0 is fully
+# confirmed working, not before -- see README.md's "Convergence" section.
 #
 # Build: docker build -f Dockerfile -t <tag> .
-ARG BASE_IMAGE=rocm/dev-ubuntu-26.04:7.14.0-full
+ARG BASE_IMAGE=rocm/dev-ubuntu-26.04:10.0.0-full
 
 ARG ROCR_CLR_IMAGE=rocr-clr-builder
 ARG ROCBLAS_IMAGE=rocblas-builder
@@ -101,7 +111,7 @@ ARG ORT_IMAGE=ort-builder
 # own stable branch for that ROCm line, not develop"): track the named
 # release's branch tip at build time, not a frozen point-in-time SHA. This
 # build is manual-dispatch only (no schedule), so "branch tip at build time"
-# means "whatever AMD has landed on release/therock-7.14 the day someone runs
+# means "whatever AMD has landed on release/therock-10.0 the day someone runs
 # this," not a moving nightly target -- re-running the same workflow_dispatch
 # twice can legitimately pick up new commits if AMD pushed a cherry-pick to
 # the branch since the last run, which is expected and desired, not drift to
@@ -109,55 +119,50 @@ ARG ORT_IMAGE=ort-builder
 #
 # rocm-libraries (rocBLAS, MIOpen) and rocm-systems (ROCR-Runtime, CLR)
 # stopped cutting per-component rocm-rel-X.Y tags/branches after 7.2 (confirmed
-# via `git ls-remote --heads`); ROCm/TheRock's release/therock-7.14 branch is
-# the actual release line these two repos track for 7.14, confirmed by
-# `git ls-remote --heads` against both landing on the exact same commits this
-# Dockerfile pinned by SHA before this branch-based rewrite.
-ARG ROCM_SYSTEMS_REF=release/therock-7.14
-ARG ROCM_LIBRARIES_REF=release/therock-7.14
+# via `git ls-remote --heads`); ROCm/TheRock's release/therock-10.0 branch is
+# the actual release line these two repos track for 10.0, confirmed by
+# `git ls-remote --heads` against both landing on the same 10.0 line this
+# build targets (same branch-name convention the 7.14 line used with
+# release/therock-7.14).
+ARG ROCM_SYSTEMS_REF=release/therock-10.0
+ARG ROCM_LIBRARIES_REF=release/therock-10.0
 
 # MIGraphX stayed a standalone repo (not folded into rocm-libraries) and still
 # cuts its own release/rocm-rel-<major.minor> branch -- same ref the main
 # repo's release.yml derives MIGRAPHX_REF from.
-ARG MIGRAPHX_REF=release/rocm-rel-7.14
+ARG MIGRAPHX_REF=release/rocm-rel-10.0
 
-# ROCm's PyTorch fork. release/2.13 matches what this repo's main
-# (gfx900+) release track pins for ROCm 7.14 (see .github/workflows/
-# release.yml's pytorch_version default, 2.13.0) -- kept in sync rather than
+# ROCm's PyTorch fork. release/2.14 matches what this repo's main
+# (gfx900+) release track pins for ROCm 10.0 (see .github/workflows/
+# release.yml's pytorch_version default, 2.14.0) -- kept in sync rather than
 # picked independently, since "same defaults as the main part of this repo"
 # was an explicit goal for this variant.
-ARG PYTORCH_REF=release/2.13
+ARG PYTORCH_REF=release/2.14
 # Taken directly from this repo's own source-build fallback logic
 # (scripts/torch-package-build-decide.sh's determine_torchvision_repo_branch
 # / determine_torchaudio_repo_branch), not extrapolated -- that script is
 # the authoritative "what branch does a from-source companion build use
-# for pytorch 2.13" answer already encoded in this repo, since gfx803 (no
+# for pytorch 2.14" answer already encoded in this repo, since gfx803 (no
 # prebuilt wheel ever published, any ROCm line) always takes the SOURCE
 # path those functions decide, never the PIP/prebuilt one.
 ARG TORCHVISION_REF=release/0.28
 ARG TORCHAUDIO_REF=release/2.11.0.2
 
-# v1.28.0, matching the main (gfx900+) build's default -- NOT the 6.4.4
+# v1.29.0, matching the main (gfx900+) build's default -- NOT the 6.4.4
 # line's v1.22.2 pin. That pin existed to keep ORT's ROCm EP (deleted
 # upstream after v1.22.2, PR #25181) as a fallback for gfx803's lack of
-# Composable Kernel/MLIR fusion in the MIGraphX EP. Tried keeping it here
-# too, but v1.22.2's ROCm EP source doesn't compile against ROCm 7.14's
-# HIP headers at all (`warpSize` changed from constexpr-usable to a
-# non-constexpr accessor object -- a HIP API change, not gfx803-specific)
-# -- confirmed via direct build failure. Patching multi-year-old,
-# upstream-deleted EP code to work with a HIP version it was never built
-# against isn't worth it for what's very likely not the only such
-# incompatibility. --use_rocm/--rocm_home are also gone from build.py's
-# own flag set as of 1.28 regardless (see docker/ort.Dockerfile's
-# scripts/build/ort.sh). Accepted cost: MIGraphX-only on gfx803, same
-# CK/MLIR-fusion gap the 6.4.4 line's ROCm EP fallback existed to soften,
-# now unsoftened here. See MIGRATION_NOTES.md.
-ARG ORT_VERSION=v1.28.0
+# Composable Kernel/MLIR fusion in the MIGraphX EP. --use_rocm is gone from
+# build.py's own flag set as of 1.28 regardless (see docker/ort.Dockerfile's
+# scripts/build/ort.sh), so no newer ORT can carry the ROCm EP at all --
+# there is nothing to try to keep alive on this line. Accepted cost:
+# MIGraphX-only on gfx803, same CK/MLIR-fusion gap the 6.4.4 line's ROCm EP
+# fallback existed to soften, now unsoftened here. See MIGRATION_NOTES.md.
+ARG ORT_VERSION=v1.29.0
 
 ARG BUILD_PARALLEL_LEVEL=auto
 
 # Ubuntu 26.04's native python3 is 3.14 (confirmed: `rocm/dev-ubuntu-26.04:
-# 7.14.0-full` ships it), same situation the main Dockerfile's python-base
+# 10.0.0-full` ships it), same situation the main Dockerfile's python-base
 # documents -- numpy/onnx dependency resolution needs 3.12. uv-managed 3.12
 # here, same approach as docker/python-base.Dockerfile, instead of rocm6.4.4/Dockerfile
 # Dockerfile's "system python IS 3.12" assumption, which does not hold on
@@ -251,21 +256,6 @@ RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 # deterministic hang to completing every run.
 RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-src
 
-# Defensive mitigation for the gfx7/8 EOP-completion-notification-loss
-# issue referenced above (root cause: undocumented firmware behavior,
-# not reachable from software -- confirmed via live kernel-fence
-# tracing showing the GPU genuinely finished the work while its specific
-# completion interrupt never arrives; see patches/rocm-systems/
-# blit-kernel-eop-interrupt-retry.patch's header for the full
-# investigation). Off by default, matching pristine upstream behavior --
-# on a system with a correctly-sized PCIe BAR (Resizable BAR / Above 4G
-# Decoding enabled, see README's hardware requirements), code-object
-# loads route around the erratum-prone path entirely and this rarely if
-# ever triggers. Opt in at runtime with ROCR_GFX8_EOP_MITIGATION=1 (see
-# the patch header for the full set of tuning env vars) on a system that
-# still sees it.
-RUN sh /rocm-systems-patches/blit-kernel-eop-interrupt-retry.sh /rocm-systems-src
-
 # Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
 # with the rest of gfx7/8 support. KFD still implements its half and still
 # expects the doubled size, so without this hsa_queue_create was stuck at a
@@ -280,7 +270,7 @@ RUN sh /rocm-systems-patches/aql-ring-queue-full-workaround.sh /rocm-systems-src
 # ROCR-Runtime first: CLR's HIP build links against it, so the patched
 # runtime has to be installed into /opt/rocm before CLR configures.
 WORKDIR /rocm-systems-src/projects/rocr-runtime
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocr-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-rocr-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
         jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
@@ -300,7 +290,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocr-ccache \
 # revision of this Dockerfile turns CLR_BUILD_OCL on, but building the OCL
 # runtime itself is skipped here as dead weight for this stack.
 WORKDIR /rocm-systems-src/projects/clr
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-clr-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-clr-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
         jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
@@ -403,9 +393,10 @@ ENV ROCBLAS_SRC=/rocblas-src-root/projects/rocblas
 COPY patches/rocblas/ /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute-source.sh /rocblas-src-root
 
-# Small-GEMM assembly miscompute -- re-diffed for 7.14 (indentation shift
-# plus a real template-signature change, TiA/TiB collapsed to Ti; see the
-# patch header for both). NOT yet re-verified on real hardware against 7.14.
+# Small-GEMM assembly miscompute -- carried from the 7.14 line (re-diffed
+# for 7.14: indentation shift plus a real template-signature change, TiA/TiB
+# collapsed to Ti; see the patch header for both). NOT yet re-verified on
+# real hardware against 10.0.
 RUN sh /rocblas-patches/small-gemm-assembly-miscompute.sh "${ROCBLAS_SRC}"
 
 # fp16 (non-HPA) GEMM kernels for gfx803. Tensile's fp16 codegen used only
@@ -423,7 +414,7 @@ RUN sh /rocblas-patches/tensile-gfx803-fp16-nond16.sh /rocblas-src-root \
         /rocblas-src-root/projects/rocblas/library/src/blas3/Tensile/Logic/asm_full/r9nano/
 
 WORKDIR ${ROCBLAS_SRC}
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocblas-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-rocblas-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
         jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
@@ -445,7 +436,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-rocblas-ccache \
     #
     # Per-directory `readlink -f` + `cp -a`, not a plain `cp -a src/. dst/`:
     # this base image's /opt/rocm/{bin,lib,include,share} are themselves
-    # symlinks (via /etc/alternatives/, to /opt/rocm/core-7.14/*) rather than
+    # symlinks (via /etc/alternatives/, to /opt/rocm/core-10.0/*) rather than
     # real directories, and cp refuses to merge a real directory over a
     # destination that lstat()s as a symlink ("cannot overwrite non-directory
     # X with directory Y") -- confirmed by direct build failure, which landed
@@ -572,7 +563,7 @@ WORKDIR ${MIOPEN_SRC}
 # install_deps.cmake's own cget_exec() shells out to whatever "python3" it
 # finds on PATH, with no override of its own -- put the uv-managed 3.12
 # first so that resolves to a python cget actually works under.
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-miopen-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-miopen-ccache \
     PATH="$(dirname "$(uv python find 3.12)"):$PATH" \
     cmake -P install_deps.cmake --minimum --prefix /miopen-deps
 
@@ -583,7 +574,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-miopen-ccache \
 # own -Werror. Downgraded just that diagnostic class below rather than
 # disabling -Werror broadly; confirmed via direct build failure, not a
 # hypothetical.
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-miopen-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-miopen-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
         jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
@@ -664,10 +655,12 @@ RUN git clone --depth 1 --branch "${MIGRAPHX_REF}" \
 
 # src/targets/gpu/lowering.cpp calls gpu::gfx_default_rocblas()
 # unconditionally, but its only declaration/definition are gated behind
-# #if MIGRAPHX_USE_HIPBLASLT -- a real upstream gap on rocm-7.14 that
+# #if MIGRAPHX_USE_HIPBLASLT -- a real upstream gap on the 7.14 line that
 # breaks the build for any target compiled with hipBLASLt off (required
-# here: hipBLASLt has never had gfx8 kernels). Confirmed via direct build
-# failure, not assumed; the call is dead code once hipBLASLt is disabled
+# here: hipBLASLt has never had gfx8 kernels); assumed still present on the
+# 10.0 refs -- the self-verifying driver below fails the build loudly if
+# it isn't. Confirmed via direct build failure on 7.14, not assumed; the
+# call is dead code once hipBLASLt is disabled
 # (hipblaslt_supported() itself always returns false then, so the `or
 # gfx_default_rocblas()` short-circuits away) -- the fix only needs the
 # symbol to exist, not to do anything reachable.
@@ -735,15 +728,16 @@ typedef enum RocmlirSplitKSelectionLikelihood RocmlirSplitKSelectionLikelihood;
 #endif // MLIR_C_DIALECT_ROCK_ENUMS_H
 EOF
 
-# NOT re-verified against 7.14's actual src/targets/gpu/{mlir,jit/mlir}.cpp
-# whether the same MIGRAPHX_MLIR-stub-function gap rocm6.4.4/Dockerfile's
-# migraphx-builder stage documents (missing is_module_fusible/dump_mlir_to_*
-# definitions in the #else branch) still exists on this MIGRAPHX_REF. If the
-# build below fails at the python-import step with an undefined-symbol error
-# for one of those three, apply the same sed fix rocm6.4.4/Dockerfile uses.
+# NOT re-verified against the 10.0 refs' actual
+# src/targets/gpu/{mlir,jit/mlir}.cpp whether the same MIGRAPHX_MLIR-stub-
+# function gap rocm6.4.4/Dockerfile's migraphx-builder stage documents
+# (missing is_module_fusible/dump_mlir_to_* definitions in the #else branch)
+# still exists on this MIGRAPHX_REF. If the build below fails at the python-
+# import step with an undefined-symbol error for one of those three, apply
+# the same sed fix rocm6.4.4/Dockerfile uses.
 
 WORKDIR /migraphx-src
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-migraphx-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-migraphx-ccache \
     ulimit -s unlimited && \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
@@ -831,7 +825,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # docker/pytorch.Dockerfile's identical reasoning.
 RUN uv venv /build-venv --python 3.12 --seed \
     && /build-venv/bin/pip install --no-cache-dir -U pip wheel setuptools \
-    && /build-venv/bin/pip install --no-cache-dir numpy pyyaml typing_extensions requests six
+    && /build-venv/bin/pip install --no-cache-dir numpy pyyaml typing_extensions requests six build
 ENV PATH=/build-venv/bin:$PATH
 
 RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodules \
@@ -863,7 +857,15 @@ RUN real=/opt/rocm/lib/llvm/bin/clang++.real \
         > /opt/rocm/lib/llvm/bin/clang++ \
     && chmod +x /opt/rocm/lib/llvm/bin/clang++
 
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
+# torch 2.14 (release/2.14) refuses `python3 setup.py bdist_wheel`: PyTorch
+# moved to scikit-build-core/PEP 517, and 2.14-2.15 deprecation makes every
+# setup.py command except install/develop fail outright (confirmed by direct
+# build failure; the mainline repo's source tier still uses bdist_wheel but is
+# dormant there because gfx900+ has a prebuilt-wheel tier that gfx803 never
+# has). The documented replacement, `python3 -m build --wheel --no-isolation`,
+# reads the same env vars (USE_ROCM/MAX_JOBS/...), so the build below is
+# otherwise unchanged. `build` is installed in the venv above.
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-pytorch-ccache \
     ulimit -s unlimited && \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
@@ -878,7 +880,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-pytorch-ccache \
         USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
         USE_DISTRIBUTED=1 USE_ROCM_CK_GEMM=0 \
         BUILD_TEST=0 \
-        python3 setup.py bdist_wheel
+        python3 -m build --wheel --no-isolation
 
 RUN pip install --no-cache-dir dist/torch*.whl \
     && mkdir -p /wheels && cp dist/torch*.whl /wheels/
@@ -887,7 +889,7 @@ FROM ${PYTORCH_IMAGE} AS pytorch-export
 
 # Own image/CI job rather than folded into pytorch-builder: each of MIGraphX,
 # PyTorch, torchvision and torchaudio gets its own runner and its own
-# 360-minute budget in gfx803-rocm7.yml, same reasoning the mainline repo's
+# 360-minute budget in gfx803-rocm10.yml, same reasoning the mainline repo's
 # docker/torchvision.Dockerfile split gives (one monolithic build overran a
 # hosted runner's time budget). No prebuilt-wheel tier here, unlike the
 # mainline Dockerfile -- gfx803 has never had one published for torch or its
@@ -904,7 +906,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --recursive --branch "${TORCHVISION_REF}" --depth 1 --shallow-submodules \
         https://github.com/pytorch/vision.git /vision
 WORKDIR /vision
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-vision-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-vision-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 \
         python3 setup.py bdist_wheel \
@@ -929,7 +931,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --recursive --branch "${TORCHAUDIO_REF}" --depth 1 --shallow-submodules \
         https://github.com/ROCm/audio.git /audio
 WORKDIR /audio
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-audio-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-audio-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 USE_FFMPEG=1 \
         python3 setup.py bdist_wheel \
@@ -943,6 +945,23 @@ ARG ROCM_ARCH=gfx803
 ARG ORT_VERSION
 
 COPY --from=migraphx-export /opt/rocm /opt/rocm
+
+# ROCm 10.0 ships its own flatbuffers (v25.9.23) in /opt/rocm, and ORT's
+# MIGraphX provider sets CMAKE_PREFIX_PATH=/opt/rocm -- so ORT's flatbuffers
+# FetchContent declaration (FIND_PACKAGE_ARGS 23.5.9, a *minimum* version)
+# find_package()s the ROCm v25 config instead of downloading the v23.5.26 it
+# pins, and the v25 headers fail ORT's own generated-schema static_assert
+# (ort.fbs.h: FLATBUFFERS_VERSION_MAJOR == 23, "(25 == 23)"). Removing the
+# whole ROCm flatbuffers footprint (headers, cmake config, static lib,
+# pkgconfig) makes find_package fail so FetchContent downloads and builds the
+# correct v23.5.26. Nothing in ORT or the MIGraphX provider uses the ROCm
+# flatbuffers, and this stage's /opt/rocm never reaches the final image (that
+# one comes from migraphx-export). The 7.14 base shipped no flatbuffers, which
+# is why this only bites on the 10.0 line.
+RUN rm -rf /opt/rocm/include/flatbuffers \
+        /opt/rocm/lib/cmake/flatbuffers \
+        /opt/rocm/lib/libflatbuffers.a \
+        /opt/rocm/lib/pkgconfig/flatbuffers.pc
 
 # libdrm-dev: onnxruntime_providers_rocm.cmake's find_package(rocm_smi)
 # pkg_check_modules(libdrm) needs libdrm's .pc file, which only the -dev
@@ -981,7 +1000,7 @@ RUN eigen_commit=$(grep '^eigen;' /onnxruntime/cmake/deps.txt | cut -d';' -f2 | 
     && git checkout -q FETCH_HEAD
 
 WORKDIR /onnxruntime
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm7-ort-ccache \
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-ort-ccache \
     python3 tools/ci_build/build.py \
         --config Release \
         --build_dir /onnxruntime/build \
@@ -1066,7 +1085,7 @@ RUN cd /opt/rocm/lib && rm -f libamdhip64.so.*-0000000 libhiprtc.so.*-0000000 li
 # (libhsa-runtime64, libamdhip64, librocblas, libMIOpen, migraphx's python
 # module) links against the versioned libdrm.so.2/libdrm_amdgpu.so.1
 # SONAMEs. This base image bundles its own *unversioned* copies under
-# /opt/rocm/core-7.14/lib/rocm_sysdeps/lib (build-time-only, dev-symlink
+# /opt/rocm/core-10.0/lib/rocm_sysdeps/lib (build-time-only, dev-symlink
 # style -- confirmed present there without the .2/.1 suffix the dynamic
 # linker actually looks for) -- confirmed via `ldd` reporting "not found"
 # for these two on every one of the libs above, in a container that never

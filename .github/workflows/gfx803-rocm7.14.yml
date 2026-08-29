@@ -1,11 +1,17 @@
-name: Build gfx803 (rocm7, main)
+name: Build gfx803 (rocm7.14, archived line)
 
-# Manual-only, same reasoning as the rocm6.4.4 workflow: every version in
-# this repo's root Dockerfile is pinned to an immutable ref (a TheRock
-# meta-release tag plus exact rocm-systems/rocm-libraries commit SHAs, a
-# MIGraphX tag, a torch ref, an ORT tag), so a nightly run would rebuild
-# byte-identical inputs and republish the same image. Run it when a pin
-# changes, or when something needs re-verifying on hardware.
+# Manual-only. There is deliberately no schedule: every version in
+# rocm7.14/Dockerfile is pinned to an immutable ref (a TheRock meta-release
+# tag plus exact rocm-systems/rocm-libraries commit SHAs, a MIGraphX tag, a
+# torch ref, an ORT tag), so a nightly run would rebuild byte-identical
+# inputs and republish the same image. Run it when a pin changes, or when
+# something needs re-verifying on hardware.
+#
+# This line is archived, not actively developed: rocm10 (this repo's root
+# line, see gfx803-rocm10.yml) is where new investigation happens now.
+# rocm7.14 stays hardware-verified and buildable, but only gets re-run when
+# a pin needs updating or something needs re-verifying, not as ongoing
+# development.
 #
 # Chain: rocr-clr -> {rocblas, miopen} -> migraphx -> {pytorch, ort} ->
 # {torchvision, torchaudio} -> final. rocr-clr (patched ROCR-Runtime/CLR:
@@ -23,10 +29,10 @@ name: Build gfx803 (rocm7, main)
 # the from-source path. final assembles migraphx + miopen + pytorch +
 # torchvision + torchaudio + ort.
 #
-# This produces the *unsuffixed* :latest-gfx803/:gfx803/:cache-gfx803 tags --
-# rocm7 is this repo's main line. rocm6.4.4 (the older, still-maintained-
-# but-no-longer-primary line) publishes under a -rocm6.4.4 suffix instead,
-# see gfx803-rocm6.4.4.yml.
+# Publishes under a -rocm7.14 tag suffix (:latest-gfx803-rocm7.14 etc) --
+# rocm10 owns the unsuffixed :latest-gfx803/:gfx803 tags now that it's this
+# repo's main line. The final image's release-tag (:rocm7.14-gfx803) is
+# unaffected either way, since the release name already disambiguates it.
 #
 # Each component is individually skippable -- these builds are long and the
 # inputs rarely all change at once. A skipped component's downstream jobs
@@ -109,6 +115,9 @@ jobs:
     with:
       component: rocr-clr
       target: rocr-clr-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
@@ -134,6 +143,9 @@ jobs:
     with:
       component: rocblas
       target: rocblas-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-rocr-clr-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
@@ -149,6 +161,9 @@ jobs:
     with:
       component: miopen
       target: miopen-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-rocr-clr-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
@@ -169,6 +184,9 @@ jobs:
     with:
       component: migraphx
       target: migraphx-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-rocblas-image: true
       with-miopen-image: true
       debug: ${{ inputs.debug }}
@@ -185,6 +203,9 @@ jobs:
     with:
       component: pytorch
       target: pytorch-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
       # TensorTopK.hip's default -O3 pushes clang's AMDGPU backend to ~20GB
@@ -212,6 +233,9 @@ jobs:
     with:
       component: torchvision
       target: torchvision-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-pytorch-image: true
       torchvision-ref: ${{ inputs.torchvision-ref }}
       debug: ${{ inputs.debug }}
@@ -228,6 +252,9 @@ jobs:
     with:
       component: torchaudio
       target: torchaudio-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-pytorch-image: true
       torchaudio-ref: ${{ inputs.torchaudio-ref }}
       debug: ${{ inputs.debug }}
@@ -244,6 +271,9 @@ jobs:
     with:
       component: ort
       target: ort-builder
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-migraphx-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
@@ -265,12 +295,14 @@ jobs:
     with:
       component: final
       final: true
+      build-dir: rocm7.14
+      tag-suffix: -rocm7.14
+      release-tag: rocm7.14
       with-migraphx-image: true
       with-miopen-image: true
       with-pytorch-image: true
       with-torchvision-image: true
       with-torchaudio-image: true
       with-ort-image: true
-      release-tag: rocm7.14
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}

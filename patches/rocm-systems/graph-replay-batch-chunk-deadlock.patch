@@ -64,19 +64,21 @@ WHAT
 ----
 - rocvirtual.cpp: clamp `kPeriod` to `min(DEBUG_HIP_GRAPH_BATCH_SIZE,
   sw_queue_size)` in `dispatchAqlPacketBatchFlat`.
-
-Applies to: CLR @ rocm-systems commit release/therock-7.14 (same pin as
-hsa-agent-rejects-legacy-doorbell.patch). Verified on real gfx803 hardware:
-before this fix, the scoped vLLM graph-replay repro
-(`--cudagraph-capture-sizes 1`) hung deterministically every run at
-identical `write_index`/`cached_read` values; after, the same repro
-completes all iterations and reports real latency numbers, repeatably.
+Applies to: CLR @ rocm-systems release/therock-10.0 (commit 6b0e43f341,
+2026-08-29). Re-diffed from the 7.14-era version: dispatchAqlPacketBatchFlat
+moved to ~1624, its packet-buffer parameter type changed
+(std::vector<uint8_t> -> amd::AlignedVector64<uint8_t>), and upstream added
+a ramp-up/lead-chunk path below the kPeriod line that the old hunk's
+post-context couldn't match. The unclamped kPeriod = DEBUG_HIP_GRAPH_BATCH_SIZE
+is still present and the gfx803 deadlock mechanism is unchanged -- same fix,
+new hunk. Verified on real gfx803 hardware on the 7.14 line (see WHY); not
+yet re-verified on a 10.0 image.
 
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-index 5ee4938aab..656aae4415 100644
+index 77afcab4d4..b224c0dce7 100644
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -1505,7 +1505,17 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPack
+@@ -1698,7 +1698,17 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
    }
    fence_state_ = static_cast<Device::CacheState>(expected_fence_state);
  
@@ -92,6 +94,6 @@ index 5ee4938aab..656aae4415 100644
 +  // board where queue creation degrades to the hard floor (Device::
 +  // acquireQueue's halving retry loop, rocdevice.cpp).
 +  const size_t kPeriod = std::min<size_t>(DEBUG_HIP_GRAPH_BATCH_SIZE, sw_queue_size);
-   auto* first_loc = reinterpret_cast<uint32_t*>(
-       queueBase + (startIndex & queueMask) * kPacketSize);
- 
+   // Ramp-up: submit a small first (lead) chunk so the doorbell is rung after
+   // copying only kLead packets instead of a full kPeriod. The GPU starts
+   // executing the lead while the CPU keeps copying the remaining

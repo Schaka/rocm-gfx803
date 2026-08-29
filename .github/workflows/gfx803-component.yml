@@ -4,10 +4,10 @@ name: Build gfx803 component
 # the mainline repo's build-component.yml -- each component gets its own
 # runner and its own 360-minute budget, and publishes an intermediate image
 # the next component COPYs from. No arch matrix: gfx803 is the only target
-# this file ever builds, across two build lines (rocm7 at the repo root,
-# rocm6.4.4/ the older classic-tag line). The published packages are shared
-# with the mainline repo's own pipeline -- gfx803 is just another arch tag
-# there.
+# this file ever builds, across three build lines (rocm10 at the repo root,
+# rocm7.14/ and rocm6.4.4/ the older lines). The published packages are
+# shared with the mainline repo's own pipeline -- gfx803 is just another
+# arch tag there.
 
 on:
   workflow_call:
@@ -26,28 +26,29 @@ on:
         required: false
         type: boolean
         default: false
-      # This repo holds two build lines (root: rocm7/Dockerfile on ROCm 7.14;
-      # rocm6.4.4/Dockerfile on the classic ROCm 6.4.4 tags). They publish to
-      # the same packages, so a line MUST carry its own tag suffix or it
-      # overwrites the other line's images -- including :latest-gfx803, the
-      # one downstream consumers actually pull. Defaults are rocm7 (the main
-      # line, unsuffixed); rocm6.4.4 is called with build-dir/tag-suffix
+      # This repo holds three build lines (root: Dockerfile on ROCm 10.0;
+      # rocm7.14/Dockerfile on the TheRock 7.14 line; rocm6.4.4/Dockerfile on
+      # the classic ROCm 6.4.4 tags). They publish to the same packages, so a
+      # line MUST carry its own tag suffix or it overwrites the other line's
+      # images -- including :latest-gfx803, the one downstream consumers
+      # actually pull. Defaults are rocm10 (the main line, unsuffixed);
+      # rocm7.14 and rocm6.4.4 are called with build-dir/tag-suffix
       # overrides below.
       build-dir:
-        description: 'Directory holding the Dockerfile, and the build context (. | rocm6.4.4)'
+        description: 'Directory holding the Dockerfile, and the build context (. | rocm7.14 | rocm6.4.4)'
         required: false
         type: string
         default: '.'
       tag-suffix:
-        description: 'Appended to every tag and to the cache ref, e.g. -rocm6.4.4. Empty for the rocm7 (main) line.'
+        description: 'Appended to every tag and to the cache ref, e.g. -rocm7.14. Empty for the rocm10 (main) line.'
         required: false
         type: string
         default: ''
       release-tag:
-        description: 'ROCm-release tag component for the final image, e.g. rocm7.14'
+        description: 'ROCm-release tag component for the final image, e.g. rocm10.0'
         required: false
         type: string
-        default: 'rocm7.14'
+        default: 'rocm10.0'
       with-rocr-clr-image:
         description: 'Pass ROCR_CLR_IMAGE so this build COPYs from the prebuilt ROCR-Runtime/CLR image'
         required: false
@@ -189,9 +190,9 @@ jobs:
           component="${{ inputs.component }}"
           self="$(pkg "${component}")"
           # Every tag this workflow reads or writes carries the suffix, so the
-          # two build lines never see each other's images -- an intermediate
-          # pulled without it would silently mix a 6.4.4 component into a 7.14
-          # build, which fails much later and very confusingly.
+          # build lines never see each other's images -- an intermediate
+          # pulled without it would silently mix a 6.4.4/7.14 component into
+          # a 10.0 build, which fails much later and very confusingly.
           arch="gfx803${{ inputs.tag-suffix }}"
 
           {
@@ -239,8 +240,8 @@ jobs:
               echo "tags<<TAGS_EOF"
               echo "${self}:latest-${arch}"
               # No suffix on this one: the ROCm release already names the line
-              # (rocm6.4.4-gfx803 vs rocm7.14-gfx803), so adding it would just
-              # read as rocm7.14-gfx803-rocm7.
+              # (rocm6.4.4-gfx803 vs rocm7.14-gfx803 vs rocm10.0-gfx803), so
+              # adding it would just read as rocm10.0-gfx803-rocm10.
               echo "${self}:${{ inputs.release-tag }}-gfx803"
               echo "${self}:${{ steps.date.outputs.date }}-${arch}"
               echo "TAGS_EOF"
@@ -270,9 +271,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           # Context is the build line's own directory, not necessarily the
-          # repo root: rocm7 (build-dir '.') IS the repo root; rocm6.4.4 is
-          # self-contained under rocm6.4.4/ and COPYs only from its own
-          # patches/ (see each Dockerfile's header).
+          # repo root: rocm10 (build-dir '.') IS the repo root; rocm7.14 and
+          # rocm6.4.4 are self-contained under their own directory and COPY
+          # only from their own patches/ (see each Dockerfile's header).
           context: ${{ inputs.build-dir }}
           file: ${{ inputs.build-dir }}/Dockerfile
           push: true
