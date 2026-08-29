@@ -1,0 +1,299 @@
+ROCR-Runtime (pinned commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350,
+therock-7.14 / ROCm 7.14.0): restore legacy (pre-1.0, type 0/1) doorbell
+support in the HSA GPU-agent constructor and AQL queue dispatch path, so
+Polaris (gfx803, DoorbellType 0 or 1 depending on board) is accepted as a
+valid HSA agent instead of rejected at enumeration.
+
+WHY
+---
+runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp's GpuAgent constructor
+unconditionally throws whenever a node's Capability.DoorbellType != 2:
+
+    if (node_props.Capability.ui32.DoorbellType != 2)
+        throw AMD::hsa_exception(HSA_STATUS_ERROR,
+            "Agent creation failed.\nThe GPU node uses a deprecated doorbell type\n");
+
+Polaris reports DoorbellType 0 or 1 ("legacy" doorbell, board-dependent),
+so this throw is the entire reason ROCm 7 rejects the card at enumeration
+-- rocminfo/clinfo see zero devices, confirmed against
+https://github.com/ROCm/clr/issues/269 (closed "not planned" by AMD: gfx803
+isn't a supported target). See gfx803/EVALUATION_ROCM_7.md, Layer 1, for
+the full investigation of what this check does and does not gate.
+
+Removing the throw alone is not sufficient, though that's the fix an
+initial read of amd_gpu_agent.cpp alone suggests. The doorbell write path
+(AqlQueue::StoreRelaxed, in amd_aql_queue.cpp) unconditionally assumes
+DoorbellType 2 semantics: a single hardware pointer write with no
+software bookkeeping. Legacy doorbell types need an entirely different
+dispatch protocol -- a software-maintained "max dispatched" watermark
+under a spinlock, with type-0 boards indexing by AQL-packet-size-scaled
+slot and type-1 boards indexing by raw dispatch id -- which upstream
+deleted in commit 39ecc88 when DoorbellType 2 became the only supported
+value. Confirmed present and necessary by testing: with only the
+amd_gpu_agent.cpp throw removed, agent creation succeeds but queue
+dispatch either silently drops packets or writes through a null/wrong
+pointer, since signal_.hardware_doorbell_ptr is HSA_SIGNAL_KIND_DOORBELL-
+only and was never given a legacy counterpart to write through.
+
+This patch is not original investigation by this repo -- it restores,
+verbatim, an AMD engineer's (lucbruni-amd) fix, verified on real Polaris
+hardware (RX 550) via a from-source TheRock build: "rocminfo and clinfo
+both detect gfx803 (RX 550) successfully." See
+https://github.com/lucbruni-amd/TheRock/commit/3d4ad6093a0069876fbfff590bb56ddb340ae9c5
+(branch lb/gfx803-polaris-support), specifically
+patches/gfx803/rocm-systems/0001-rocr-Restore-legacy-doorbell-support-for-gfx8-Polari.patch
+within that commit. Reproduced here, re-diffed clean against this repo's
+own pinned rocm-systems commit (2b22ab0195, therock-7.14), not just
+copied -- `git apply --check` against that exact commit passes with no
+fuzz. That patch's own commit message notes the upstream deletion this
+restores: https://github.com/ROCm/rocm-systems/commit/39ecc88.
+
+Confirms the EVALUATION_ROCM_7.md Layer 1 finding that the runtime block
+"has a small, proven fix" -- but the actual proven fix is a full legacy
+doorbell dispatch path restore across 4 files (~76 lines), not the
+single guarded exception that first read of amd_gpu_agent.cpp alone
+suggests. Getting past enumeration and getting real dispatch working
+turn out to be the same fix, not two.
+
+WHAT
+----
+- amd_gpu_agent.cpp: remove the DoorbellType != 2 throw.
+- amd_hsa_signal.h: add a legacy_hardware_doorbell_ptr (uint32_t*) member
+  to the amd_signal_s doorbell union, alongside the existing
+  hardware_doorbell_ptr (uint64_t*) used by type-2 boards.
+- amd_aql_queue.h / amd_aql_queue.cpp: cache the agent's DoorbellType on
+  the queue at construction time (doorbell_type_); branch queue-resource
+  setup, signal-kind selection, and GetInfo's DOORBELL_ID query on it;
+  and give StoreRelaxed a second path for doorbell_type_ != 2 that
+  reproduces the deleted software watermark protocol (CAS-guarded
+  max-dispatched update, then a type-0/type-1-specific doorbell write).
+
+Applies to: ROCR-Runtime @ rocm-systems commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350
+(therock-7.14 / ROCm 7.14.0 pin). Not gfx803-specific in the sense of
+touching arch-gated code -- this is generic HSA dispatch-protocol logic;
+gfx803 (and any other pre-1.0-doorbell board, though none of the others
+this repo targets report legacy doorbells) is simply the only consumer
+of the doorbell_type_ != 2 branch. See
+hsa-agent-rejects-legacy-doorbell.sh for how this is applied and
+verified at build time.
+
+UPDATE (2026-08-24): missing _mm_sfence() in the legacy StoreRelaxed
+branch -- HIP graph-replay hang root-caused to this
+----------------------------------------------------------------------
+vLLM HIP graph replay hangs indefinitely on this hardware (`replay()`
+spins forever in VirtualGPU::WaitForQueueSlot). Root-caused via real
+hardware MQD register dump (`/sys/kernel/debug/kfd/mqds`, cross-checked
+against `/proc/<pid>/mem` ring contents) to a genuine CP (compute-pipe)
+stall: cp_hqd_pq_wptr correctly advances (confirms the queue's software
+write-index proxy, cp_hqd_pq_wptr_poll_addr -> max_legacy_doorbell_dispatch_id_plus_1,
+is being read correctly -- this patch's queue_rsrc wiring is not at
+fault), but cp_hqd_pq_rptr freezes on a slot whose AQL packet header is
+still HSA_PACKET_TYPE_INVALID (1) -- the exact value rocclr's
+appendPacketToFlatBuffer() stages there before the real header is
+released. CP is correctly obeying the AQL protocol (spin-wait until a
+slot's header goes valid); the header write from rocclr's
+packet_store_release() (rocvirtual.cpp) simply never became visible
+before the doorbell woke the CP.
+
+The type-2 doorbell path this patch left untouched calls _mm_sfence()
+immediately before its doorbell write, specifically to drain the CPU's
+write-combining buffers for the AQL ring memory before the (separately
+mapped, confirmed pgprot_noncached/UC via the amdkfd doorbell mmap
+handler) doorbell BAR write executes -- UC writes are strongly ordered
+against each other but NOT automatically ordered after a still-buffered
+WC write from a different mapping without an explicit fence (x86 SDM
+11.3.1). The legacy branch added by this patch reproduces every other
+part of the deleted watermark protocol but dropped this fence entirely.
+On an idle consumer thread (exactly graph replay's pattern: ring the
+doorbell, then wait) there is no other memory traffic to force the WC
+buffer to drain, so the gap is not a transient delay -- it is a stall
+with no natural end, matching the observed permanent hang exactly.
+
+Fix: add the same _mm_sfence() to the legacy branch, before either
+memory-order-release store that becomes visible to the GPU (the
+wptr-proxy field write and/or the doorbell-pointer write). One line.
+NOT YET RE-VERIFIED ON REAL HARDWARE as of this patch text -- see
+tools/rocr-novad-rebuild/ for the standalone ROCR-Runtime rebuild used
+to test this without a full image rebuild, and vllm-gfx803/NOTES.md for
+the verification result once run.
+
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+index 8125565318..7685bcc5c3 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+@@ -331,6 +331,9 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
+   // Indicates if queue is active
+   std::atomic<bool> active_;
+ 
++  // Cached value of HsaNodeProperties.HSA_CAPABILITY.DoorbellType
++  int doorbell_type_;
++
+   // Handle of agent, which queue is attached to
+   GpuAgent* agent_;
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+index 42d946bd0c..62bcd92bfc 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+@@ -102,6 +102,9 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+       priority_(HSA::HSA_AMD_QUEUE_PRIORITY_NORMAL),
+       exception_signal_(nullptr) {
+ 
++  // Identify doorbell semantics for this agent.
++  doorbell_type_ = agent->properties().Capability.ui32.DoorbellType;
++
+   // Queue size is a function of several restrictions.
+   const uint32_t min_pkts = ComputeRingBufferMinPkts();
+   const uint32_t max_pkts = ComputeRingBufferMaxPkts();
+@@ -137,8 +140,13 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+   HsaQueueResource queue_rsrc = {0};
+   queue_rsrc.Queue_read_ptr_aql = (uint64_t*)&amd_queue_.read_dispatch_id;
+ 
+-  // Hardware write pointer supports AQL semantics.
+-  queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.write_dispatch_id;
++  if (doorbell_type_ == 2) {
++    // Hardware write pointer supports AQL semantics.
++    queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.write_dispatch_id;
++  } else {
++    // Map hardware write pointer to a software proxy.
++    queue_rsrc.Queue_write_ptr_aql = (uint64_t*)&amd_queue_.max_legacy_doorbell_dispatch_id_plus_1;
++  }
+ 
+   // Populate amd_queue_ structure.
+   amd_queue_.hsa_queue.type = HSA_QUEUE_TYPE_MULTI;
+@@ -151,8 +159,8 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+       uintptr_t(&amd_queue_.read_dispatch_id) - uintptr_t(&amd_queue_));
+   // Initialize the doorbell signal structure.
+   memset(&signal_, 0, sizeof(signal_));
+-  signal_.kind = AMD_SIGNAL_KIND_DOORBELL;
+-  signal_.hardware_doorbell_ptr = nullptr;
++  signal_.kind = (doorbell_type_ == 2) ? AMD_SIGNAL_KIND_DOORBELL : AMD_SIGNAL_KIND_LEGACY_DOORBELL;
++  signal_.legacy_hardware_doorbell_ptr = nullptr;
+   signal_.queue_ptr = &amd_queue_;
+ 
+   const auto& props = agent->properties();
+@@ -288,7 +296,11 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+     throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                              "Queue create failed\n");
+   // Complete populating the doorbell signal structure.
+-  signal_.hardware_doorbell_ptr = queue_rsrc.Queue_DoorBell_aql;
++  if (doorbell_type_ == 2) {
++    signal_.hardware_doorbell_ptr = queue_rsrc.Queue_DoorBell_aql;
++  } else {
++    signal_.legacy_hardware_doorbell_ptr = (volatile uint32_t*)queue_rsrc.Queue_DoorBell;
++  }
+ 
+   // Bind Id of Queue such that is unique i.e. it is not re-used by another
+   // queue (AQL, HOST) in the same process during its lifetime.
+@@ -480,16 +492,63 @@ uint64_t AqlQueue::AddWriteIndexRelease(uint64_t value) {
+ }
+ 
+ void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+-  if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
+-        core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
+-    HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
+-  } else {
+-    // Hardware doorbell supports AQL semantics.
++  if (doorbell_type_ == 2) {
++    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
++          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
++      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
++    } else {
++      // Hardware doorbell supports AQL semantics.
++      _mm_sfence();
++      *(signal_.hardware_doorbell_ptr) = uint64_t(value);
++      /* signal_ is allocated as uncached so we do not need read-back to flush WC */
++    }
++    return;
++  }
++
++  // Acquire spinlock protecting the legacy doorbell.
++  while (atomic::Cas(&amd_queue_.legacy_doorbell_lock, 1U, 0U,
++                     std::memory_order_acquire) != 0) {
++    os::YieldThread();
++  }
++
++#ifdef HSA_LARGE_MODEL
++  uint64_t legacy_dispatch_id = value + 1;
++#else
++  uint64_t legacy_dispatch_id = amd_queue_.write_dispatch_id;
++  legacy_dispatch_id =
++      Min(legacy_dispatch_id,
++          uint64_t(amd_queue_.read_dispatch_id) + amd_queue_.hsa_queue.size);
++#endif
++
++  // Discard backwards and duplicate doorbells.
++  if (legacy_dispatch_id > amd_queue_.max_legacy_doorbell_dispatch_id_plus_1) {
++    // Flush WC-buffered AQL packet header writes (packet_store_release, in
++    // rocclr) before either write below becomes visible to the GPU. The
++    // type-2 path above does this before its doorbell write for the same
++    // reason; this branch was missing it entirely, letting CP observe the
++    // wptr-proxy/doorbell update before the packet header it describes.
+     _mm_sfence();
+-    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
+-    /* signal_ is allocated as uncached so we do not need read-back to flush WC */
++    atomic::Store(&amd_queue_.max_legacy_doorbell_dispatch_id_plus_1,
++                  legacy_dispatch_id, std::memory_order_release);
++
++    if (doorbell_type_ == 0) {
++      uint64_t queue_size_mask = (1 * amd_queue_.hsa_queue.size) - 1;
++
++      atomic::Store(signal_.legacy_hardware_doorbell_ptr,
++                    uint32_t((legacy_dispatch_id & queue_size_mask) *
++                             (sizeof(core::AqlPacket) / sizeof(uint32_t))),
++                    std::memory_order_release);
++    } else if (doorbell_type_ == 1) {
++      atomic::Store(signal_.legacy_hardware_doorbell_ptr,
++                    uint32_t(legacy_dispatch_id), std::memory_order_release);
++    } else {
++      assert(false && "Agent has unsupported doorbell semantics");
++    }
+   }
+-  return;
++
++  // Release spinlock protecting the legacy doorbell.
++  atomic::Store(&amd_queue_.legacy_doorbell_lock, 0U,
++                std::memory_order_release);
+ }
+ 
+ void AqlQueue::StoreRelease(hsa_signal_value_t value) {
+@@ -517,8 +576,11 @@ hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value
+       *(reinterpret_cast<hsa_agent_t*>(value)) = agent_->public_handle();
+       break;
+     case HSA_AMD_QUEUE_INFO_DOORBELL_ID:
+-      *(reinterpret_cast<uint64_t*>(value)) =
+-          reinterpret_cast<uint64_t>(signal_.hardware_doorbell_ptr);
++      if (doorbell_type_ == 2)
++        *(reinterpret_cast<uint64_t*>(value)) =
++            reinterpret_cast<uint64_t>(signal_.hardware_doorbell_ptr);
++      else
++        return HSA_STATUS_ERROR_INVALID_QUEUE;
+       break;
+     case HSA_QUEUE_INFO_USE_COUNT:
+       if (!is_counted_queue) {
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+index 2caa1456f9..e78dd3c2c6 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -132,9 +132,6 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
+   const bool is_apu_node = (properties_.NumCPUCores > 0);
+   profile_ = (is_apu_node) ? HSA_PROFILE_FULL : HSA_PROFILE_BASE;
+ 
+-  if (node_props.Capability.ui32.DoorbellType != 2)
+-    throw AMD::hsa_exception(HSA_STATUS_ERROR, "Agent creation failed.\nThe GPU node uses a deprecated doorbell type\n");
+-
+   hsa_status_t err = driver().GetClockCounters(node_id(), &t0_);
+   t1_ = t0_;
+   historical_clock_ratio_ = 0.0;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
+index 12e1c08157..cc81a32067 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/amd_hsa_signal.h
+@@ -62,6 +62,7 @@ typedef struct AMD_SIGNAL_ALIGN amd_signal_s {
+   amd_signal_kind64_t kind;
+   union {
+     volatile int64_t value;
++    volatile uint32_t* legacy_hardware_doorbell_ptr;
+     volatile uint64_t* hardware_doorbell_ptr;
+   };
+   uint64_t event_mailbox_ptr;

@@ -1,37 +1,59 @@
-From fd8ceaa3b9d3590813debf99c97161daefbbb484 Mon Sep 17 00:00:00 2001
-From: Schaka <jonastanzer@gmail.com>
-Date: Tue, 11 Aug 2026 00:00:00 +0000
-Subject: [PATCH 1/3] rocblas: route small gfx803 GEMMs off broken assembly kernels
-
+rocBLAS (re-diffed for pinned commit cd9574023093742434e8c992d13b89ab9a6c1cf8,
+therock-7.14 / ROCm 7.14.0, from the original fix against rocm-6.4.4):
 gfx803's tuned Tensile assembly GEMM kernels silently miscompute whenever
-every dimension of the problem is small (reproduced down to a 1x1x1
-problem), returning rocblas_status_success with wrong numbers. HIP source
-kernels are correct at these sizes and also faster there (0.63-0.71x
-runtime at 2x2x1/4x4x4), so no performance is given up by routing to them.
+every dimension of the problem is small. Route those shapes to a HIP
+source kernel instead. See gfx803/patches/rocblas/small-gemm-assembly-miscompute.sh
+for the full WHY (measurements, isolation method, KERNEL_BUGS.md
+reference) -- unchanged from 6.4.4, reproduced here only for the WHAT.
 
-In runContractionProblem's else-branch, before falling through to
+RE-DIFF NOTE (7.14): two real changes were needed, both confirmed by
+reading the actual current source, not assumed:
+
+1. Reindentation. tensile_host.cpp's runContractionProblem() gained an
+   is_device_memory_size_query() branch, which pushed the
+   `else { solution = library->findBestSolution(...); }` block this
+   patch replaces one level deeper (16-space body indent instead of
+   12-space). Purely cosmetic -- same surrounding control flow
+   (solutionBased/getSolutionByIndex branch above, fallbackTensileProblem
+   check below), just shifted.
+
+2. Real API change, not cosmetic: runContractionProblem's template
+   signature in 6.4.4 was
+   `template <typename TiA, typename To, typename Tc, typename TiB, typename TcA, typename TcB>`
+   (confirmed by fetching rocm-6.4.4's actual tensile_host.cpp) -- rocBLAS
+   supported distinct input types for the A and B operands. In the 7.14
+   source this collapsed to `template <typename Ti, typename To, typename Tc>`
+   -- a single input type covers both operands now. The original patch's
+   `std::is_same<TiA, float>::value && std::is_same<TiB, float>::value`
+   gate does not compile against 7.14 (no TiA/TiB in scope); rewritten to
+   `std::is_same<Ti, float>::value`, which is the direct equivalent now
+   that one type parameter does what two used to.
+
+WHAT
+----
+In runContractionProblem's else-branch (the non-solution-index,
+non-fitness-query, non-memory-size-query path), before falling through to
 findBestSolution: for float-only, strided-batch problems with every
-dimension <= 8 on a gfx803 device, look up (and cache per problem
+dimension <= 8 on a gfx803 device, look up (and cache, per problem
 signature) the lowest-indexed applicable HIP source (_KLS_) solution via
-findAllSolutions, and use it instead. Falls through to the normal
-findBestSolution path if no source solution applies. Scoped to gfx803 and
-float only, so no other architecture or datatype changes behavior.
+findAllSolutions, and use it instead of whatever findBestSolution would
+have picked. Falls through to the normal findBestSolution path if no
+source solution applies.
 
-Vendored into this experimental pipeline, re-diffed against rocm-libraries
-commit cd9574023093742434e8c992d13b89ab9a6c1cf8 (therock-7.14) from the
-original fix against rocm-6.4.4. See
-patches/rocblas/small-gemm-assembly-miscompute.patch in ROCm-gfx803 for
-the full measurements, isolation method and re-diff notes (a real
-template-signature change, TiA/TiB collapsed to Ti, between 6.4.4 and
-7.14) this commit message only summarizes.
+Applies to: rocBLAS @ rocm-libraries commit cd9574023093742434e8c992d13b89ab9a6c1cf8
+(therock-7.14 / ROCm 7.14.0 pin). NOT YET RE-VERIFIED ON REAL HARDWARE
+against 7.14 -- the 6.4.4 measurements (onnxruntime_test_all failure
+counts, the 1x1x1 isolation, the source-vs-assembly timing comparison)
+have not been re-run against this ROCm line; re-diffing only restores
+compilability, it does not substitute for re-running KERNEL_BUGS.md's
+methodology against 7.14 binaries (see gfx803/EVALUATION_ROCM_7.md,
+step 7). See small-gemm-assembly-miscompute.sh for how this patch is
+applied and verified at build time.
 
-NOT YET RE-VERIFIED under TheRock's own build against real gfx803
-hardware.
----
-diff --git a/projects/rocblas/library/src/tensile_host.cpp b/projects/rocblas/library/src/tensile_host.cpp
+diff --git a/library/src/tensile_host.cpp b/library/src/tensile_host.cpp
 index 1b1289f..38312f2 100644
---- a/projects/rocblas/library/src/tensile_host.cpp
-+++ b/projects/rocblas/library/src/tensile_host.cpp
+--- a/library/src/tensile_host.cpp
++++ b/library/src/tensile_host.cpp
 @@ -46,6 +46,8 @@
  #include <Tensile/hip/HipSolutionAdapter.hpp>
  #include <Tensile/hip/HipUtils.hpp>

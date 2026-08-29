@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""On-hardware smoke test for the therock-experimental gfx803 image.
-
-Adapted from ../verify.py -- same checks (MIGraphX EP inference, rocBLAS
-GEMM numerics, MIOpen convolution), against this line's own image instead.
-
-WGM8 guard note: this line's rocm-libraries patches now carry
-0004-rocblas-wgm-miscompute-source-fix.patch (a source-level replacement
-for the sed-based wgm-miscompute.sh, see README.md's "wgm-miscompute"
-section for the real-hardware verification behind it) -- gated on
-ISA==gfx803 && KernelLanguage==Assembly, so it correctly leaves the
-already-correct HIP-source "_WGM8"-named fallback kernels alone rather
-than zeroing every "_WGM8" string in the library the way the sed did.
-The "no WGM8 symbols" guard below is therefore scoped to the *_KLA_
-(assembly) kernels specifically, not a library-wide grep, to avoid
-flagging those known-fine fallback kernels as a regression.
+"""On-hardware smoke test for the gfx803 (Polaris) image.
 
 Run inside a container started with --device=/dev/kfd --device=/dev/dri
---group-add video.
+--group-add video. Exercises the three paths that only the base image's
+build-time import check (rocm6.4.4/Dockerfile, final stage) doesn't cover:
+MIGraphX EP inference, rocBLAS GEMM, MIOpen convolution -- each of which
+can import fine and still fail (or silently fall back) on real hardware.
+
+See README.gfx803.md#verifying-on-hardware.
 """
 
-import re
 import sys
 
 
@@ -42,6 +32,8 @@ def main():
         fail("MIGraphXExecutionProvider not built into this wheel")
 
     step("MIGraphX EP inference")
+    # onnx's default IR/opset can outrun what ORT 1.21.1 supports
+    # (max IR version 10, ai.onnx opset ceiling 22) -- pin both explicitly.
     import numpy as np
     import onnx
     from onnx import helper, TensorProto
@@ -78,56 +70,66 @@ def main():
     print("device:", torch.cuda.get_device_name(0))
 
     step("rocBLAS GEMM numerics (torch)")
+    # This used to print the sum and assert nothing, which is exactly how gfx803
+    # shipped a rocBLAS whose sgemm returned garbage: every Tensile assembly
+    # kernel built with WorkGroupMapping != 1 miscomputes on this arch, and
+    # rocBLAS still reports success. See patches/rocblas/wgm-miscompute.sh.
+    #
+    # Shapes matter more than size here. Which Tensile solution gets picked is a
+    # function of M/N/K, and the broken kernels were only selected from M>=768 --
+    # a single square 2048 case would have caught this one, but a single 512 case
+    # would not have. These cover both sides of that boundary and a non-square
+    # case, since M and N select differently.
     for m, n, k in ((512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048), (1024, 64, 1024)):
         a = torch.randn(m, k, device="cuda")
         b = torch.randn(k, n, device="cuda")
         got = a @ b
         torch.cuda.synchronize()
+        # float64 on the CPU: a float32 reference accumulates in a different
+        # order and would blur the difference between "fp32 rounding" and
+        # "wrong answer", which here differ by ~6 orders of magnitude.
         ref = (a.double().cpu() @ b.double().cpu())
         scale = ref.abs().max().item()
         rel = (got.double().cpu() - ref).abs().max().item() / max(scale, 1e-30)
         print(f"  {m}x{n}x{k}: max rel err {rel:.3g}")
         if rel > 1e-4:
             fail(f"GEMM {m}x{n}x{k} is numerically wrong (max rel err {rel:.3g}). "
-                 "rocBLAS reports success regardless -- check for _KLA_..._WGM8 "
-                 "kernels in /opt/rocm/**/rocblas/library.")
+                 "rocBLAS reports success regardless -- check for WGM8 kernels in "
+                 "/opt/rocm/lib/rocblas/library.")
 
-    step("no WorkGroupMapping!=1 assembly kernels in the rocBLAS library")
-    # Scoped to _KLA_ (assembly) kernel names specifically -- the fallback
-    # library's _KLS_ (HIP-source) kernels legitimately carry "_WGM8" in
-    # their name too, and are correct regardless (see README.md's
-    # wgm-miscompute section for the real-hardware verification of that).
+    step("no WorkGroupMapping!=1 kernels in the rocBLAS library")
+    # Direct regression guard for the above: kernel names embed the parameters
+    # they were generated with, so a correctly patched library contains no
+    # ..._WGM8 symbol at all. Cheap, needs no GPU, and names the defect exactly.
     import glob
     import os
 
     offenders = []
-    for root, _, files in os.walk("/opt/rocm"):
-        if "rocblas" not in root or "library" not in root:
+    libdir = "/opt/rocm/lib/rocblas/library"
+    for path in glob.glob(os.path.join(libdir, "*gfx803*")):
+        if not os.path.isfile(path):
             continue
-        for name in files:
-            if "gfx803" not in name:
-                continue
-            path = os.path.join(root, name)
-            with open(path, "rb") as fh:
-                data = fh.read()
-            n = len(re.findall(rb"Cijk_[A-Za-z0-9_]*_KLA_[A-Za-z0-9_]*_WGM8", data))
-            if n:
-                offenders.append((name, n))
+        with open(path, "rb") as fh:
+            n = fh.read().count(b"_WGM8")
+        if n:
+            offenders.append((os.path.basename(path), n))
     if offenders:
         for name, n in offenders[:5]:
             print(f"  {n:4d}  {name}")
         total = sum(n for _, n in offenders)
-        fail(f"{total} assembly (_KLA_) WGM8 kernels across {len(offenders)} gfx803 "
-             "library files -- these miscompute silently on this arch")
-    print("checked gfx803 rocblas library files, no assembly WGM8 kernels")
+        fail(f"{total} WGM8 kernels across {len(offenders)} gfx803 library files -- "
+             "these miscompute silently on this arch")
+    print(f"checked {len(glob.glob(os.path.join(libdir, '*gfx803*')))} gfx803 library files, no WGM8 kernels")
 
     step("MIOpen convolution (torch)")
+    # gfx803 has no .kdb tuning DB here -- expect slow, not wrong or crashing.
     import torch.nn as nn
 
     conv = nn.Conv2d(3, 16, 3).cuda()
     xi = torch.randn(1, 3, 64, 64, device="cuda")
     yo = conv(xi)
     torch.cuda.synchronize()
+    # Same reasoning as the GEMM above: shape alone proves nothing.
     ref = nn.functional.conv2d(xi.cpu(), conv.weight.detach().cpu(), conv.bias.detach().cpu())
     rel = (yo.cpu() - ref).abs().max().item() / max(ref.abs().max().item(), 1e-30)
     print("conv output shape:", tuple(yo.shape), "max rel err:", f"{rel:.3g}")

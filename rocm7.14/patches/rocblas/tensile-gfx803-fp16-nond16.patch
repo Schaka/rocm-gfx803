@@ -1,0 +1,630 @@
+Tensile (rocm-libraries, therock-7.14 / ROCm 7.14.0): enable non-HPA fp16
+GEMM assembly kernels on gfx803 by running Tensile's fp16 codegen in an
+unpacked "one fp16 per VGPR" mode, and fix the gfx803-only WGM work-group
+division bug that made the resulting kernels silently miscompute.
+
+WHY
+---
+gfx803 (Polaris) has no packed-fp16 hardware: all d16/d16_hi sub-dword
+memory ops (buffer_load_short_d16_hi, ds_write_b16_d16_hi, ...),
+v_pk_* packed fp16 ALU, and v_*_mix_f32 mixed-precision instructions are
+GFX9+ only (confirmed against the live LLVM/AMDGPU assembler: every one
+errors with "instruction not supported on this GPU (gfx803)"). Tensile's
+fp16 kernels previously had no code path that could generate without
+those instructions, so every fp16 GEMM on this hardware fell through to
+the portability-only _fallback_ kernel. See
+patches/rocblas/TENSILE_GFX803_FP16_TODO.md for the full investigation.
+
+This patch has two parts:
+
+1) HasD16 capability + halfNoD16 writer mode. Adds an AsmCaps capability
+   `HasD16` (False on gfx803, runtime-probed via tryAssembler so it can't
+   drift from reality), and a `halfNoD16` writer flag that selects
+   unpacked fp16 codegen: buffer_load_ushort + in-place lshl/or packing in
+   the global-read emitters, plain ds_write_b16 LDS stores (with
+   v_lshrrev from the hi half for odd elements), scalar v_mul_f16 /
+   v_add_f16 alpha/beta, per-element buffer_store_short stores and C beta
+   loads, and an unpacked C-tile register layout. Also rewrites
+   MAC_F16_Plain (upstream was silently broken: four identical
+   v_mac_f16, op_sel dropped) to mirror FMA_F16_Packed's element mapping
+   using SDWA src0_sel:WORD_1 selectors, which the RX 470 implements
+   correctly (verified standalone).
+
+2) gfx803 WGM division fix. After (1), the kernel generated, assembled and
+   ran on the RX 470 but silently miscomputed: every thread's A loads
+   collapsed to A[1..4] (B correct). Root cause: gfx803 lacks
+   s_mul_hi_u32, so s_mul_int_64_32() falls back to computing the 64-bit
+   scalar product in VECTOR registers (v0/v1). The WGM work-group
+   division (graWorkGroup) runs that fallback and clobbers v0/v1, which
+   hold the live GRO tile/unroll offsets (graTileAssignment) -- the
+   init-code optimization (isInitCodeOptLW) emits that assignment before
+   the kernel-arg-load wait, so those values are live when the WGM
+   section runs. The tile-offset copy (v4=v0, v7=v1) then reads garbage,
+   giving a uniform wrong GRO and the A[1..4] collapse. Fix: disable
+   isInitCodeOptLW when HasSMulHi is False, so the tile assignment is
+   emitted after the WGM section. On gfx900+ the same code is fine (the
+   WGM division is pure scalar); the bug is latent upstream because
+   gfx803 has been unsupported since ROCm 6.0.
+
+REAL-HARDWARE VERIFICATION (RX 470, ROCm 7.14 client)
+---
+Kernel Cijk_Ailk_Bljk_H_MT32x64x8_SN_K1, client alpha=2 beta=0, after
+this patch:
+  - Exact [16,16,2,1]  (tail loop, M=16 edge):  0 validation mismatches
+  - Exact [16,16,2,16] (unrolled main loop):     0 validation mismatches
+  - Exact [32,64,8,1]: kernel D equals the expected 2*A*B element-for-
+    element (0 mismatches vs expected); the client's own reference for
+    that shape comes back sparse (a client-side reference issue for that
+    problem shape, not the kernel -- every non-zero reference element
+    matches the kernel).
+The main-loop path uses the unchanged b64 loads; only the tail path's
+u16+pack code is new. HPA (fp32-accumulate) fp16 remains impossible on
+gfx803 (no v_pk_fma_f16/v_mad_mix_f32) -- this is non-HPA only, which is
+what the fp16 GEMM needs here.
+
+WHAT
+---
+a/shared/tensile/Tensile/AsmCaps.py              HasD16 capability
+a/shared/tensile/Tensile/Common.py               HasD16 runtime probe
+a/shared/tensile/Tensile/KernelWriterAssembly.py halfNoD16 writer mode +
+                                                 gfx803 WGM division fix
+a/shared/tensile/Tensile/Components/MAC_F16.py   fixed MAC_F16_Plain
+a/shared/tensile/Tensile/Source/client/source/ResultFileReporter.cpp  benchmark-client stoi crash fix
+--- a/shared/tensile/Tensile/AsmCaps.py	2026-08-25 17:17:05.772646698 +0200
++++ b/shared/tensile/Tensile/AsmCaps.py	2026-08-25 17:17:17.312267654 +0200
+@@ -82,8 +82,9 @@
+                  'v_pk_fma_f16': False,
+                  'v_pk_fmac_f16': False},
+      (8, 0, 3): {'HasAddLshl': False,
+-                 'HasAtomicAdd': False,
+-                 'HasDirectToLdsDest': False,
++                  'HasAtomicAdd': False,
++                  'HasD16': False,
++                  'HasDirectToLdsDest': False,
+                  'HasDirectToLdsNoDest': True,
+                  'HasExplicitCO': False,
+                  'HasExplicitNC': False,
+@@ -1377,4 +1378,13 @@
+ 
+         nested_update_(cachedAsmCaps, v19_diff)
+ 
++    # GFX803_FP16_NOD16_PATCH: D16-format sub-dword memory ops
++    # (buffer/global/ds *_d16 and *_d16_hi, packing two fp16 halves into one
++    # VGPR) are a GFX9+ feature. gfx803 must use plain u16/b16 accesses and
++    # cannot use v_pk_* packed fp16 math -- Tensile's fp16 codegen has to run
++    # in an unpacked one-f16-per-VGPR mode for such ISAs.
++    for isaVersion, isaCaps in cachedAsmCaps.items():
++        if "HasD16" not in isaCaps:
++            isaCaps["HasD16"] = isaVersion[0] >= 9
++
+     return cachedAsmCaps
+--- a/shared/tensile/Tensile/Common.py	2026-08-25 21:11:39.869627516 +0200
++++ b/shared/tensile/Tensile/Common.py	2026-08-25 17:53:31.470658467 +0200
+@@ -2085,6 +2085,11 @@
+ 
+     derivedAsmCaps["v_mov_b64"]             = tryAssembler(isaVersion, "v_mov_b64 v[20:21], v[22:23]")
+ 
++    # GFX803_FP16_NOD16_PATCH: D16-format sub-dword memory ops (packing two
++    # f16 halves into one VGPR via *_d16/_d16_hi instructions) are GFX9+;
++    # pre-Vega ISAs must use plain u16/b16 accesses and unpacked-f16 codegen
++    derivedAsmCaps["HasD16"]                = tryAssembler(isaVersion, "buffer_load_short_d16 v0, v1, s[0:3], 0 offen offset:0")
++
+     derivedAsmCaps["HasAtomicAdd"]          = tryAssembler(isaVersion, "buffer_atomic_add_f32 v0, v1, s[0:3], 0 offen offset:0")
+     derivedAsmCaps["HasGLCModifier"]        = tryAssembler(isaVersion, "buffer_load_dwordx4 v[10:13], v[0], s[0:3], 0, offen offset:0, glc")
+     derivedAsmCaps["HasNTModifier"]         = tryAssembler(isaVersion, "buffer_load_dwordx4 v[10:13], v[0], s[0:3], 0, offen offset:0, nt")
+--- a/shared/tensile/Tensile/KernelWriterAssembly.py	2026-08-25 17:17:05.772423324 +0200
++++ b/shared/tensile/Tensile/KernelWriterAssembly.py	2026-08-25 21:11:13.358571699 +0200
+@@ -859,7 +859,8 @@
+     if ((kernel.enabledSplitLDS and (kernel["UnrollMajorLDSA"] or kernel["UnrollMajorLDSB"])) or \
+         kernel["PersistentKernel"] or kernel["StreamK"] or \
+         (not kernel["BufferLoad"]) or \
+-        self.groOffsetInMacroTile == 0):
++        self.groOffsetInMacroTile == 0 or \
++        not globalParameters["AsmCaps"][kernel["ISA"]].get("HasSMulHi", True)): # GFX803_FP16_NOD16_PATCH: no s_mul_hi_u32 -> WGM div clobbers v0/v1
+       # disable init opt for local write
+       self.isInitCodeOptLW = False
+     # disable init code opt for local read if kernel["PreloadKernelArguments"] == 1
+@@ -1119,6 +1120,16 @@
+         if kernel["_GlobalAccumulation"]: # TODO SK and kernel["_GlobalAccumulation"] != 'PartialsBuffer':
+             self.bpeCexternal = 2
+ 
++    # GFX803_FP16_NOD16_PATCH: plain-f16 (non-HPA) on a pre-Vega ISA has no
++    # D16 packed-half memory ops and no v_pk_* packed f16 ALU, so every f16
++    # element (A/B staging, C accumulators, C loads/stores, alpha/beta math)
++    # lives alone in the low 16 bits of its own VGPR instead of two halves
++    # packed per VGPR. All the //2, %2 and d16/packed-f16 sites below key off
++    # this single flag.
++    self.halfNoD16 = kernel["ProblemType"]["DataType"].isHalf() \
++        and not kernel["ProblemType"]["HighPrecisionAccumulate"] \
++        and not self.asmCaps["HasD16"]
++
+     #jgolds Need to check device for support
+     # HPA not allowed in dgemm, cgemm, zgemm, sgemm
+     if kernel["ProblemType"]["HighPrecisionAccumulate"] and \
+@@ -1335,7 +1346,11 @@
+     ####################################
+     # num vgprs: valu
+     #jgolds bpeCinternal because we are allocating accumulation registers here
+-    self.numVgprValuC = (kernel["ThreadTile0"]*kernel["ThreadTile1"]*self.bpeCinternal)//self.bpr
++    if self.halfNoD16:
++      # one f16 accumulator per VGPR, value in the low 16 bits
++      self.numVgprValuC = kernel["ThreadTile0"]*kernel["ThreadTile1"]
++    else:
++      self.numVgprValuC = (kernel["ThreadTile0"]*kernel["ThreadTile1"]*self.bpeCinternal)//self.bpr
+ 
+     PLR = kernel["PrefetchLocalRead"] if kernel["PrefetchLocalRead"] < kernel["LoopIters"] else kernel["LoopIters"] - 1
+ 
+@@ -8546,10 +8561,14 @@
+                   destVgprHi = self.vgprPool.checkOut( int8TempVgpr , 'destVgprHi')
+                 dataIsByte = True
+               elif numBytesPerLoad == 2:
+-                if self.archCaps["HasEccHalf"]:
++                if self.archCaps["HasEccHalf"] or self.halfNoD16:
+                   # In some cards, loading half types into register will zero out
+                   # the other half. Therefore we need to load into a separate register
+-                  # then pack 2 registers into one
++                  # then pack 2 registers into one.
++                  # GFX803_FP16_NOD16_PATCH: same separate-register scheme for
++                  # pre-Vega -- plain u16 loads always land zero-extended in the
++                  # low half, so the odd element needs a temp + lshl + or to
++                  # build the packed pair the downstream code expects.
+                   destVgprHi = self.vgprPool.checkOut(1, 'destVgprHi')
+               elif numBytesPerLoad > 16:
+                 printWarning("DataType unsupported")
+@@ -8594,7 +8613,7 @@
+               # Not buffer load case, we use exec flag and register value is unchanged if exec flag is 0.
+               # If we do not initialize dest register here, some uninitialized value can be used for or operation
+               if (bpl == 1 and (not self.archCaps["HasEccHalf"])) or \
+-                 (bpl < 4 and self.archCaps["HasEccHalf"] and not kernel["BufferLoad"]):
++                 (bpl < 4 and (self.archCaps["HasEccHalf"] or self.halfNoD16) and not kernel["BufferLoad"]):
+                 kStr += inst("v_mov_b32", vgpr(loadVgpr), 0, "set to zero to avoid unexpected value for byte per load < 4")
+ 
+               if kernel["BufferLoad"]:
+@@ -8759,6 +8778,10 @@
+               # Half
+               elif destVgprHi != None and (r//numElementsPerLoad) % 2 == 1:
+                 kStr += "s_waitcnt vmcnt(0)\n"
++                if self.halfNoD16 and not self.archCaps["HasEccHalf"]:
++                  # GFX803_FP16_NOD16_PATCH: the u16 load zero-extends into
++                  # the low half, so shift the odd element up before packing
++                  kStr += inst("v_lshlrev_b32", vgpr(destVgprHi), "16", vgpr(destVgprHi), "no d16: hi f16 << 16")
+                 kStr += "v_or_b32 " + vgpr(destVgpr) + ", " + vgpr(destVgpr) + ", " + vgpr(destVgprHi) + " // HasEccHalf: pack\n"
+ 
+               # For half (bf16). Note: for int8, we will checkin after loading all components
+@@ -8997,6 +9020,9 @@
+     prevLdsOffset    = 0
+ 
+     loopCnt = -1
++    # GFX803_FP16_NOD16_PATCH: temp for packing an odd f16 into its pair
++    # register's high half when per-component (bpl==2) loads are used
++    halfNoD16LoadTmp = -1
+     if problemType["ZeroPad%s"%tc]:
+       addrV = self.vgprPool.checkOut(1,"addrV")
+     for perp in range(0, tP["nrp"]):
+@@ -9048,7 +9074,7 @@
+ 
+                 if kernel["UseInstOffsetForGRO"]:
+                   # buffer_load only support 12 bit instruction offset
+-                  # we have to increase m0 if offset is larger thant 12 bits
++                  # we have to increase m0 if offset is larger than 12 bits
+                   if instOffset >= self.buff_load_inst_offset_max:
+                     inc = (instOffset // self.buff_load_inst_offset_max) * self.buff_load_inst_offset_max
+                     loadModule.addInst("s_add_u32", "m0", "m0", inc, "Move LDS write address to next base" )
+@@ -9086,14 +9112,32 @@
+                 destVgpr="G2L%s+%u"%(tc, g2lIdx)
+ 
+               # TODO: is it possible to load only hi16 when no in tail? (need to check INT8 too)
++              hi16 = (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) and loopCnt%2==1
++              halfNoD16PackTmp = None
++              if self.halfNoD16 and bpl == 2 and hi16 and destVgpr != 0 and not kernel["DirectToVgpr%s"%tc]:
++                # GFX803_FP16_NOD16_PATCH: scalar (glvw=1) half loads have no
++                # _d16_hi form; load the odd f16 (zero-extended) into a temp
++                # and pack it into the pair register's high half, so all
++                # downstream consumers see the same naturally-packed layout
++                # the d16 path produces. g2lIdx's %u truncation = pair index.
++                if halfNoD16LoadTmp == -1:
++                  halfNoD16LoadTmp = self.vgprPool.checkOut(1, "halfNoD16 load pack temp")
++                halfNoD16PackTmp = halfNoD16LoadTmp
++                loadDest = halfNoD16PackTmp
++              else:
++                loadDest = destVgpr
+               loadModule.addCode( self.chooseGlobalRead(kernel["BufferLoad"], \
+-                        bpl, destVgpr=destVgpr, \
++                        bpl, destVgpr=loadDest, \
+                         addr0=vgpr(offsetVgpr), addr1=sgpr("Srd%s"%tc, 4), \
+                         soffset=soffset, offset=instOffset, \
+                         extraFields=extraFields, \
+                         dtlNoDestVgpr=dtlNoDestVgpr, \
+-                        hi16=(kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) and loopCnt%2==1, \
++                        hi16=hi16, \
+                         comment="G -> Reg %u_%u_%u_%u"%(para, sPara, perp, sPerp)))
++              if halfNoD16PackTmp != None:
++                loadModule.addInst("s_waitcnt", "vmcnt(0)", "no d16: wait for odd f16 load")
++                loadModule.addInst("v_lshlrev_b32", vgpr(halfNoD16PackTmp), "16", vgpr(halfNoD16PackTmp), "no d16: hi f16 << 16")
++                loadModule.addInst("v_or_b32", vgpr("G2L%s+%u"%(tc, g2lIdx)), vgpr("G2L%s+%u"%(tc, g2lIdx)), vgpr(halfNoD16PackTmp), "no d16: pack f16 pair")
+ 
+               if unrollMirrorWithSoffset:
+                 codeMod = Code.Module("mirrorIdx%u"%loopCnt)
+@@ -9111,15 +9155,30 @@
+                 destVgpr="G2L%s%u+%u"%(tc, vregSetIdx, g2lIdx)
+               else:
+                 destVgpr="G2L%s+%u"%(tc, g2lIdx)
++              hi16Flat = (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) and loopCnt%2==1
++              flatPackTmp = None
++              if self.halfNoD16 and bpl == 2 and hi16Flat and not kernel["DirectToVgpr%s"%tc]:
++                # GFX803_FP16_NOD16_PATCH: pack the odd f16 into the pair
++                # register's high half (see the buffer-load branch above)
++                if halfNoD16LoadTmp == -1:
++                  halfNoD16LoadTmp = self.vgprPool.checkOut(1, "halfNoD16 load pack temp")
++                flatPackTmp = halfNoD16LoadTmp
++                flatDest = flatPackTmp
++              else:
++                flatDest = destVgpr
+               loadModule.addCode( self.chooseGlobalRead(False, \
+                         bpl, \
+-                        destVgpr=destVgpr, \
++                        destVgpr=flatDest, \
+                         addr0=vgpr("GlobalReadAddr%s+%u"%(tc,graIdx),2), addr1="", \
+                         soffset=0, offset=0, \
+                         extraFields=extraFields, \
+                         dtlNoDestVgpr=dtlNoDestVgpr, \
+-                        hi16=(kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) and loopCnt%2==1, \
++                        hi16=hi16Flat, \
+                         comment="G -> Reg %u_%u_%u_%u"%(para, sPara, perp, sPerp )))
++              if flatPackTmp != None:
++                loadModule.addInst("s_waitcnt", "vmcnt(0)", "no d16: wait for odd f16 load")
++                loadModule.addInst("v_lshlrev_b32", vgpr(flatPackTmp), "16", vgpr(flatPackTmp), "no d16: hi f16 << 16")
++                loadModule.addInst("v_or_b32", vgpr("G2L%s+%u"%(tc, g2lIdx)), vgpr("G2L%s+%u"%(tc, g2lIdx)), vgpr(flatPackTmp), "no d16: pack f16 pair")
+ 
+     if self.db["ConservativeWaitCnt"] & 0x1:
+         imod.footer.addInst( self.syncStr, "debug")
+@@ -9145,6 +9204,9 @@
+     if problemType["ZeroPad%s"%tc]:
+       self.vgprPool.checkIn(addrV)
+ 
++    if halfNoD16LoadTmp != -1:
++      self.vgprPool.checkIn(halfNoD16LoadTmp)
++
+     return imod
+ 
+ 
+@@ -9710,6 +9772,9 @@
+         print("nwcvpi", tP["nwcvpi"])
+ 
+       tmpLocalWriteAddr = -1
++      # GFX803_FP16_NOD16_PATCH: temp holding an odd f16 shifted out of a
++      # naturally-packed pair for the plain-b16 LDS store (glvw>=2 case)
++      halfNoD16HiTmp = -1
+ 
+       # due to bug in scheduler, cannot use temp sgpr for now
+       #tempFp16Sgpr = -1
+@@ -9827,9 +9892,6 @@
+ 
+             #print "offset", offset
+ 
+-            paramTuple = tuple(paramList)
+-            #comment = "Reg -> L %u_%u_%u_%u"%(para, sPara, perp, sPerp)
+-            #comment += " #%u"%self.localWriteDoCnt
+             nonTemporal = 0
+             isHigh16Bits = False
+             if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+@@ -9837,7 +9899,6 @@
+                 isHigh16Bits = True
+               if tP["glvw"]==1 and instructionCnt%2==1:
+                 isHigh16Bits = True
+-
+             #       |  hi16  |  hi16  |        |        |
+             #       |  hi8   |        |   hi8  |        |
+             #############################################
+@@ -9849,6 +9910,21 @@
+               # TODO
+               # if tP["glvw"]==1 and instructionCnt%2==1:
+               #   isHigh16Bits = True
++            if self.halfNoD16 and (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) and isHigh16Bits and blockWidth < 1:
++              # GFX803_FP16_NOD16_PATCH: no ds_write_b16_d16_hi on pre-Vega.
++              # Global-read staging packs f16 pairs naturally into the G2L
++              # registers (see the load-side pack), so the odd element of a
++              # pair sits in the register's high half; shift it down into a
++              # temp for the plain b16 store. Must run before paramTuple is
++              # frozen below so the redirected source register takes effect.
++              if halfNoD16HiTmp == -1:
++                halfNoD16HiTmp = self.vgprPool.checkOut(1, "halfNoD16 hi-half temp")
++              localWriteCode.addInst("v_lshrrev_b32", vgpr(halfNoD16HiTmp), "16", \
++                  vgpr("G2L%s+%u"%(tc, g2lIdx)), "no d16: hi f16 >> 16")
++              paramList[1] = vgpr(halfNoD16HiTmp)
++              isHigh16Bits = False
++
++            paramTuple = tuple(paramList)
+             localWriteCode.addCode(Code.LocalWriteInst( \
+                 instruction.IssueLatency, \
+                 tP["localWriteInstruction"].toCodeInst(paramTuple, \
+@@ -9857,6 +9933,8 @@
+             loopCnt+=1
+       if tmpLocalWriteAddr != -1:
+         self.vgprPool.checkIn(tmpLocalWriteAddr)
++      if halfNoD16HiTmp != -1:
++        self.vgprPool.checkIn(halfNoD16HiTmp)
+ 
+       # due to bug in scheduler, cannot use temp sgpr for now
+       #if tempFp16Sgpr != -1:
+@@ -11359,6 +11437,10 @@
+           self.numVgprsPerDataPerVI = (1.0 * regsPerElement * bpeC) / kernelWriter.bpr
+         elif beta:
+           self.numVgprsPerDataPerVI = (1.0 * bpeC) / kernelWriter.bpr
++          if kernelWriter.halfNoD16:
++            # GFX803_FP16_NOD16_PATCH: each loaded f16 element occupies its
++            # own VGPR (low half) instead of sharing a packed register
++            self.numVgprsPerDataPerVI = 1.0
+           if kernelWriter.HHH_WMMA:
+               self.numVgprsPerDataPerVI = 1.0
+         else:
+@@ -12441,6 +12523,12 @@
+               # dataV+0 = new c = old c*beta + rC
+               kStr += inst("v_pk_add_f16", vgpr("ValuC+%u"%(sumIdxV)), vgpr(dataV), vgpr("ValuC+%u"%(sumIdxV)), \
+                   "sum*alpha + C*beta")
++            elif self.halfNoD16:
++              # GFX803_FP16_NOD16_PATCH: one f16 per VGPR on both sides;
++              # scalar add combines sum and C (mirrors the packed add-only
++              # shape of this path)
++              kStr += inst("v_add_f16", vgpr("ValuC+%u"%(sumIdxV)), vgpr(dataV), vgpr("ValuC+%u"%(sumIdxV)), \
++                  "sum*alpha + C*beta")
+             elif sumIdxV%2==0 or (not self.ss.cfg.halfDataRegPerVI and gwvw==1):
+               # dataV+0 = new c = old c*beta
+               # kStr += inst("v_pk_mul_f16", vgpr(dataV), sgpr("Beta"), vgpr(dataV+0), \
+@@ -13857,9 +13945,21 @@
+         globalReadInst = "_buffer_load_d16_u8"
+         rpv *= 4
+       elif bpl==2 and hi16:
+-        globalReadInst = "_buffer_load_d16_hi_b16"
+-        rpv *= 2
++        # GFX803_FP16_NOD16_PATCH: no _d16/_d16_hi on pre-Vega; read each f16
++        # into the low half of its own VGPR (zero-extended) as a u16 load.
++        # The caller passes per-component offsets (r*bpe + instOffset), so
++        # component 1 of a pair already lands at offset+2.
++        assert self.halfNoD16
++        assert not dtlNoDestVgpr, "halfNoD16 does not support DirectToLds half loads (no d16 dtl fallback yet)"
++        rv.addCode(Code.GlobalReadInst("_buffer_load_u16", vgpr(destVgpr, 1), addr0, \
++                  addr1, soffset, tailFields, comment))
++        return rv
+       elif bpl==2 and not hi16:
++        if self.halfNoD16:
++          assert not dtlNoDestVgpr, "halfNoD16 does not support DirectToLds half loads (no d16 dtl fallback yet)"
++          rv.addCode(Code.GlobalReadInst("_buffer_load_u16", vgpr(destVgpr, 1), addr0, \
++                  addr1, soffset, tailFields, comment))
++          return rv
+         globalReadInst = "_buffer_load_d16_b16"
+         rpv *= 2
+       elif bpl==4:
+@@ -13906,8 +14006,14 @@
+       elif bpl==1 and not hi16:
+         return Code.GlobalReadInst("_global_load_d16_u8", vgpr(destVgpr, rpv*4), addr0, "off", tailFields, comment )
+       elif bpl==2 and hi16:
+-        return Code.GlobalReadInst("_global_load_d16_hi_b16", vgpr(destVgpr, rpv*2), addr0, "off", tailFields, comment )
++        # GFX803_FP16_NOD16_PATCH: no _d16/_d16_hi on pre-Vega; read each f16
++        # into the low half of its own VGPR (zero-extended) as a u16 load.
++        # The caller passes per-component offsets (r*bpe + instOffset).
++        assert self.halfNoD16
++        printExit("halfNoD16 flat/global half loads unsupported on pre-Vega (no global_load_ushort); use BufferLoad")
+       elif bpl==2 and not hi16:
++        if self.halfNoD16:
++          printExit("halfNoD16 flat/global half loads unsupported on pre-Vega (no global_load_ushort); use BufferLoad")
+         return Code.GlobalReadInst("_global_load_d16_b16", vgpr(destVgpr, rpv*2), addr0, "off", tailFields, comment )
+       elif bpl==4:
+         return Code.GlobalReadInst("_global_load_b32", vgpr(destVgpr, rpv), addr0, "off", tailFields, comment )
+@@ -13965,10 +14071,20 @@
+           kStr += inst("buffer_store_byte_d16_hi", vgpr(vb1Tmp), addr0, \
+                   addr1, tmpSgpr, "offen", "offset:%u"%offset, extraFields, "store D")
+       elif bps==2 and hi16:
+-        kStr += inst("_buffer_store_d16_hi_b16", vgpr(srcVgpr, rpv*2), addr0, \
++        if self.halfNoD16:
++          # GFX803_FP16_NOD16_PATCH: srcVgpr is the element's own VGPR
++          # (value in low half); store it with the plain 2-byte instruction
++          kStr += inst("buffer_store_short", vgpr(srcVgpr), addr0, \
++                  addr1, tmpSgpr, "offen", "offset:%u"%offset, extraFields, "store D")
++        else:
++          kStr += inst("_buffer_store_d16_hi_b16", vgpr(srcVgpr, rpv*2), addr0, \
+                   addr1, tmpSgpr, "offen", "offset:%u"%offset, extraFields, "store D")
+       elif bps==2 and not hi16:
+-        kStr += inst("_buffer_store_b16", vgpr(srcVgpr, rpv*2), addr0, \
++        if self.halfNoD16:
++          kStr += inst("buffer_store_short", vgpr(srcVgpr), addr0, \
++                  addr1, tmpSgpr, "offen", "offset:%u"%offset, extraFields, "store D")
++        else:
++          kStr += inst("_buffer_store_b16", vgpr(srcVgpr, rpv*2), addr0, \
+                   addr1, tmpSgpr, "offen", "offset:%u"%offset, extraFields, "store D")
+       elif bps==4:
+         kStr += inst("_buffer_store_b32", vgpr(srcVgpr, rpv), addr0, \
+@@ -14009,9 +14125,17 @@
+         else:
+           assert 0, "bad bps"
+       elif bps==2 and hi16:
+-        kStr += inst("_global_store_d16_hi_b16", addr0, vgpr(srcVgpr*2), "off", extraFields, "store D" )
++        if self.halfNoD16:
++          # GFX803_FP16_NOD16_PATCH: srcVgpr is the element's own VGPR, but
++          # pre-Vega has no sub-dword flat/global store at all
++          printExit("halfNoD16 flat/global half stores unsupported on pre-Vega; use BufferStore")
++        else:
++          kStr += inst("_global_store_d16_hi_b16", addr0, vgpr(srcVgpr*2), "off", extraFields, "store D" )
+       elif bps==2 and not hi16:
+-        kStr += inst("_global_store_d16_b16", addr0, vgpr(srcVgpr, rpv*2), "off", extraFields, "store D" )
++        if self.halfNoD16:
++          printExit("halfNoD16 flat/global half stores unsupported on pre-Vega; use BufferStore")
++        else:
++          kStr += inst("_global_store_d16_b16", addr0, vgpr(srcVgpr, rpv*2), "off", extraFields, "store D" )
+       elif bps==4:
+         kStr += inst("_global_store_b32", addr0, vgpr(srcVgpr, rpv), "off", extraFields, "store D" )
+       elif bps==8:
+@@ -14071,7 +14195,14 @@
+ 
+         if not kernel["ProblemType"]["HighPrecisionAccumulate"]:
+           # (H,H,H,H,H,H), internal H
+-          if globalParameters["AsmCaps"][self.version]["HasWMMA"] and kernel["EnableMatrixInstructionStore"]:
++          if self.halfNoD16:
++            # GFX803_FP16_NOD16_PATCH: one plain 2-byte store per element;
++            # the element's f16 sits in the low half of its own VGPR
++            # (ValuC+sumIdx+vi), so no d16 store variants are needed
++            for vi in range(0, ss.cfg.gwvw):
++              kStr += self.chooseGlobalWrite(useBuffer, 2, sumIdx+vi, 1, addr0, addr1, \
++                  offset + vi*self.bpeCexternal, ntStr, hi16=0, vb1Tmp=0, soffset=wsOffset)
++          elif globalParameters["AsmCaps"][self.version]["HasWMMA"] and kernel["EnableMatrixInstructionStore"]:
+             kStr += self.chooseGlobalWrite(useBuffer, bps, sumIdx, rpv, addr0, addr1, offset, ntStr, hi16=0, vb1Tmp=0, soffset=wsOffset)
+           else:
+             kStr += self.chooseGlobalWrite(useBuffer, bps, sumIdx//2, rpv, addr0, addr1, offset, ntStr, hi16=sumIdx%2, vb1Tmp=0, soffset=wsOffset)
+@@ -14182,7 +14313,11 @@
+ 
+         if kernel["ProblemType"]["ComputeDataType"].isHalf() and not kernel["ProblemType"]["HighPrecisionAccumulate"]:
+           # (h,h,h,h,h,h), internal alpha is f16 (2-16bits)
+-          if sumIdxV%2:
++          if self.halfNoD16:
++            # GFX803_FP16_NOD16_PATCH: one f16 accumulator per VGPR; scalar
++            # multiply reads the f16 alpha from the sgpr's low half
++            kStr += inst("v_mul_f16", vgpr("ValuC+%u"%sumIdxV), sgpr("Alpha"), vgpr("ValuC+%u"%sumIdxV), "*= alpha sumIdx=%u vi=%u"%(elementSumIdx[elementIdx], vi))
++          elif sumIdxV%2:
+             kStr += inst("v_pk_mul_f16", vgpr("ValuC+%u"%(sumIdxV//2)), sgpr("Alpha"), vgpr("ValuC+%u"%(sumIdxV//2)), "*= alpha sumIdx=%u vi=%u"%(elementSumIdx[elementIdx], vi))
+ 
+         # Int8 (TODO- Int8x4 not checked, but should be OK)
+@@ -14278,6 +14413,15 @@
+       comment = "load partials"
+ 
+     if dataType.isHalf():
++      if self.halfNoD16:
++        # GFX803_FP16_NOD16_PATCH: one u16 load per element into its own
++        # VGPR (zero-extended, value in low half); no d16 load variants
++        for vi in range(0, gwvw):
++          kStr += self.chooseGlobalRead(useBuffer, 2, data+vi, \
++                    addr0, addr1, soffset=soffset, offset=offset + vi*2, \
++                    extraFields=extraStr, dtlNoDestVgpr=False, hi16=0, \
++                    comment=comment).toStr()
++        return kStr
+       hi16 = 0 if self.HHH_WMMA else (vc0 % 2)
+       kStr += self.chooseGlobalRead(useBuffer, bps, data, \
+                 addr0, addr1, soffset=soffset, offset=offset, \
+@@ -14939,7 +15083,13 @@
+             sumIdxV = ss.elementSumIdx[elementIdx] + vi
+             if kernel["ProblemType"]["DestDataType"].isHalf():
+               if not kernel["ProblemType"]["HighPrecisionAccumulate"]:
+-                if self.asmCaps["HasWMMA"] and kernel["EnableMatrixInstructionStore"]:
++                if self.halfNoD16:
++                  # GFX803_FP16_NOD16_PATCH: one f16 per VGPR on both sides
++                  kStr += inst("v_mul_f16", vgpr(dataV), sgpr("Beta"), vgpr(dataV), \
++                      "%s = C*beta ei=%u vi=%u"%(vgpr(dataV),elementIdx, vi))
++                  kStr += inst("v_add_f16", vgpr("ValuC+%u"%sumIdxV), vgpr(dataV), vgpr("ValuC+%u"%sumIdxV), \
++                      "sum*alpha + C*beta")
++                elif self.asmCaps["HasWMMA"] and kernel["EnableMatrixInstructionStore"]:
+                   dataV = ss.elementData[elementIdx] + int(vi / 2 * ss.cfg.numVgprsPerDataPerVI)
+                   if (vi % 2) == 0:
+                       kStr += inst("v_pk_mul_f16", vgpr(dataV), sgpr("Beta"), vgpr(dataV+0), \
+--- a/shared/tensile/Tensile/Components/MAC_F16.py	2026-08-25 17:17:05.773360672 +0200
++++ b/shared/tensile/Tensile/Components/MAC_F16.py	2026-08-25 17:44:58.898046688 +0200
+@@ -27,7 +27,8 @@
+ 
+ class MAC_F16_Plain(MAC):
+     """
+-    Plain MAC instruction implementation
++    Plain MAC instruction implementation for pre-Vega ISAs (gfx8) that have
++    v_mac_f16 but no D16 packed-half memory ops and no v_pk_* packed math.
+     """
+     asmCaps = {"v_mac_f16": True,
+                "v_pk_fma_f16": False,
+@@ -38,37 +39,44 @@
+ 
+     def __call__(self, writer, m, innerUnroll):
+         kernel = writer.kernel
++        assert writer.halfNoD16, \
++            "MAC_F16_Plain generates the pre-Vega unpacked-f16 sequence"
+ 
+         kStr = self.commentHeader()
+ 
+         priority = Component.Priority.find(writer)
+ 
+-        vars = {}
++        endLine = writer.endLine
+ 
+-        vars["m"] = m
+-        vars["kernel"] = kernel
+-        vars["endLine"] = writer.endLine
+-
+-        vars["ThreadTile0"] = kernel["ThreadTile0"]
+-        vars["ThreadTile1"] = kernel["ThreadTile1"]
+-
+-        vars["Half_ThreadTile0"] = kernel["ThreadTile0"] // 2
+-        vars["Half_ThreadTile1"] = kernel["ThreadTile1"] // 2
+-
+-        for blockB in range(0, kernel["ThreadTile1"]//2):
+-            for blockA in range(0, kernel["ThreadTile0"]//2):
+-                for b in range(blockB*2, (blockB+1)*2):
+-                    for a in range(blockA*2, (blockA+1)*2):
+-                        for iui in range(0, innerUnroll):
+-                            vars["blockA"] = blockA
+-                            vars["blockB"] = blockB
+-                            vars["iui"] = iui
+-
+-                            vars["cStr"] = "v[vgprValuC+{blockA}+{blockB}*{ThreadTile0}+0]".format_map(vars)
+-                            vars["aStr"] = "v[vgprValuA_X{m}_I{iui}+{blockA}]".format_map(vars)
+-                            vars["bStr"] = "v[vgprValuB_X{m}_I{iui}+{blockB}]".format_map(vars)
+-                            kStr += "v_mac_f16 {cStr}, {aStr}, {bStr}{endLine}".format_map(vars)
+-                            kStr += priority(writer, 1, "Raise priority while processing macs")
++        ThreadTile0 = kernel["ThreadTile0"]
++        ThreadTile1 = kernel["ThreadTile1"]
++
++        # GFX803_FP16_NOD16_PATCH: upstream MAC_F16_Plain was broken for its
++        # own data layout -- it dropped the half-selectors of the
++        # FMA_F16_Packed component it was cloned from (2020 "Move fp16 code
++        # entirely to components"), emitting four identical v_mac_f16 per
++        # element pair. This rewrite mirrors FMA_F16_Packed's element
++        # mapping exactly: A[blockA] holds the packed f16 pair
++        # (a=2*blockA, 2*blockA+1), B[blockB] holds (b=2*blockB,
++        # 2*blockB+1) at the same k, and C element (a,b) lives alone in the
++        # low half of VGPR vgprValuC+a+b*ThreadTile0 (one accumulator per
++        # element in the unpacked mode). The high halves of the A/B pairs
++        # are selected with SDWA word selectors -- the only half-selection
++        # mechanism pre-Vega ISAs have (VOP3 op_sel is GFX9+).
++        for blockB in range(0, ThreadTile1//2):
++            for blockA in range(0, ThreadTile0//2):
++                for iui in range(0, innerUnroll):
++                    aStr = "v[vgprValuA_X%u_I%u+%u]" % (m, iui, blockA)
++                    bStr = "v[vgprValuB_X%u_I%u+%u]" % (m, iui, blockB)
++                    cIdx0 = blockA*2     + blockB*2     * ThreadTile0
++                    cIdx1 = blockA*2 + 1 + blockB*2     * ThreadTile0
++                    cIdx2 = blockA*2     + (blockB*2+1) * ThreadTile0
++                    cIdx3 = blockA*2 + 1 + (blockB*2+1) * ThreadTile0
++                    kStr += "v_mac_f16 v[vgprValuC+%u], %s, %s%s" % (cIdx0, aStr, bStr, endLine)
++                    kStr += priority(writer, 1, "Raise priority while processing macs")
++                    kStr += "v_mac_f16 v[vgprValuC+%u], %s, %s src0_sel:WORD_1%s" % (cIdx1, aStr, bStr, endLine)
++                    kStr += "v_mac_f16 v[vgprValuC+%u], %s, %s src1_sel:WORD_1%s" % (cIdx2, aStr, bStr, endLine)
++                    kStr += "v_mac_f16 v[vgprValuC+%u], %s, %s src0_sel:WORD_1 src1_sel:WORD_1%s" % (cIdx3, aStr, bStr, endLine)
+ 
+         kStr += priority(writer, 0, "Reset priority after macs")
+         return kStr
+
+a/shared/tensile/Tensile/Source/client/source/ResultFileReporter.cpp
+---
+Benchmark client robustness fix: ResultFileReporter crashed with
+"std::invalid_argument: stoi" whenever the GPU clock/power/hotspot
+metrics came back NaN or empty (ROCm SMI path on unsupported gfx803
+hardware returns NaN), aborting every benchmark run before results
+printed. Guard the three stoi calls with try/catch.
+--- a/shared/tensile/Tensile/Source/client/source/ResultFileReporter.cpp	2026-08-25 21:27:22.235746769 +0200
++++ b/shared/tensile/Tensile/Source/client/source/ResultFileReporter.cpp	2026-08-25 21:24:00.444545906 +0200
+@@ -115,15 +115,18 @@
+             }
+             else if(key == ResultKey::GfxFrequency)
+             {
+-                m_currGfxClock = static_cast<uint16_t>(std::stoi(valueStr));
++                try { m_currGfxClock = static_cast<uint16_t>(std::stoi(valueStr)); }
++                catch(std::invalid_argument const&) {}
+             }
+             else if(key == ResultKey::Power)
+             {
+-                m_currPower = static_cast<uint16_t>(std::stoi(valueStr));
++                try { m_currPower = static_cast<uint16_t>(std::stoi(valueStr)); }
++                catch(std::invalid_argument const&) {}
+             }
+             else if(key == ResultKey::TemperatureHot)
+             {
+-                m_currTemperatureHot = static_cast<uint16_t>(std::stoi(valueStr));
++                try { m_currTemperatureHot = static_cast<uint16_t>(std::stoi(valueStr)); }
++                catch(std::invalid_argument const&) {}
+             }
+             else
+             {

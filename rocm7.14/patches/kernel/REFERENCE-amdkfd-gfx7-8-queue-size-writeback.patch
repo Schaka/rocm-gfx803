@@ -1,0 +1,104 @@
+SUPERSEDED -- DO NOT BUILD OR LOAD. Kept for the record only.
+
+This write-back forces the HQD's CP_HQD_PQ_CONTROL queue-size field back to
+the single, un-doubled ring size on GFX7/8 AQL queues. That is the opposite
+of what this hardware needs: the doubled size is not an accounting error,
+it is the workaround. GFXIP 7/8's CP cannot distinguish a full ring from an
+empty one unless the span it masks against is twice the ring, so telling it
+the true size re-arms the silent dispatch hang tracked as problem 1 in
+RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md.
+
+It appeared to fix something because it was paired with
+graph-replay-queue-size-cap.patch, which reported a doubled size for a ring
+that was never actually mirrored -- so the CP was addressing a span whose
+upper half was unmapped, and faulted. Removing the doubling removed the
+fault and the workaround together. The real missing piece was
+HsaMemFlags.ui32.AQLQueueMemory; see patches/rocm-systems/
+aql-ring-queue-full-workaround.patch.
+
+ACTION REQUIRED if this is already installed: the gfx803 box at
+192.168.1.214 was running an out-of-tree amdgpu.ko built with this patch as
+of 2026-08-28. It has to be rebuilt without it before the ROCR-side fix can
+work.
+
+For the record, that ROCR-side fix does not fix the silent dispatch hang
+either -- see RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md's top-of-file summary. The hang
+is VRAM-clock marginality (mining-tuned VBIOS driving Hynix VRAM above its
+rated speed), confirmed on hardware 2026-08-29. This patch's own analysis
+of the double-map mechanism is still correct; it just isn't the hang.
+
+Original header follows.
+
+REFERENCE ONLY -- NOT built, applied, or shipped by this repo. Out-of-tree
+kernel (amdgpu/amdkfd) driver source, not a userspace ROCm component this
+repo's Docker image build touches. Saved here purely as documentation for
+the companion userspace patch (patches/rocm-systems/
+graph-replay-queue-size-cap.patch), whose header explains the full WHY.
+Per AGENTS.md's standing rule, driver changes belong outside this repo --
+this file exists only so the paired fix is documented next to the
+userspace half that depends on it, not as something to `patch -p1` into a
+build.
+
+WHY (short version -- see graph-replay-queue-size-cap.patch for the full
+investigation): kfd_queue_acquire_buffers() computes the correct halved
+ring size needed to validate a GFX7/8 AQL compute queue's VM-mapped
+backing buffer ("AQL queues on GFX7 and GFX8 appear twice their actual
+size"), but only uses it locally for that one check -- it's never written
+back to properties->queue_size, which kfd_mqd_manager_vi.c's update_mqd()
+later reads RAW to program the real hardware CP_HQD_PQ_CONTROL queue-size
+field and wptr_mask. If userspace reports a doubled ring_size (required to
+get hsa_queue_create to succeed above the 64-packet floor at all -- see
+the paired patch), that doubled value reaches hardware unmodified,
+desyncing the CP's wraparound point from the actual backing buffer and
+software's own index masking. Confirmed as a real GPU fault under load
+(memory access fault, GPU hang) on real gfx803 hardware without this
+write-back; confirmed fixed with it (hsa_queue_create succeeds at the full
+131072-packet max, vLLM's HIP-graph-replay repro completes cleanly and
+repeatably, no fault).
+
+Verified by building this as a standalone out-of-tree module from
+Fedora's kernel-7.1.9-200.fc44 source (matching the box's running
+7.1.8-200.fc44 headers -- confirmed safe since the Fedora/RHEL aggregate
+patch between those two versions touches zero files under
+drivers/gpu/drm/amd; same build recipe as this repo's vllm-gfx803/NOTES.md
+documents for the unrelated pqm_debugfs_mqds NULL-deref fix), installing
+it over the stock module, and rebooting.
+
+Applies to: drivers/gpu/drm/amd/amdkfd/kfd_queue.c, function
+kfd_queue_acquire_buffers(). Confirmed present, byte-for-byte identical in
+the relevant region, in live mainline Linux at the time of writing -- a
+real, unfixed upstream gap, not distro-specific. Worth reporting to
+gitlab.freedesktop.org/drm/amd/-/issues.
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+index 0000000000..0000000000 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+@@ -246,11 +246,23 @@ int kfd_queue_acquire_buffers(struct kfd_process_device *pdd, struct queue_pro
+ 	/* AQL queues on GFX7 and GFX8 appear twice their actual size */
+ 	if (properties->type == KFD_QUEUE_TYPE_COMPUTE &&
+ 	    properties->format == KFD_QUEUE_FORMAT_AQL &&
+ 	    topo_dev->node_props.gfx_target_version >= 70000 &&
+-	    topo_dev->node_props.gfx_target_version < 90000)
++	    topo_dev->node_props.gfx_target_version < 90000) {
+ 		/* metadata_queue_size not supported on GFX7/GFX8 */
+ 		expected_queue_size =
+ 			PAGE_ALIGN(properties->queue_size / 2);
+-	else
++		/*
++		 * userspace reports queue_size doubled (matching the VA-size
++		 * check above) so hsa_queue_create can request ring sizes
++		 * beyond the point where PAGE_ALIGN(queue_size/2) no longer
++		 * coincidentally rounds back up to queue_size itself (the
++		 * >1-page case). The MQD/HQD programming path (kfd_mqd_manager_vi.c)
++		 * reads properties->queue_size raw for CP_HQD_PQ_CONTROL's
++		 * queue_size field and wptr_mask -- without this write-back it
++		 * would program hardware with the doubled, not the real, ring
++		 * capacity, desyncing HW wraparound from the actual backing
++		 * buffer. Write back the true (halved) size now that the VA
++		 * check above has validated it against the real allocation.
++		 */
++		properties->queue_size = expected_queue_size;
++	} else
+ 		expected_queue_size =
+ 			PAGE_ALIGN(properties->queue_size + properties->metadata_queue_size);

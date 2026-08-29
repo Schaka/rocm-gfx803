@@ -1,0 +1,132 @@
+GPU hang, hardware-verified on gfx803 (RX 470): any triton kernel with a
+data-dependent `while` loop nested inside a `for`-style loop whose trip
+count is exactly 1 hangs the GPU on launch, unconditionally. This is a
+genuine triton compiler miscompile, NOT gfx803-specific in mechanism (the
+buggy code path has nothing arch-specific in it), though it was only
+proven with real gfx803 hardware -- no other ROCm GPU was available to
+confirm generically. Kept as a triton-source patch here (not filed
+upstream from this repo) because that's this repo's scope; upstreaming is
+still the right long-term fix if someone with a second GPU wants to.
+
+Found via vLLM's `_topk_topp_kernel` (vllm/v1/sample/ops/topk_topp_triton.py),
+which launches `grid=(min(num_compute_units, batch_size),)` and has each
+program grid-stride-loop over its assigned rows
+(`for row_id in tl.range(pid, BATCH_SIZE, num_programs)`), with a bounded
+ternary-search `while` loop per row. On gfx803 this kernel launches, then
+the GPU pegs at 100%/boosted clocks and never returns -- dmesg shows a
+real hardware `ring gfx timeout` -> BACO reset, not a soft hang. See
+rocm-gfx803 repo vllm-gfx803/NOTES.md for the full
+debugging saga (killing the host process does not release the GPU; the
+comm name is truncated to "VLLM::EngineCor", `pkill -f EngineCore` misses
+it).
+
+INVESTIGATION
+-------------
+Bisection ruled out the algorithm and the GCN3 DPP patch (this directory's
+gfx803-dpp-broadcast-warpreduce.patch) as suspects: standalone `tl.min`/
+`tl.sum` (N up to 1024), `tl.cumsum` (N up to 2048), the kernel's own
+outlier-gather pass (cumsum + masked scatter, full 151936-vocab, tiled),
+and the bisection `while` loop itself (standalone, full vocab, multiple k)
+all ran correctly with no hang. The SAME bisection loop wrapped in
+`for row_id in tl.range(pid, BATCH_SIZE, num_programs):` hangs -- even at
+BATCH_SIZE=1, grid=(1,) (a single program, single row, one outer-loop
+iteration). Concurrency (grid=2/4/8/32) was ruled out: all hang
+identically to grid=1 once the for-wrapper is present. A minimal
+reduction -- a trivial `while` loop (5 fixed iterations, no data
+dependency at all) nested in the same `tl.range` for-wrapper -- also
+hangs, proving the bug is structural, not specific to the real kernel's
+complexity.
+
+ROOT CAUSE
+----------
+IR diffing (`TRITON_KERNEL_DUMP=1` and `MLIR_ENABLE_DUMP=1`) on the
+minimal repro pinpoints the exact pass: `TritonAMDFoldTrueCmpI`
+(`tritonamdgpu-fold-true-cmpi`, this file's FoldTrueCmpIOp pattern). Right
+before this pass the while's condition block reads
+`%1 = arith.cmpi eq, %done_5, %c0_i32; scf.condition(%1) ...` (correct,
+matches the frontend TTIR). Right after: `scf.condition(%true) ...` -- the
+condition computation was folded to a hardcoded constant.
+
+`TritonAMDFoldTrueCmpI` trusts `TritonIntegerRangeAnalysis`'s range
+inference for `cmpIIsStaticallyTrue`. That analysis bounds its
+loop-carried-argument fixed-point iteration by `getTotalLoopTripCount`,
+which multiplies together the trip counts of a loop AND all its
+*enclosing* loops (`getEnclosingLoops`). When the while's own body
+argument lattice is visited, if the outer `scf.for`'s trip count is
+provably 1 (true here: BATCH_SIZE=1, num_programs=1, so `%row_id` ranges
+over exactly one value), the combined bound caps how many times the
+analysis will propagate the while's own back-edge (the `scf.yield` in its
+"after" region) before giving up. In the degenerate outer-trip-count=1
+case this appears to cut the while's own condition value off at its
+*initial* value before the back-edge update is ever incorporated, so a
+comparison against that initial value gets "proven" constant -- when the
+loop body genuinely updates it every iteration and the real answer is
+data-dependent. (The exact single line inside MLIR's dataflow solver where
+the back-edge contribution is dropped was not pinned down further --
+would need live debugging with a full triton build, not attempted here.)
+
+WHAT (the fix, deliberately narrow)
+------------------------------------
+Rather than touching the range-analysis internals (large, general-purpose,
+used by other passes too -- higher risk of new bugs), this patches
+`FoldTrueCmpIOp::matchAndRewrite` itself: refuse to fold a `cmpi` op that
+is the direct operand of its own enclosing `scf.while`'s `scf.condition`,
+regardless of what the range analysis claims. This is the ONE place in
+the whole pass where a wrong "provably true/false" answer is catastrophic
+(true = infinite loop, false = the loop's body -- including any writes it
+was supposed to perform -- never runs) rather than merely a missed
+optimization. Every other `cmpi` in a kernel is still eligible for
+folding.
+
+VERIFICATION (real gfx803 hardware, RX 470, 2026-08-23)
+---------------------------------------------------------
+- Minimal repro (trivial 5-iteration while nested in tl.range for): ran to
+  completion, correct value, no hang.
+- Full bisection-loop repro at grid=1 through grid=32, batch=1 through
+  batch=8: all correct pivots, no hang (previously hung at every
+  grid/batch combination once the for-wrapper was present).
+- vLLM's actual `apply_top_k_top_p_triton(logits, k, p)` called directly
+  with batch=8, vocab=151936 (the exact call that originally hung):
+  completes, correct output shape, GPU returns to idle.
+- Full end-to-end vLLM generation with the triton topk/topp path enabled
+  (no pytorch-fallback stopgap): coherent output, clean shutdown, GPU
+  idle afterward.
+
+--- a/third_party/amd/lib/Analysis/RangeAnalysis.cpp
++++ b/third_party/amd/lib/Analysis/RangeAnalysis.cpp
+@@ -799,8 +799,35 @@ struct FoldTrueCmpIOp : OpRewritePattern<arith::CmpIOp> {
+   FoldTrueCmpIOp(MLIRContext *context, DataFlowSolver *solver)
+       : OpRewritePattern(context), solver(solver) {};
+
++  // gfx803 hang, hardware-verified (rocm-gfx803 repo, 2026-08-23): when an
++  // scf.while is nested inside an scf.for whose own trip count is exactly 1,
++  // TritonIntegerRangeAnalysis's loop-trip-count-bounded fixed point stops
++  // propagating the while's "before"-region block arguments before the
++  // back-edge from the "after" region (scf.yield) is ever folded in. The
++  // loop-carried condition value is then seen only at its *initial* value,
++  // so a comparison against that initial value (the while's own exit test)
++  // gets "proven" statically true or false -- when it is neither, since the
++  // loop body genuinely updates it every iteration. Folding the while's own
++  // exit condition to a constant is uniquely dangerous among all the cmpi
++  // ops this pass touches: true means the loop never terminates, false
++  // means it never runs -- so refuse to fold a cmpi that is the operand of
++  // its own enclosing scf.while's scf.condition, regardless of what the
++  // range analysis claims. All other cmpi ops in the kernel are unaffected.
++  static bool isOwnWhileConditionOperand(arith::CmpIOp cmpOp) {
++    for (Operation *user : cmpOp.getResult().getUsers()) {
++      auto conditionOp = dyn_cast<scf::ConditionOp>(user);
++      if (!conditionOp || conditionOp.getCondition() != cmpOp.getResult())
++        continue;
++      if (isa_and_nonnull<scf::WhileOp>(conditionOp->getParentOp()))
++        return true;
++    }
++    return false;
++  }
++
+   LogicalResult matchAndRewrite(arith::CmpIOp cmpOp,
+                                 PatternRewriter &rewriter) const override {
++    if (isOwnWhileConditionOperand(cmpOp))
++      return failure();
+     if (llvm::isa<IntegerType, IndexType>(cmpOp.getType()) &&
+         cmpIIsStaticallyTrue(*solver, cmpOp)) {
+       if (failed(mlir::dataflow::maybeReplaceWithConstant(*solver, rewriter,

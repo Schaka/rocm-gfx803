@@ -1,0 +1,38 @@
+gfx803 (Polaris, GCN3): warpReduce()'s cross-row broadcast step picks
+between two DPP lowerings based on isCDNA(getISAFamily()) -- the CDNA
+branch uses DPP row_bcast:15/row_bcast:31 (both valid GCN3 instructions,
+gfx803 has FeatureDPP), the fallback (labelled "RDNA" in the source
+comment) emits ROCDL::PermlaneX16Op. v_permlanex16 is GFX10+ only and does
+not exist on gfx803 -- confirmed with `llvm-mc -mcpu=gfx803`, error
+"instruction not supported on this GPU". Every non-CDNA target (including
+GCN3, which is neither CDNA nor RDNA) fell into the permlanex16 branch and
+failed to compile any kernel exercising a >16-lane warpReduce, surfacing
+as `LLVM ERROR: Cannot select: %llvm.amdgcn.permlanex16` (hit via vLLM's
+_topk_topp_kernel, see rocm-gfx803 repo vllm-gfx803/NOTES.md, and
+rocm-gfx803/patches/triton/README.md).
+
+WHAT
+----
+- TargetInfo.cpp: warpReduce()'s DPP-broadcast branch condition becomes
+  `isCDNA(getISAFamily()) || getISAFamily() == ISAFamily::GCN3`, routing
+  GCN3 to the DPP row_bcast path instead of permlanex16.
+
+Verified on real gfx803 hardware (RX 470): standalone GEMM/reduction
+triton kernels correct (maxerr=0.0000), and downstream of this the
+FoldTrueCmpI fix in this same directory, vLLM's `_topk_topp_kernel`
+(which requires a >16-lane reduce) compiles and runs correctly.
+
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
+@@ -485,7 +485,10 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+     buf = createDppReduxOpWithBoundCtrl(valType, buf, 1 + dppCtrlRowShr,
+                                         allRows, allBanks);
+
+-    if (isCDNA(getISAFamily())) {
++    // gfx803 (GCN3) has DPP broadcast (FeatureDPP, BCAST15/31 both valid)
++    // but lacks v_permlanex16 (GFX10+ only) -- confirmed on real hardware,
++    // see rocm-gfx803 repo vllm-gfx803/NOTES.md.
++    if (isCDNA(getISAFamily()) || getISAFamily() == ISAFamily::GCN3) {
+       // row_bcast:15 row_mask:0xa
+       buf = createDppReduxOpWithBoundCtrl(
+           valType, buf, static_cast<uint32_t>(DppCtrl::BCAST15), 0xa, allBanks);

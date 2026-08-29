@@ -1,7 +1,10 @@
-From 747ef4157dd0baaaab27cac577d4bfd8d5c7c608 Mon Sep 17 00:00:00 2001
-From: Schaka <jonastanzer@gmail.com>
-Date: Tue, 11 Aug 2026 00:00:00 +0000
-Subject: [PATCH 4/4] rocblas: force WorkGroupMapping=1 for gfx803 assembly solutions
+Tensile (rocm-libraries commit cd9574023093742434e8c992d13b89ab9a6c1cf8,
+therock-7.14 / ROCm 7.14.0): force WorkGroupMapping=1 for gfx803 assembly
+solutions at the point every solution's parameters get normalized, instead
+of rewriting the WGM value in every Tensile Logic *.yaml file
+(wgm-miscompute.sh, kept alongside this patch, not removed -- see that
+script's own header for the full hardware measurements this is based on;
+not repeated here).
 
 WHY
 ---
@@ -69,7 +72,7 @@ the sed which also rewrote their (harmless) WGM entries).
 Applies to: Tensile @ rocm-libraries commit
 cd9574023093742434e8c992d13b89ab9a6c1cf8 (therock-7.14 / ROCm 7.14.0
 pin), same commit wgm-miscompute.sh already targets in this line.
----
+
 diff --git a/shared/tensile/Tensile/SolutionStructs.py b/shared/tensile/Tensile/SolutionStructs.py
 index e4a0457e70..92a941813d 100644
 --- a/shared/tensile/Tensile/SolutionStructs.py
