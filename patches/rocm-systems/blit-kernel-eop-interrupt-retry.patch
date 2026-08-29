@@ -1,3 +1,33 @@
+CORRECTION (supersedes this patch's WHY below): the mechanism described
+here -- a lost gfx7/8 EOP completion interrupt -- is not what causes the
+hang this patch was written for. Both call sites wait with
+HSA_WAIT_STATE_ACTIVE, and BusyWaitSignal::WaitRelaxed and
+InterruptSignal::WaitRelaxed alike treat ACTIVE as a pure spin on
+signal_.value; hsaKmtWaitOnEvent_Ext is only reached on the passive path.
+No interrupt participates in the wait, so no interrupt can be lost from
+it. The real cause is the missing GFXIP 7/8 double-mapped ring -- see
+patches/rocm-systems/aql-ring-queue-full-workaround.patch.
+
+That makes this mitigation not merely useless but actively harmful: it
+gives up on a packet that is still live in a ring the CP has not drained,
+and lets the process free the kernarg and signal the CP may still write
+into. That is the "device lost from bus" cascade and both full-box hard
+lockups recorded in RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md. It stays in the tree,
+still off by default, only because it was validated against a real vLLM
+workload before any of this was understood. Do not enable
+ROCR_GFX8_EOP_MITIGATION or ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US.
+
+SECOND CORRECTION (2026-08-29): the ring double-map fix pointed to above
+also does not fix the hang -- see RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md's top-of-file
+summary. The hang is VRAM-clock marginality (mining-tuned VBIOS driving
+Hynix VRAM above its rated speed), confirmed on hardware by both dropping
+MCLK to 1750MHz on the mining VBIOS and by flashing a correct-vendor
+Hynix-strapped VBIOS at its stock 1750MHz ceiling -- 64/64 and 75/75 clean
+runs respectively, versus repeated same-boot hangs before. Not a ring,
+EOP, or software bug at all.
+
+Original header follows.
+
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_kernel.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_kernel.h
 index 06cb1d0094..86540198cf 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_kernel.h

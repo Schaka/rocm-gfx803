@@ -1,15 +1,23 @@
 # Build ROCr-Runtime + libhsakmt at the gfx803 7.14 pin with the box's full
-# current patch chain (doorbell, va-reuse-defer, graph-replay-batch-chunk-
-# deadlock -- same set the main Dockerfile applies, in the same order) PLUS
-# sdma-doorbell-missing-sfence on top, to test that one new patch in
-# isolation against an otherwise-identical runtime to what's already live on
-# the box. Ships libhsa-runtime64.so* + libhsakmt.so* for swap-in on the box.
+# current patch chain, in the same order the main Dockerfile applies it, so
+# a single new patch can be tested against an otherwise-identical runtime to
+# what is already live on the box. Ships libhsa-runtime64.so* +
+# libhsakmt.so* for swap-in on the box.
+#
+# Currently on top: aql-ring-queue-full-workaround, the GFXIP 7/8
+# double-mapped AQL ring. Note it needs a kernel WITHOUT
+# REFERENCE-amdkfd-gfx7-8-queue-size-writeback -- that patch forces the HQD
+# back to the single ring size and cancels this one out.
 #
 # Build: docker build -f Dockerfile -t rocr-novad:latest .
 # Then:  docker run --rm rocr-novad:latest tar -C /out -cf - . > libhsa-novad.tar
-# Ship the tar to the gfx803 box, extract over /opt/rocm/lib/, and re-run
-# the Qwen3.5-2B repro. The bug is intermittent, so a single clean run does
-# not confirm the fix -- repeat several times before trusting it.
+# Ship the tar to the gfx803 box and extract over /opt/rocm/lib/ to pick up
+# the queue-full fix on its own merits (real queue sizes instead of the
+# 64-packet floor). It was originally built to test this patch against the
+# silent dispatch hang and the Qwen3.5-2B graph-replay hang; both were later
+# root-caused to VRAM-clock marginality instead (see RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md
+# and README.md's "Host VBIOS setting" section) -- this patch does not fix
+# either hang.
 #
 # NOT a general-purpose ROCm rebuild: only the two runtime libs are produced.
 FROM rocm/dev-ubuntu-26.04:7.14.0-full
@@ -83,21 +91,24 @@ RUN cd /rocm-systems-src && { grep -q "AqlQueue::ExecutePM4.*packet did not comp
     && grep -q "Gfx8EopMitigationMaxAttempts" projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp \
     && echo BLIT_KERNEL_EOP_RETRY_APPLIED
 
-# Third completion-wait site, same erratum: rocclr's shared WaitForSignal()
-# (device/rocm/rocvirtual.hpp) backs HIP memcpy (hipMemcpyWithStream et
-# al.) and other ROCclr dispatch waits -- unreachable/unobserved as long
-# as a preceding BlitKernel copy aborted first, so this only showed up
-# once the BAR fix routed copies around that path. Same opt-in
-# ROCR_GFX8_EOP_MITIGATION master switch, own
-# ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US (default 5000us) since this
-# function has no size/duration context to auto-pick a safe default --
-# tune it above your workload's genuinely slowest dispatch through this
-# path.
-COPY rocclr-eop-wait-mitigation.patch /tmp/
-RUN cd /rocm-systems-src && { grep -q "Gfx8EopMitigationHipTimeoutUs" projects/clr/rocclr/device/rocm/rocvirtual.hpp \
-    || git apply /tmp/rocclr-eop-wait-mitigation.patch; } \
-    && grep -q "Gfx8EopMitigationHipTimeoutUs" projects/clr/rocclr/device/rocm/rocvirtual.hpp \
-    && echo ROCCLR_EOP_WAIT_MITIGATION_APPLIED
+# The real fix for every one of those wait sites: restore the GFXIP 7/8
+# double-mapped AQL ring. Without it the CP cannot tell a full ring from an
+# empty one, parks, and never drains -- so the waits above are waiting on a
+# packet that will never be fetched. See
+# patches/rocm-systems/aql-ring-queue-full-workaround.patch.
+#
+# rocclr-eop-wait-mitigation.patch used to be applied here and is
+# deliberately not any more. It adds ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US
+# to ROCclr's WaitForSignal(), which gives up on a packet still live in a
+# ring the CP has not drained; enabling it hard-locked the whole box twice
+# (no SSH, no ping, physical power-cycle to recover). Not something to leave
+# one env var away from a validation run on real hardware.
+COPY aql-ring-queue-full-workaround.patch /tmp/
+RUN cd /rocm-systems-src && { grep -q "queue_full_workaround_" projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp \
+    || git apply /tmp/aql-ring-queue-full-workaround.patch; } \
+    && grep -q "ui32.AQLQueueMemory" projects/rocr-runtime/runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp \
+    && grep -q "MemoryRegion::AllocateDoubleMap" projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp \
+    && echo AQL_RING_QUEUE_FULL_WORKAROUND_APPLIED
 
 WORKDIR /rocm-systems-src/projects/rocr-runtime
 RUN mkdir -p build && cd build \

@@ -266,6 +266,17 @@ RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-
 # still sees it.
 RUN sh /rocm-systems-patches/blit-kernel-eop-interrupt-retry.sh /rocm-systems-src
 
+# Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
+# with the rest of gfx7/8 support. KFD still implements its half and still
+# expects the doubled size, so without this hsa_queue_create was stuck at a
+# 64-packet floor. Verified on hardware: 64 -> 131072 packets. This does
+# NOT fix the silent dispatch hang tracked as problem 1 in
+# RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md -- that turned out to be VRAM-clock
+# marginality, see the patch header and README's "Host VBIOS setting".
+# Applied last because it multiplies the legacy type-0 doorbell mask that
+# hsa-agent-rejects-legacy-doorbell.sh restores.
+RUN sh /rocm-systems-patches/aql-ring-queue-full-workaround.sh /rocm-systems-src
+
 # ROCR-Runtime first: CLR's HIP build links against it, so the patched
 # runtime has to be installed into /opt/rocm before CLR configures.
 WORKDIR /rocm-systems-src/projects/rocr-runtime

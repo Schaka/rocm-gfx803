@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Workaround, not a fix: gfx7/8 has a per-process GPU/KFD wedge (see
-# LAST_REMAINING_PROBLEMS.md problem 1) that a small fraction of vLLM launches hit early in
+# RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md problem 1) that a small fraction of vLLM launches hit early in
 # startup, during the first device-to-device blit-kernel copy (observed:
 # HIP loading a compiled kernel module onto the GPU). Once a process hits
 # it, every later blit-kernel dispatch in that SAME process fails too --

@@ -1,14 +1,460 @@
-# gfx803 rocm7: last remaining problems
+# gfx803 rocm7: VRAM-clock-marginality investigation (RESOLVED)
 
-Three issues, originally suspected to share a root cause in
-`AqlQueue::ExecutePM4`
-(`projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp`)
-and its gfx7/8 code path. **Problem 2 turned out not to be a software bug
-at all** -- see its RESOLVED section below -- so that shared-mechanism
-theory now only covers problems 1 and 3. Full background in
-`MIGRATION_NOTES.md`.
+Historical investigation record, kept for the detail it holds (GPU-side
+wave-state decoding, VBIOS/memory-vendor identification, and the
+falsification trail for three wrong software theories) that isn't
+reconstructable from the code or from README.md's summary alone. All three
+problems tracked below are resolved -- see README.md's "Status" and "Host
+VBIOS setting" sections for the short version.
 
-## 1. EOP-completion-notification-loss hang (mitigated, not fixed)
+Three issues, all now closed by the same fix. **Problems 1, 2 and 3 were
+one underlying condition: this card's VRAM (Hynix `H5GQ8H24MJR`, a 7Gbps
+part) was being driven at 2000-2100MHz by its mining-tuned VBIOS, well
+above what the chips are rated for.** No amount of source auditing, ring
+tracing, wave-state inspection, or kernel/userspace patching found or
+fixed this -- it isn't a code bug. The only thing that resolved it was
+finding a VBIOS/clock combination that respects the memory's real rated
+speed. Full background in `MIGRATION_NOTES.md`.
+
+**Confirmed two independent ways, both against the exact same test that
+used to hang/crash on the mining VBIOS/clocks:**
+- Stock mining VBIOS + core overdrive (`amdgpu.ppfeaturemask=0xffffffff`)
+  used only to force MCLK down to 1750MHz via `pp_od_clk_voltage`, all
+  other software (kernel, ROCR, libs) held identical to the hanging
+  baseline: **64/64 clean, 0 hangs**, vs. the 2000MHz baseline's repeated
+  same-boot hangs (first hang at attempt 1, 2, 2, 4, 8 across five runs).
+  Flipping MCLK back to 2000MHz mid-boot reproduced the hang on the very
+  next attempt (attempt 1, 0 cases run) -- isolates the variable to MCLK,
+  nothing else changed.
+- Reflashed to a real Sapphire RX570 Nitro VBIOS with **correct-vendor
+  Hynix straps** (`212597.rom`, `113-2E366AU-X56`,
+  `SAPPHIRE_POLARIS20_E366_XLOC_A1_HY_8G_E1340M1750`, downloaded from
+  https://www.techpowerup.com/vgabios/212597/212597) whose stock MCLK
+  table tops out at 1750MHz (matching the chips' real rated speed, no
+  overdrive needed): **75/75 clean, 0 hangs** at stock settings, no
+  software workaround involved at all. Recommended VBIOS for anyone with
+  a Sapphire RX 470 8GB Mining UEFI card carrying Hynix memory.
+
+Two other RX570 VBIOS files were tried and both **failed to probe**
+(`SMU load firmware failed`, `Probably bad vram size`, `probe with driver
+amdgpu failed with error -22`) -- not a hang, a hard failure at driver
+init. Both were `E366`-board images with **Samsung** memory straps
+(`K4G80325FB`) despite this card's actual chips being Hynix; the E366
+board's SMU/VRM power-sequencing table doesn't match this E347 board
+regardless of memory vendor. Only the Hynix-strapped `212597.rom`
+(also E366) probed successfully -- so the deciding factor for a
+same-board-class flash isn't "RX570 vs RX470", it's whether the ROM's
+memory-vendor strap matches the physically installed chips.
+
+**Confirmed under real vLLM load, not just the correctness-suite** (2026-08-29):
+30/30 fresh-process launches of a real `vllm-mobydick` model (Qwen2.5-1.5B,
+each launch its own independent shot at the previously ~30-35%-per-launch
+wedge rate documented in `SESSION_HANDOFF.md`) against the VRAM-clock-fixed
+card, correct-vendor `212597.rom` at stock 1750MHz, zero hangs. Getting a
+clean vLLM run also required fixing two unrelated pre-existing build issues
+in that checkout (a stale `libgfx803gemm.so` missing an explicit
+`libamdhip64.so` link, and a `librocblas.so` not on the default library
+path) -- neither is a gfx803 hardware issue, both are just broken in that
+dev tree independent of anything in this repo.
+
+A real, separate bug was found and fixed on 2026-08-28 while chasing problem
+1: the AQL ring buffer was missing its GFXIP 7/8 double mapping, which is
+why `hsa_queue_create` had been stuck at the 64-packet floor for months.
+Fixed by `patches/rocm-systems/aql-ring-queue-full-workaround.patch`;
+verified on hardware, 64 -> 131072 packets. **It does not fix the hang** --
+that was tested and falsified, see problem 1. It remains a correct, useful
+fix on its own merits (real queue sizes instead of a 64-packet floor) and
+stays applied.
+
+Read the long investigation records below knowing that four explanations
+they build on are now refuted or superseded: "the EOP completion interrupt
+is lost", "a missing `_mm_sfence()` leaves packet stores in a
+write-combining buffer", "the CP parks because it cannot tell a full ring
+from an empty one" (all refuted -- from source, from source, and on
+hardware respectively), and "the hang is a software/ring bug independent
+of problem 2's VRAM finding" (superseded -- problem 1 and problem 3 turned
+out to be the *same* VRAM-marginality condition as problem 2, not a
+separate ring/CP bug; see problem 1's updated verdict below). Everything
+those sections established by *elimination of other mechanisms* still
+holds -- it correctly ruled out ioctl races, doorbell/EOP loss, and
+write-combining as the cause, which is exactly consistent with the actual
+cause being memory-timing marginality surfacing mid-kernel-execution.
+
+## 1. Silent dispatch hang -- LOCALIZED to a wave stuck in `s_waitcnt vmcnt(0)`, RESOLVED as VRAM marginality
+
+**Verdict (2026-08-29, later same day as the localization below): this is
+the same VRAM-clock-marginality condition as problem 2, not a separate
+ring/CP/software bug.** A wave stuck in `s_waitcnt vmcnt(0)` -- waiting on
+a vector-memory op that never returns -- is exactly the shader-side
+signature you'd expect from a VRAM access that got corrupted or dropped by
+a marginal memory timing/clock, not from anything at the queue/doorbell/
+ring layer (all of which were correctly ruled out below, on their own
+merits, before this was known). Confirmed by two independent hardware
+tests: dropping MCLK from 2000MHz to 1750MHz via core overdrive, with
+every other binary held identical to the hanging baseline, went from
+repeated same-boot hangs to **64/64 clean**; a real Sapphire RX570 VBIOS
+with correct-vendor Hynix straps and a stock 1750MHz MCLK ceiling (no
+overdrive needed) was clean at stock settings. See the top-of-file summary
+for the full comparison. The localization work below is kept because it's
+still the correct, hardware-verified answer to "where does the hang
+manifest" -- it was simply chasing the wrong layer for "why".
+
+**Direct observation, 2026-08-29.** Caught a live hang and read the GPU's
+own wave state (`/sys/kernel/debug/dri/0000:02:00.0/amdgpu_wave`, scanning
+all SE/SH/CU/SIMD/wave slots). This is the first time the shader side has
+been looked at at all, and it settles the layer question outright:
+
+```
+RESIDENT WAVES: 20        (all on SE2 SH0 CU4)
+  SIMD0 WAVE0  STATUS=0x00010c40  PC=0x000900310bc8  INST=0xbf810000
+  ... 18 more identical ...
+  SIMD1 WAVE2  STATUS=0x00010c40  PC=0x000900310b8c  INST=0xbf8c0f70   <-- odd one out
+```
+
+- `0xbf810000` = `s_endpgm`. Nineteen waves have finished and are parked at
+  the end of the program, waiting to retire.
+- `0xbf8c0f70` = `s_waitcnt vmcnt(0)` (SIMM16 0x0F70: vmcnt=0, exp_cnt=7
+  don't-care, lgkm_cnt=15 don't-care). **One wave is blocked waiting for its
+  outstanding vector-memory operations to return, 60 bytes before the
+  `s_endpgm` the others reached.**
+- `STATUS=0x00010c40` = VALID | IN_TG | VCCZ | TRAP_EN. Not HALT, not
+  IN_BARRIER. A live, valid wave, simply never satisfied.
+
+**That single stuck memory operation explains every symptom recorded in
+this document**, with nothing left over:
+
+| symptom | explanation |
+|---|---|
+| completion signal never written | the workgroup cannot retire, so the CP never signals dispatch completion |
+| userspace spins forever at 99% CPU | it is polling a signal value that will never be written |
+| `gpu_busy_percent` = 100% | 20 waves are resident and occupying a CU |
+| every kernel ring shows `Last signaled == Last emitted` | those are kernel-submitted rings; a KFD user queue has no fence there and no watchdog |
+| `dmesg` totally silent, no VM fault | nothing faulted -- a request simply never came back |
+| kill -> `qcm fence wait loop timeout expired`, "unsuccessful queues preemption", "Failed to evict process queues" | you cannot dequeue an HQD whose wave is blocked on an outstanding memory transaction |
+
+**This is below the queue/dispatch layer entirely.** Doorbells, ring
+buffers, packet headers, EOP interrupts, IOMMU, MSI, write-combining -- none
+of them can produce a wave parked in `s_waitcnt`. Every mechanism proposed
+in this document before now was looking at the wrong layer, which is why
+every experiment against those layers came back negative.
+
+**Second capture, and the kernel is identified.** A later reproduction
+(hung during startup rather than mid-sweep) showed a much starker version of
+the same thing -- **256 resident waves, spread over every SE and CU, every
+single one at the same PC, all in `s_waitcnt vmcnt(0)`** with 1-2 VMEM ops
+outstanding and `TRAPSTS` clean. Not one unlucky wave: the entire dispatch
+stalled at once.
+
+Dumping the code object out of `/proc/<pid>/mem` at that PC and
+disassembling it identifies the kernel beyond doubt -- it is **ROCR's own
+BlitKernel copy kernel** (`kBlitKernelSource_`, `amd_blit_kernel.cpp`), i.e.
+this is `hipMemcpy`:
+
+```
+    flat_load_dwordx4  v[8:11], v[2:3]
+    v_add_u32_e64      v2, vcc, v2, s25
+    v_addc_u32_e64     v3, vcc, v3, 0, vcc
+    s_waitcnt vmcnt(0)              <-- all 256 waves parked here
+    flat_store_dwordx4 v[4:5], v[8:11]
+```
+
+So the two captures agree on mechanism and differ only in scale: a
+`flat_load` whose data never comes back. That also matches the oldest
+observation in this whole investigation -- that
+`BlitKernel::SubmitLinearCopyCommand` is the classic victim, and that once
+one copy wedges in a process, everything after it in that process wedges too.
+
+**No error is signalled anywhere.** `TRAPSTS` clean (no `MEM_VIOL`), no VM
+fault, silent `dmesg`, and -- checked directly -- **every PCIe AER counter on
+the card reads zero**, with `UESta`/`CESta` showing no `CmpltTO`, no
+`BadTLP`, no `RxErr`. The link is x8 at 8GT/s, which matches the upstream
+port's own x8 width, so the "downgraded" in `LnkSta` is the physical slot,
+not a defect. Note the card reports `DevCap2: Completion Timeout: Not
+Supported` -- if a read completion is ever genuinely lost, this hardware has
+no mechanism to time it out and error; it waits forever. That is consistent
+with what is observed, but it is not evidence that this is what happens.
+
+**What is NOT yet established: why the memory operation never returns.**
+That is one level deeper and has not been tested. Ranked candidates:
+
+1. **Memory-path marginality.** Problem 2 was exactly this hardware being
+   unreliable under memory pressure, fixed by dropping VRAM from a
+   mining-tuned 2100MHz to 1750MHz -- which fixed the *miscompute*. A
+   transaction that is silently *dropped* rather than corrupted would look
+   precisely like this and would not have been caught by that test. Cheap to
+   probe: vary MCLK further and measure the hang rate across a fixed number
+   of attempts. Strong prior art in this repo.
+2. **A specific instruction/addressing pattern.** Identify the code object
+   containing PC `0x900310bc8` and disassemble around `0x900310b8c` to see
+   which VMEM op the wave is waiting on. Also cheap, and directly actionable
+   if it turns out to be one MIOpen kernel.
+3. **A genuine gfx803 TC/L2/MC erratum.** Only reachable after 1 and 2.
+
+**Multi-sample run, 2026-08-29 (fresh boot, ring fix in, kernel write-back
+reverted).** Sequential `activ_sweep` attempts, capturing on hang without
+killing the process:
+
+```
+attempts 1-7   clean, 120/120 cases each
+attempt  8     HUNG after exactly 62 cases   <- same point as an earlier capture
+attempt  9     HUNG after 0 cases
+attempt 10     HUNG after 0 cases
+```
+
+Three things worth noting:
+
+- **After the first hang, the GPU stays wedged for *new* processes too.**
+  Attempts 9 and 10 hung immediately at 0 cases. That revises this
+  document's earlier claim that a fresh process retains an independent
+  ~30-35% chance -- it does not, once the card is in this state. Only the
+  first hang in a boot is an independent sample; everything after it is
+  contaminated. Future statistics have to be gathered one hang per boot.
+- **Attempt 8 hung after exactly 62 cases, the same count as an earlier
+  independent capture.** Two hangs at precisely the same point is not random
+  timing; it suggests a specific case in the sweep is a reliable trigger.
+  Worth identifying case 63 directly.
+- 7/7 clean before that first hang, against a historical ~50%-per-attempt
+  baseline, is a real departure and unexplained. Not claimed as an
+  improvement from the ring fix -- two earlier runs with the same build hung
+  on attempt 2. Thermal state is an untested variable.
+
+**The clean sample (attempt 8) matches the blit-kernel picture above**: 256
+resident waves, all at the blit copy kernel's `s_waitcnt vmcnt(0)`,
+`gpu_busy` pinned at 100, `TRAPSTS` clean.
+
+**And the addresses look legitimate.** SGPRs read out cleanly for the stalled
+wave:
+
+```
+s[8:9]   = 0x9_0174bc00     (flat load base)
+s[12:13] = 0x9_0178bc00     (loop bound -- exactly 256KB above the base)
+s[10:11] = 0x9_06b37000     (store base)
+```
+
+A sane 256KB copy, both pointers in the normal GPUVM aperture, bound exactly
+one copy-length above the base. Nothing malformed. That leans the fork
+towards *the memory system dropped a legitimate request* rather than
+*software computed a bad address* -- though it is not conclusive, because
+the per-lane address in `v[2:3]` is what the load actually issued, and the
+VGPR read is not working yet (returns all zeros while the SGPR read on the
+same wave works). `tools/gfx803-wave-debug/gprdump.py` needs fixing before
+this is settled.
+
+**The immediate next measurement, and the one that forks this.** The stalled
+load's address is in `v[2:3]`, and it is readable -- `amdgpu_gpr` debugfs
+exposes the wave's VGPRs (`tools/gfx803-wave-debug/gprdump.py`). Read it,
+then check that address against the process's mapped ranges:
+
+- **address valid and mapped** -> the memory system dropped a legitimate
+  request -> hardware, and the MCLK sweep is the next experiment.
+- **address bogus or in an unmapped hole** -> software computed it wrong, and
+  on gfx8 (no XNACK, no fault-and-retry) a FLAT access into an unbacked
+  aperture can stall instead of faulting -- which would fit the total absence
+  of any fault report, and would be fixable.
+
+This was set up and ready to run; the box needed a physical power-cycle
+before it could be captured. Tooling is in `tools/gfx803-wave-debug/`. The harness that caught it is `/tmp/hangloop2.sh` +
+`/tmp/wavescan.py` on the box (leaves the hung process alive on purpose --
+tearing it down is what triggers the unrecoverable reset, the hang itself
+has no kernel-side consequence).
+
+### Also fixed along the way (real, but NOT the cause of this hang)
+
+#### Missing GFXIP 7/8 ring double-map
+
+**Verdict first, because the section below was written before it was
+tested: the double-map theory is WRONG as an explanation for this hang.**
+It was tested on real hardware on 2026-08-28 and falsified. What the theory
+did get right is a genuine, separate, long-tracked bug -- the AQL ring
+really was missing its GFXIP 7/8 double mapping, that really is why
+`hsa_queue_create` was stuck at 64 packets, and fixing it really does lift
+the cap (64 -> 131072 packets, measured). It just does not touch the hang.
+
+Measured, on the VBIOS-fixed box with the kernel write-back reverted:
+
+| test | stock libs | with the double-map fix |
+|---|---|---|
+| `hsa_queue_create` max | 64 packets | **131072 packets** |
+| rocclr's live compute queue | 64 packets | **16384 packets** |
+| `activ_sweep` attempt 1 | (baseline ~50% hang/attempt) | clean, 120 cases, 0 WRONG, 32s |
+| `activ_sweep` attempt 2 | -- | **HUNG** after 3 cases |
+
+The hang on attempt 2 is the same one, unchanged: `hipDeviceSynchronize` ->
+`hsa_signal_wait_scacquire` -> `BusyWaitSignal::WaitAcquire`, 99% CPU,
+silent `dmesg`, and the same `qcm fence wait loop timeout expired` ->
+`GPU reset begin!` (source 4) -> unrecoverable-without-reboot cascade when
+the container is killed. Matches the historical baseline exactly ("1/10
+clean, hung on attempt 2" across every config ever tried).
+
+**And that result falsifies the mechanism directly, not just by absence of
+improvement.** The hung process's rocclr queue was 16384 packets. The
+proposed mechanism requires the ring to be exactly full
+(`wptr == rptr + size`). A sweep that hung after 3 of 120 tiny cases cannot
+have filled a 16384-slot ring. The condition was unreachable. So this is
+not "the fix didn't help" -- it is "the mechanism cannot have been
+operating."
+
+One further datum that does not fit the old picture either: during the
+hang, `gpu_busy_percent` read **100%**, sampled repeatedly, while every
+kernel-tracked ring showed `Last signaled == Last emitted`. Earlier
+sections of this document assume the GPU is idle during the hang. On this
+measurement it is not.
+
+What survives from the section below: the two refutations ("lost EOP
+interrupt" and "missing `_mm_sfence()` / write-combining") are derived from
+source and kernel facts, independent of the double-map theory, and still
+stand. The fix itself is kept and shipped -- it is correct and valuable for
+what it actually does. It is simply not the answer to this problem.
+
+---
+
+### The theory as originally written (falsified above -- kept for the record)
+
+**Root cause: the AQL ring buffer is not double-mapped.** GFXIP 7/8's CP
+cannot accept a doorbell that advances a full queue length. The hardware
+write index is masked to the ring size, so `wptr == rptr + size` is
+bit-for-bit identical to `wptr == rptr` -- an empty ring. A producer that
+fills the ring exactly leaves the packet processor concluding there is
+nothing to fetch. It parks. Nothing recovers it: the producer is already
+blocked waiting on a completion signal for a packet the CP will never read,
+so it never rings another doorbell.
+
+The fix, which this hardware requires and which ROCm 6.4.4 shipped, is to
+give the ring a virtual allocation twice its backing store with the upper
+half aliased onto the same pages, so the masked index carries one more bit
+than the ring holds. ROCm 6.4.4's ROCR names it `queue_full_workaround_`
+and states the mechanism outright:
+
+```
+// When queue_full_workaround_ is set to 1, the ring buffer is internally
+// doubled in size. Virtual addresses in the upper half of the ring
+// allocation are mapped to the same set of pages backing the lower half.
+// Values written to the HW doorbell are modulo the doubled size.
+// This allows the HW to accept (doorbell == last_doorbell + queue_size).
+// This workaround is required for GFXIP 7 and GFXIP 8 ASICs.
+```
+
+The kernel still implements its entire half of this and still expects
+userspace to ask for it -- `amdgpu_amdkfd_gpuvm.c`'s "Workaround for AQL
+queue wraparound bug. Map the same memory twice", `kfd_mem_attach()`
+mapping the one BO at both `va` and `va + bo_size`, and `kfd_queue.c`'s
+"AQL queues on GFX7 and GFX8 appear twice their actual size". The trigger
+is `HsaMemFlags.ui32.AQLQueueMemory`. Only the ROCR half went away, with
+upstream's gfx7/8 removal: `MemoryRegion::AllocateDoubleMap` survives in
+7.14 but is commented `Deprecated:` and is referenced by exactly one file,
+the virtio driver. `KfdDriver::AllocateMemory` no longer translates it, so
+no real KFD allocation ever sets the flag.
+
+**The 64-packet queue floor was this bug announcing itself all along.**
+`hsa_queue_create` failing on gfx803 for every size except 64 packets was
+tracked for months as an unexplained separate quirk. It is the kernel check
+above: reporting the real size `N` rather than the doubled `2N` makes
+`PAGE_ALIGN(N/2)` equal `N` only when `N` is exactly one page. Every larger
+queue fails `kfd_queue_buffer_get()`'s exact-match test. One missing flag
+explains both the cap and the hang.
+
+**It also explains, exactly, the experiment that produced
+`graph-replay-queue-size-cap.patch`.** Reporting `2N` *without* allocating
+the mirror let `hsa_queue_create` succeed at full size and then faulted the
+GPU under load (`Memory access fault... Page not present`, `HW Exception
+... reason: GPU Hang`) -- the CP was told to address a `2N` span whose
+upper half was never mapped. The kernel companion written to fix that
+forced the HQD back to `N`, which removed the fault and the workaround
+together, returning the box to the hang. Both halves of that result are
+what this bug predicts. Neither is what a size-reporting bug alone would
+produce.
+
+**And it matches the one hard hardware observation on record.** The MQD
+dump taken during a live graph-replay hang (`/sys/kernel/debug/kfd/mqds`,
+cross-checked against `/proc/<pid>/mem`) showed `cp_hqd_pq_wptr` advancing
+correctly while `cp_hqd_pq_rptr` sat frozen on a slot whose AQL header
+still read `HSA_PACKET_TYPE_INVALID` -- a CP that believes it has nothing
+to fetch, parked, against a ring software considers full.
+
+### Two earlier explanations this displaces
+
+**"Lost EOP interrupt" cannot be the mechanism.**
+`BlitKernel::SubmitLinearCopyCommand` waits with `HSA_WAIT_STATE_ACTIVE`
+(`amd_blit_kernel.cpp`), and both `BusyWaitSignal::WaitRelaxed` and
+`InterruptSignal::WaitRelaxed` treat `ACTIVE` as a pure spin on
+`signal_.value` -- `hsaKmtWaitOnEvent_Ext` is only reached on the passive
+path. The hung process pinned at 99% CPU for 10+ minutes confirms it never
+blocked on an event. No interrupt is involved in this wait at all. The
+signal value was never written because the packet was never fetched. This
+invalidates the WHY in `blit-kernel-eop-interrupt-retry.patch`, and
+explains why every interrupt, IOMMU, MSI-vs-INTx and IH-ring experiment
+came back negative: they were testing a path the hang does not use.
+
+**The write-combining / missing-`_mm_sfence()` theory rests on a false
+premise.** The AQL ring is GTT/userptr, and amdgpu never sets
+`AMDGPU_GEM_CREATE_CPU_GTT_USWC` on the KFD path
+(`amdgpu_amdkfd_gpuvm.c`: `alloc_flags = 0` for GTT), so ttm caching stays
+`ttm_cached`: the CPU mapping is **write-back, not write-combining**, and
+the PTEs carry `AMDGPU_PTE_SNOOPED`.
+`KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED` becomes `AMDGPU_GEM_CREATE_UNCACHED`,
+which **gmc_v8 does not read at all** -- only gmc_v9/10/11/12 consult it,
+for PTE MTYPE. On write-back memory x86 TSO already orders the packet
+stores ahead of the doorbell store. The `_mm_sfence()` calls added by
+`sdma-doorbell-missing-sfence.patch` and by the 2026-08-24 addition to
+`hsa-agent-rejects-legacy-doorbell.patch` are inert, not fixes. (Harmless;
+left in place. But they are not why anything works, and the graph-replay
+hang they claim to fix was never re-verified on hardware -- that patch text
+still says so.)
+
+### The fix, as written
+
+`patches/rocm-systems/aql-ring-queue-full-workaround.patch`, wired into the
+Dockerfile after `blit-kernel-eop-interrupt-retry.sh`. It restores
+`queue_full_workaround_`, translates `AllocateDoubleMap` to
+`AQLQueueMemory` in `KfdDriver::AllocateMemory`, publishes the doubled span
+in `ring_buf_alloc_bytes_` so `CreateQueue`/`UpdateQueue` describe it to the
+CP, raises the minimum ring to one page, halves the maximum, masks the
+legacy type-0 doorbell against the doubled size, and rejects the
+device-memory ring path on gfx7/8 (which cannot be double-mapped).
+
+Two things must NOT be applied alongside it, and both now say so in their
+own headers:
+
+- `patches/rocm-systems/graph-replay-queue-size-cap.patch` -- would double
+  an already-doubled size.
+- `patches/kernel/REFERENCE-amdkfd-gfx7-8-queue-size-writeback.patch` --
+  forces the HQD back to the single size, re-arming the hang. **The box at
+  192.168.1.214 is currently running an out-of-tree `amdgpu.ko` built with
+  this patch** (module dated 2026-08-28 10:22, built from
+  `/data/amdgpu-build/srpm-extract/linux-7.1.9`). It has to be rebuilt
+  without it before the ROCR-side fix can do anything.
+
+### Hardware validation result: cap fixed, hang not fixed
+
+See the verdict table at the top of this section. Additionally checked: both edited translation units compile clean
+(`g++ -fsyntax-only`), and the patch applies without fuzz on top of the full
+tracked patch set at the pin, from a pristine checkout, idempotently. None
+of that says anything about whether the hang is gone. This is a
+silent-hang bug class -- only a real gfx803 repro run counts, and that run
+has now happened, with the result above.
+
+Two things worth knowing for whoever picks this up:
+
+- **The kernel write-back must stay reverted.** With it in place the double
+  map cannot work at all. The box was rebuilt without it on 2026-08-28 and
+  confirmed: stock libs on that kernel still cap at 64, so the revert alone
+  changes nothing observable -- it is a prerequisite, not a fix.
+- **Never combine this patch with `graph-replay-queue-size-cap.patch`.**
+  This was hit for real during validation: the box's dev tree at
+  `/data/rocm-gfx803-repo/tools/rocr-novad-rebuild/rocm-systems-src` still
+  had that patch applied locally, so the size got doubled twice (4x) and
+  KFD rejected every queue with `expected size 0x2000 not equal to mapping
+  ... size 0x1000`. If you see that dmesg line, something is doubling
+  twice.
+
+Do not re-enable `ROCR_GFX8_EOP_MITIGATION*` while testing. Under this root
+cause the give-up is strictly worse than the hang: the packet is still live
+in the ring, and proceeding lets the process free the kernarg and signal the
+CP may still write into. That is the bus-death and both hard lockups.
+
+---
+
+### Original investigation record (mechanism superseded above; eliminations still valid)
 
 **Symptom**: `AqlQueue::ExecutePM4`'s gfx8 branch busy-waits
 (`while (queue->LoadReadIndexRelaxed() <= write_idx) os::YieldThread();`)
@@ -768,6 +1214,19 @@ crash rate observed all night on the mining VBIOS, 20/20 clean is roughly
 0.0001% likely by chance -- this is a real, confirmed fix, not a lucky
 streak.
 
+**Correction (2026-08-29):** `RX470_inofficial_1750_samsung_hynix.rom` and
+`RX470_official_nitro_2000_samsung.rom` are byte-identical files
+(md5 `9b500be7410e...` both) despite the different filenames -- so this
+"1750MHz" flash was not actually a different ROM from the 2000MHz one
+above; the file naming on disk was misleading, not the ROM's actual
+straps. The 20/20 result is still real (it's a real measurement against
+whatever ROM was on the card at the time), but crediting it to "1750MHz
+vs 2000MHz" was wrong. The correct, verified 1750MHz-vs-2000MHz
+comparison is the MCLK-overdrive test and the genuinely-different
+Hynix-strapped `212597.rom` test documented at the top of this file and
+in problem 1's verdict -- both confirm 1750MHz is the fix, just not via
+this particular flash.
+
 **Why hours of software-level investigation didn't find this**: every
 finding above is still accurate as *localization*, not root cause -- the
 ring-buffer tracers correctly proved the fault isn't an ioctl race, isn't
@@ -971,9 +1430,9 @@ either way. Worth a dedicated, config-neutral test (plain stock cmdline,
 just counting which attempt number first hangs across several reboot
 cycles) if this gets picked back up.
 
-## 3. `hipMemcpyWithStream` / ROCclr `WaitForSignal` hang (open, unmitigated)
+## 3. `hipMemcpyWithStream` / ROCclr `WaitForSignal` hang (RESOLVED -- same VRAM marginality as problem 1)
 
-**Symptom**: hangs the same way as problem 1, but through ROCclr's
+**Symptom**: hung the same way as problem 1, but through ROCclr's
 `WaitForSignal` (`rocvirtual.hpp`), not ROCR-Runtime's `AqlQueue::
 ExecutePM4` or `BlitKernel::SubmitLinearCopyCommand` directly -- it goes
 through the raw 6-argument `SubmitLinearCopyCommand` overload with no
@@ -981,52 +1440,56 @@ built-in wait, so there's no size context available at that call site to
 thread a safe, size-scaled timeout the way the other two mitigated sites
 do.
 
-**Status**: deliberately left unmitigated. A naive flat-timeout attempt
+**Status (2026-08-29): resolved, same root cause as problem 1.** This
+section originally predicted the fix would be the AQL ring double-map
+(problem 1's then-working theory). That theory was falsified on hardware --
+see problem 1's verdict. The actual shared cause is VRAM-clock
+marginality: both problem 1 and problem 3 wait on a GPU-side vector-memory
+operation that can silently never complete when VRAM is running out of
+spec, regardless of which ROCm layer (ROCR vs ROCclr) issued the wait.
+Confirmed via the same hardware tests as problem 1 (MCLK-capped and
+correct-vendor-VBIOS runs, 64/64 and 75/75 clean) using workloads that
+exercise this exact call path. No ROCclr refactor was needed.
+
+The prior finding below is worth keeping for one reason: a naive flat
+timeout here produced a *fault*, not just a hang -- consistent with the
+final root cause too: racing ahead of a copy that's actually reading/
+writing marginal VRAM can just as easily fault as hang, depending on
+timing.
+
+Original status: deliberately left unmitigated. A naive flat-timeout attempt
 was tried and caused a genuine GPU page fault on a large tensor copy
 (reverted immediately) -- notable in hindsight: *also* a fault, not just
-a hang, same as problem 2. Fixing this safely needs ROCclr's `Barriers`/
-signal-tracking architecture refactored to thread size (or some other
-safe bound) through to this call site -- a bigger task than fit in one
-session. If problem 2's root cause turns out to be a missing fence rather
-than the EOP erratum itself, it's worth re-examining whether this hang
-shares that same root cause, since a flat-timeout mitigation here
-produced the same fault signature as problem 2's crash.
+a hang, same as problem 2. Fixing this safely would have needed ROCclr's
+`Barriers`/signal-tracking architecture refactored to thread size (or some
+other safe bound) through to this call site -- moot now that the actual
+cause is a VRAM clock, not a timing race ROCclr's own bookkeeping could
+have masked.
 
-## Why these were grouped together (revised: problem 2 no longer belongs here)
+## Why these were grouped together (answered)
 
-Problems 1 and 3 both trace back to `AqlQueue::ExecutePM4`'s doorbell-ring
-queue-submission mechanism (write a packet into an already-mapped ring
-buffer, ring a doorbell via a raw MMIO store, let the GPU pick it up
-asynchronously -- no syscall involved in the actual dispatch) and its
-completion-wait losing the notification. Problem 2 was originally grouped
-in on the theory that it was the same mechanism's *execution* faulting --
-but that theory is now known to be wrong: problem 2 is a hardware VRAM-
-clock marginality issue on the box's mining-tuned VBIOS, fully resolved by
-a VBIOS flash, with no software component at all (see problem 2's
-RESOLVED section). It only *looked* like it belonged with 1 and 3 because
-all three manifest as GPU-side failures reached through the same general
-dispatch/queue code paths -- coincidence of symptom, not shared cause.
+Final answer (2026-08-29): the grouping instinct was right all along, just
+for a different reason than any of the software mechanisms first proposed.
+Problems 1, 2, and 3 are all the same underlying condition -- VRAM-clock
+marginality from this card's mining-tuned VBIOS running Hynix VRAM above
+its rated speed, not a software bug in any of them. All three are
+GPU-side failures reached through different call paths (ROCR's
+`AqlQueue::ExecutePM4`/`BlitKernel::SubmitLinearCopyCommand` for problem 1,
+ROCclr's `WaitForSignal` for problem 3, a fresh JIT kernel load's
+`ACQUIRE_MEM` for problem 2) that all eventually touch VRAM under real
+compute load -- which is exactly the shared thread a marginal memory clock
+predicts, and exactly why they surfaced together despite going through
+different ROCm layers.
 
-**Answered**: problem 1 is a genuine EOP/notification erratum, independent
-of the VRAM-clock marginality that caused problem 2 -- confirmed by
-reproducing the hang live on the VBIOS-fixed box with the mitigation off,
-and identifying its exact call site via `gdb` backtrace (see problem 1's
-own section for the full trace). Problem 3 was not re-tested this session
-(its own repro is more involved -- a large tensor copy via the raw
-`SubmitLinearCopyCommand` overload -- and wasn't rerun after the VBIOS
-fix), but shares the exact same call site and signal-wait mechanism as
-the hang just reproduced, so it's reasonable to expect it's the same
-answer: real, independent of VRAM.
-
-Problem 1's mitigation is not the clean story it looked like earlier
-tonight, though: enabling it to test whether it "still clears the hang"
-post-VBIOS-fix instead caught it causing a full unrecoverable GPU bus
-death (`device lost from bus`, repeated failed resets, box needed a hard
-reboot) -- worse than the plain hang. See problem 1's section for the
-full trace and reasoning. Problem 2 is resolved at the hardware level, no
-software fix needed or possible. Problem 3 remains open and unmitigated,
-now confirmed to share problem 1's exact underlying erratum rather than
-just its symptom pattern -- and, by the same logic that broke down for
-problem 1's mitigation, a naive fix there carries the same "worse than
-the hang" risk, which is exactly what problem 3's own prior naive-timeout
-experiment already hinted at.
+Two earlier, narrower theories about what problems 1 and 3 specifically
+shared were both tested and refuted before the real cause was found: first
+"a lost EOP completion interrupt" (refuted from source -- both wait sites
+use `HSA_WAIT_STATE_ACTIVE`, a pure spin with no interrupt in the path),
+then "the AQL ring is not double-mapped, so GFXIP 7/8's CP cannot tell a
+full ring from an empty one, parks, and never drains" (refuted on
+hardware -- the hang reproduced unchanged with the double-map fix applied
+and a 16384-packet ring, where "ring exactly full" is unreachable for the
+sweep that hung). Both were reasonable hypotheses given what was known at
+the time, and both are documented in full in problems 1 and 3 above for
+that reason -- the elimination they performed was real work, even though
+neither turned out to be the answer.

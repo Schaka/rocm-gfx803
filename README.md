@@ -91,46 +91,83 @@ diffed and consciously merged back together -- see "Convergence" below.
   full `tools/correctness-suite/` (23 MIOpen op/solver sweeps) passes clean,
   including `pool_sweep`, which used to crash intermittently (~50% of runs)
   with a real GPU VM fault. Root-caused to a **hardware** issue, not
-  software: this card's mining-tuned VBIOS ran VRAM at 2100MHz, above its
-  actual correctness margin. Reflashing to a non-mining VBIOS running VRAM
-  at 1750MHz fixed it outright -- 20/20 clean runs, vs ~50% crashing before.
-  See "Host VBIOS setting" below and `LAST_REMAINING_PROBLEMS.md` for the
-  full investigation.
-ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
-   against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
-   separate real regressions from generic upstream gaps. One confirmed
-   gfx803-specific regression (the `attention_*_gqa_with_past_and_present_expanded`
-   tests, traced to the rocBLAS strided-batched gemm GSU workspace-reuse
-   miscompute) was root-caused and fixed via the sgemm-shim's new
-   strided-batched interceptor -- see `MIGRATION_NOTES.md`. One regression
-   remains open (`ConvTranspose`, traced to an upstream MIGraphX bug, not
-   gfx803-specific). Real-model
-   validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
-   HIP-accelerated) all pass with correct transcripts on real audio.
-- **vLLM on gfx803: deprioritized/discontinued.** A long investigation
-  into intermittent hangs (gfx7/8 EOP-completion-notification-loss
-  erratum, mitigated with a bounded retry gated behind
-  `ROCR_GFX8_EOP_MITIGATION=1`; a separate missing-SFENCE doorbell bug,
-  fixed unconditionally via `sdma-doorbell-missing-sfence.patch`) still
-  leaves one call path (`hipMemcpyWithStream` / ROCclr's `WaitForSignal`)
-  hanging with no safe mitigation available without a real ROCclr
-  refactor. See `MIGRATION_NOTES.md` for the full investigation, and
-  `LAST_REMAINING_PROBLEMS.md` problem 1 for the deepest dive (exact
-  packet-level localization of the hang, and the investigation's closing
-  status). **Do not enable `ROCR_GFX8_EOP_MITIGATION=1` outside a
-  disposable test environment**: caught in a follow-up session causing a
-  full, unrecoverable GPU bus death (`device lost from bus`, box needed a
-  hard reboot) via `hipMemcpy` racing ahead of a still-in-flight SDMA job;
-  a later attempt at the same fix idea against a different call site
-  (`ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`, an untracked patch) caused a
-  *worse* failure -- a full system hard lockup with no network response
-  at all, reproduced twice, requiring physical power-cycles to recover
-  both times. This hang is currently unresolved with no known safe
-  mitigation; the investigation into it is closed for now.
-  `llama.cpp`/HIP remains the recommended, working inference path on this
+  software: this card's mining-tuned VBIOS ran VRAM above its actual rated
+  speed. Capping VRAM clock to 1750MHz fixed it outright -- 20/20 clean
+  runs, vs ~50% crashing before, later reconfirmed at 75/75 with a
+  correct-vendor VBIOS flash. This same root cause also explained the
+  long-standing vLLM hang -- see "Host VBIOS setting" below and
+  `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full investigation.
+
+  ORT's own `onnx_backend_test_series.py` (3828 tests) run and diffed
+  against both the 6.4.4 line and a gfx1201 (mainline ROCm 7) image to
+  separate real regressions from generic upstream gaps. One confirmed
+  gfx803-specific regression (the `attention_*_gqa_with_past_and_present_expanded`
+  tests, traced to the rocBLAS strided-batched gemm GSU workspace-reuse
+  miscompute) was root-caused and fixed via the sgemm-shim's new
+  strided-batched interceptor -- see `MIGRATION_NOTES.md`. One regression
+  remains open (`ConvTranspose`, traced to an upstream MIGraphX bug, not
+  gfx803-specific). Real-model
+  validation (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp, all
+  HIP-accelerated) all pass with correct transcripts on real audio.
+- **vLLM on gfx803: RESOLVED -- same VRAM-clock marginality as `pool_sweep`
+  above, not a software bug.** Months of investigation had refuted three
+  proposed software mechanisms (lost EOP completion interrupt; missing
+  `_mm_sfence()`/write-combining ring; and, on hardware, the missing GFXIP
+  7/8 ring double-map) without finding the real cause. It turned out to be
+  the same mining-VBIOS VRAM clock as `pool_sweep`'s crash, just manifesting
+  as a hang (a GPU-side wave parked in `s_waitcnt vmcnt(0)`, waiting on a
+  vector-memory op that never returns) instead of a fault. Confirmed on
+  hardware two independent ways: dropping MCLK from 2000MHz to 1750MHz via
+  core overdrive on the mining VBIOS (64/64 clean, vs. repeated same-boot
+  hangs before), and flashing a correct-vendor Hynix-strapped VBIOS at its
+  stock 1750MHz ceiling, no overdrive needed (75/75 clean). See "Host VBIOS
+  setting" below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full
+  investigation and the shader-side wave-state capture that finally
+  localized it.
+
+  Confirmed under real vLLM load, not just the correctness-suite: 30/30
+  fresh-process launches of a real `vllm-mobydick` model (Qwen2.5-1.5B)
+  against the VRAM-clock-fixed card, versus a documented ~30-35% per-launch
+  wedge rate before. Getting there also required two unrelated build-time
+  fixes in that vLLM checkout, worth knowing about if you hit them
+  independently of any GPU issue: its prebuilt `libgfx803gemm.so` was
+  missing an explicit link to `libamdhip64.so` (`undefined symbol:
+  __hipPopCallConfiguration` at dlopen) -- recompile from
+  `gfx803_gemm_lib_final.hip` with the ROCm 7.14 `hipcc`, not the stray
+  system one; and `librocblas.so` needs `LD_LIBRARY_PATH=/opt/rocm/core-7.14/
+  lib` since it isn't on the default search path in that environment.
+
+  **Fixed along the way, and worth having on its own even though it did not
+  turn out to be the hang's cause:** the AQL ring really was missing its
+  GFXIP 7/8 double mapping, which is why `hsa_queue_create` was capped at 64
+  packets. `patches/rocm-systems/aql-ring-queue-full-workaround.patch`
+  restores it -- verified on hardware, 64 -> 131072 packets, a 2048x
+  increase, which also removes the constraint behind
+  `graph-replay-batch-chunk-deadlock.patch`. It requires a kernel WITHOUT
+  `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and must never be combined
+  with `graph-replay-queue-size-cap.patch`.
+
+  **Do not enable `ROCR_GFX8_EOP_MITIGATION=1` or
+  `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`.** They give up on a packet the
+  CP has not consumed. Caught causing a full unrecoverable GPU bus death
+  (`device lost from bus`), and the HIP-timeout variant hard-locked the whole
+  box with no network response, twice, needing physical power-cycles. That
+  finding stands regardless of the VRAM-clock fix -- both remain a real way
+  to lose the whole box, not just the one process.
+
+  `llama.cpp`/HIP remains a working, well-tested inference path on this
   hardware -- confirmed via a rebuild against the latest patch chain and
-  clean `llama-bench` runs (no hangs across 3 runs), without this
-  mitigation enabled.
+  clean `llama-bench` runs (no hangs across 3 runs). vLLM is now also viable
+  once the card's VRAM clock is confirmed within spec (see "Host VBIOS
+  setting").
+
+  **Still open, unrelated to the above**: a hybrid Mamba/GDN-attention model
+  (Qwen3.5-2B) hangs vLLM's engine-init memory-profiling pass on this same
+  box -- confirmed *not* the GPU hang (GPU stays 0% busy throughout, unlike
+  every instance of the real wedge, which sits at 100% busy and needs a
+  reboot). Looks like a host-side deadlock in the Triton GDN kernel's
+  JIT/launch path, specific to this model's architecture and this
+  `vllm-mobydick` checkout. Untouched by this investigation; next up.
 - **rocm6.4.4**: hardware-verified, the longer-running of the two lines. See
   `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
 - **therock-experimental**: EXPERIMENTAL, not hardware-verified, a third
@@ -229,24 +266,54 @@ on any gfx803 host until proven otherwise on that specific board. See
 `tools/host-setup/` for a working `setpci`-based systemd unit for boards
 where BIOS/firmware won't actually hand ASPM control to Linux.
 
-## Host VBIOS setting: mining-tuned VRAM clocks cause random GPU VM faults
+## Host VBIOS setting: mining-tuned VRAM clocks cause random GPU faults and hangs
 
-At least one gfx803 card in use with this repo shipped with a mining-tuned
-VBIOS running VRAM (MCLK) at 2100MHz. Under a correctness-checked compute
-workload (`tools/correctness-suite/pool_sweep`) this produced an
-intermittent (~50% of runs), deterministic-address GPU VM fault that took
-hours of software-level investigation (ioctl tracing, PM4 dispatch
-tracing, kernel-side TLB-flush review, delay-based mitigation across three
-orders of magnitude) to correctly rule out as a driver/software bug --
-mining workloads tolerate occasional VRAM bit errors that a
-correctness-checked one won't surface until it's already returned wrong
-results or faulted. Reflashing to a non-mining VBIOS running VRAM at
-1750MHz (via `amdvbflash`'s force-flash mode -- see
-`LAST_REMAINING_PROBLEMS.md` for the exact ROM and flash procedure)
-resolved it completely: 20/20 clean runs afterward, vs ~50% crashing
-before. Check VRAM clock (`cat
-/sys/class/drm/card*/device/pp_dpm_mclk`) against the card's actual rated
-spec before assuming a gfx803 GPU-fault report is a software bug.
+At least one gfx803 card in use with this repo (Sapphire RX 470 8GB Mining
+UEFI, Hynix `H5GQ8H24MJR` VRAM) shipped with a mining-tuned VBIOS running
+VRAM (MCLK) at 2000-2100MHz -- above what a 7Gbps-rated Hynix chip is
+actually spec'd for. Under a correctness-checked compute workload this
+produced two symptoms that both took real investigation to correctly rule
+out as driver/software bugs (ioctl tracing, PM4 dispatch tracing,
+kernel-side TLB-flush review, GPU-side wave-state capture via debugfs --
+see `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full investigation on both):
+
+- `tools/correctness-suite/pool_sweep`: an intermittent (~50% of runs),
+  deterministic-address GPU VM fault.
+- vLLM and other sustained-load workloads: an intermittent, unrecoverable
+  hang -- a wave parked forever in `s_waitcnt vmcnt(0)`, waiting on a
+  vector-memory op that never returns. Killing the stuck process fails a
+  KFD queue eviction and needs a reboot.
+
+Mining workloads tolerate occasional VRAM bit errors that a
+correctness-checked or long-running one won't -- it'll eventually surface
+as a fault, a hang, or (worse) silently wrong results.
+
+**Fix: flash a VBIOS whose VRAM clock matches the installed memory's real
+rated speed**, via `amdvbflash`'s force-flash mode (`amdvbflash -f -p 0
+<rom>`; always dump/keep the existing ROM first). Confirmed on hardware two
+independent ways:
+
+- Keeping the card's own mining VBIOS but capping MCLK to 1750MHz via core
+  overdrive (`amdgpu.ppfeaturemask=0xffffffff` + `pp_od_clk_voltage`):
+  64/64 clean runs, vs. repeated same-boot hangs/crashes at 2000MHz with
+  every other binary held identical.
+- Flashing a real Sapphire RX570 Nitro VBIOS with correct-vendor Hynix
+  straps (`113-2E366AU-X56`, downloaded from
+  https://www.techpowerup.com/vgabios/212597/212597) whose stock MCLK table
+  tops out at 1750MHz, no overdrive needed: 75/75 clean runs at stock
+  settings. This is the recommended fix for anyone with the same
+  Sapphire RX 470 8GB Mining UEFI card and Hynix memory -- no software
+  workaround required at all.
+
+Two other RX570 VBIOS files with **Samsung** straps (wrong vendor for this
+card's Hynix chips) failed to probe entirely (`SMU load firmware failed`,
+`probe with driver amdgpu failed with error -22`) rather than hang -- a
+different, harder failure mode. Match the VBIOS's memory-vendor strap to
+the physically installed chips, not just the card model/VRAM size.
+
+Check VRAM clock (`cat /sys/class/drm/card*/device/pp_dpm_mclk`) against
+the card's actual rated spec before assuming a gfx803 GPU fault or hang
+report is a software bug.
 
 ## What needs real gfx803 hardware to validate, and what doesn't
 

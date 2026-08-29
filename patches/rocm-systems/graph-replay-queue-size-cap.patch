@@ -1,3 +1,28 @@
+SUPERSEDED -- DO NOT APPLY. Kept for the record only.
+
+This patch reported double the real AQL ring size to KFD without allocating
+the mirror that makes the doubled size true, which is why it needed a kernel
+companion to undo its own effect on the HQD, and why on its own it faulted
+the GPU under load. Both halves of that are now understood: the missing
+piece was never the reported size, it was
+HsaMemFlags.ui32.AQLQueueMemory. patches/rocm-systems/
+aql-ring-queue-full-workaround.patch restores the flag, and the doubled
+report falls out of it for free (ring_buf_alloc_bytes_ is doubled after the
+allocation, so CreateQueue is told the real, genuinely-mapped span).
+
+Applying this patch on top of that one would double an already-doubled size
+and reintroduce exactly the fault it was written to work around. Its kernel
+companion, REFERENCE-amdkfd-gfx7-8-queue-size-writeback.patch, must not be
+loaded either -- see that file.
+
+For the record, aql-ring-queue-full-workaround.patch does not fix the
+silent dispatch hang either -- see RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md's
+top-of-file summary. The hang is VRAM-clock marginality (mining-tuned
+VBIOS driving Hynix VRAM above its rated speed), confirmed on hardware
+2026-08-29.
+
+Original header follows.
+
 ROCR-Runtime (optional, NOT applied by the main Dockerfile -- see WHY):
 report double the real AQL ring size to KFD for GFX7/8 compute queues, so
 `hsa_queue_create` can actually get the sizes it asks for instead of

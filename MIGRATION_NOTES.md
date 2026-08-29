@@ -84,6 +84,48 @@ The Dockerfile builds HIP only (`CLR_BUILD_OCL=OFF`); the OpenCL patch is
 applied (harmless) but the OCL runtime itself isn't built, since this
 stack doesn't use it.
 
+### AQL ring queue-full workaround: `hsa_queue_create` stuck at a 64-packet floor
+
+`hsa_queue_create` failed with `HSA_STATUS_ERROR_OUT_OF_RESOURCES` for
+every requested queue size except a hard floor of 64 AQL packets, while
+`HSA_AGENT_INFO_QUEUE_MAX_SIZE` reported a normal 131072 -- the agent
+wasn't the thing capping it. Root-caused via `kfd_queue_acquire_buffers()`
+(`drivers/gpu/drm/amd/amdkfd/kfd_queue.c`): for GFX7/8 AQL compute queues
+it validates the ring against `expected_queue_size = PAGE_ALIGN(queue_size
+/ 2)` -- the kernel's own comment: "AQL queues on GFX7 and GFX8 appear
+twice their actual size". Upstream deleted the userspace half of that
+contract (`HsaMemFlags.ui32.AQLQueueMemory` -> `MemoryRegion::
+AllocateDoubleMap`, which actually double-maps the ring's upper VA half
+onto the same physical pages) along with the rest of gfx7/8 support, while
+KFD kept expecting it. Every queue size above 1 page silently failed the
+kernel's exact-match check; only 64 packets happened to round-trip through
+`PAGE_ALIGN(size/2)` correctly.
+
+Fix: restore `queue_full_workaround_` -- request `AllocateDoubleMap` from
+the driver, and report the doubled span back to `CreateQueue` so KFD's own
+halving lands on the real allocation. Verified on hardware: max queue size
+64 -> 131072 packets, rocclr's live compute queue 64 -> 16384, a real
+2048x increase. This also removes the constraint
+`graph-replay-batch-chunk-deadlock.patch` exists to work around.
+
+This patch was originally written believing it also explained the
+long-standing gfx803 silent dispatch hang (a GFXIP 7/8 CP-can't-tell-a-
+full-ring-from-an-empty-one theory). That was tested on hardware and is
+false -- the hang reproduced unchanged with this patch applied and a
+16384-packet ring, where the mechanism it addresses is unreachable. The
+hang's actual cause was VRAM-clock marginality in the test hardware's
+mining-tuned VBIOS, unrelated to this fix -- see README.md's "Host VBIOS
+setting" section. This patch is still correct and still shipped, on its
+own merits, for the queue-size fix alone.
+
+Files: `patches/rocm-systems/aql-ring-queue-full-workaround.{patch,sh}`.
+Requires a kernel WITHOUT the reference
+`REFERENCE-amdkfd-gfx7-8-queue-size-writeback` patch (which forces the HQD
+back to the single, un-doubled ring size and cancels this fix out), and
+must never be combined with the superseded
+`graph-replay-queue-size-cap.patch` (double-doubles the reported size and
+faults the GPU under load).
+
 ## Layer 3: rocBLAS
 
 Two patches carried over from the 6.4.4 line; one intentionally not
@@ -363,37 +405,38 @@ vLLM. Full chain:
    ~30-35% clean-run baseline with the mitigation alone. Not shipped.
 
 6. **Follow-up session: `ROCR_GFX8_EOP_MITIGATION=1` caught causing a
-   full GPU bus death, worse than the hang it mitigates.** After a
-   separate hardware fix (mining-VBIOS VRAM marginality -- see the
-   `pool_sweep` section above and `LAST_REMAINING_PROBLEMS.md` problem 2),
-   re-verified whether this mitigation was still needed. It is -- the hang
-   reproduced cleanly with it off, live `gdb` backtrace confirming the
-   exact `BlitKernel::SubmitLinearCopyCommand` call site. But testing with
-   the mitigation *on* went worse: its bounded give-up-and-proceed logic
-   let a `hipMemcpy` return early while its SDMA job was still genuinely
-   in flight; the calling process then exited and closed its device fd,
-   and the *kernel's own* `drm_sched_entity_flush` wait (unrelated to and
-   not bounded by this userspace mitigation) blocked on that same
-   still-outstanding job. Enough real time passed for the kernel's own
-   ring-timeout watchdog to fire a GPU reset, which failed repeatedly
-   (`device lost from bus`, `GPU Recovery Failed: -19`, 405+ times) until
-   the GPU was permanently wedged off the PCIe bus, unrecoverable short of
-   a full reboot. Full trace and reasoning in `LAST_REMAINING_PROBLEMS.md`
-   problem 1. Doesn't retract the mitigation (it's still off by default,
-   and item 5 above already validated it against real vLLM traffic) but
-   does mean "settled defaults" oversold how safe this is against every
-   call pattern -- specifically anything doing a blocking copy shortly
-   before process/context teardown.
+   full GPU bus death, worse than the hang it mitigates.** Testing with
+   the mitigation *on* went worse than off: its bounded give-up-and-proceed
+   logic let a `hipMemcpy` return early while its SDMA job was still
+   genuinely in flight; the calling process then exited and closed its
+   device fd, and the *kernel's own* `drm_sched_entity_flush` wait
+   (unrelated to and not bounded by this userspace mitigation) blocked on
+   that same still-outstanding job. Enough real time passed for the
+   kernel's own ring-timeout watchdog to fire a GPU reset, which failed
+   repeatedly (`device lost from bus`, `GPU Recovery Failed: -19`, 405+
+   times) until the GPU was permanently wedged off the PCIe bus,
+   unrecoverable short of a full reboot. This finding stands regardless of
+   anything below: do not enable `ROCR_GFX8_EOP_MITIGATION=1` or
+   `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US` outside a disposable test
+   environment.
 
-**Decision: vLLM support for gfx803 is being deprioritized/discontinued.**
-The accumulated hang/fault surface across `BlitKernel`, `AqlQueue`, and
-`hipMemcpyWithStream` -- one of which (item 4) can't be safely mitigated
-without a real ROCclr refactor -- makes vLLM not reliably usable on this
-hardware. `llama.cpp` remains a viable, working inference path (see final
-regression pass below) and is the recommended path forward for gfx803
-going forward. This was an explicit decision made with the repo owner,
-not a unilateral call -- if vLLM support is ever revisited, start from
-item 4 above.
+**Superseded: the "deprioritize vLLM" decision above no longer holds.**
+Items 1-6 correctly investigated and documented real software-level
+behavior (the EOP mitigation's own failure mode, the missing SFENCE, the
+unmitigated ROCclr call path) -- that work is accurate and the mitigations
+above are still shipped. But none of it was the actual cause of the
+underlying hang. A later investigation (2026-08-29) found the real cause:
+VRAM-clock marginality in the test hardware's mining-tuned VBIOS, the same
+condition also responsible for the `pool_sweep` GPU VM fault documented
+below. Confirmed on hardware: with a VBIOS/clock combination that respects
+the installed VRAM's real rated speed, 30/30 fresh-process vLLM launches
+completed clean, versus the ~30-35% per-launch wedge rate this
+investigation measured. vLLM is viable on gfx803 once the card's VRAM
+clock is confirmed within spec -- see README.md's "Host VBIOS setting"
+section for the general warning and fix, and the AQL ring queue-full
+workaround above for the one real software fix that came out of this
+investigation (does not fix this hang, but is a correct fix in its own
+right).
 
 ## ldconfig silently reverting the patched libamdhip64/libhiprtc/
 ## libhiprtc-builtins back to stock
@@ -466,7 +509,8 @@ exception to the previously-claimed clean 23/23 pass.
 **Root cause identified in a follow-up session: hardware, not software.**
 Extensive tracing (ioctl-level, PM4-dispatch-level, kernel TLB-flush
 review, delay-based mitigation) ruled out every software explanation --
-see `LAST_REMAINING_PROBLEMS.md` problem 2 for the full investigation.
+see `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` problem 2 for the full
+investigation.
 The actual cause: this card's mining-tuned VBIOS ran VRAM (MCLK) at
 2100MHz, above its real correctness margin -- a clock mining workloads
 tolerate occasional bit errors at, but this correctness-checked workload
@@ -476,7 +520,7 @@ VBIOS. No software fix exists in this repo for this issue because there
 was never a software bug -- see `README.md`'s "Host VBIOS setting"
 section.
 
-## Final regression pass (this session, before vLLM deprioritization)
+## Final regression pass (this session)
 
 Run against `rocm-gfx803:rocm7-regression`, a rebuild of the main
 Dockerfile (with the ldconfig fix above, `sdma-doorbell-missing-sfence`,
