@@ -61,7 +61,7 @@ rocm-gfx803/
 ├── Dockerfile                  # ROCm 10.0 (TheRock), the primary/actively-developed line
 ├── patches/                    # gfx803 patches against the 10.0 pin
 ├── vllm/                       # the gfx803 vLLM hard fork, moved to the 10.0 line
-│                               #   (was under rocm7.14/; re-targeting to the 10.0 stack)
+│                               #   (was under rocm7.14/; targets the 10.0 stack)
 ├── tools/                      # correctness-suite, host-setup, etc. (shared across lines)
 ├── verify.py
 ├── MIGRATION_NOTES.md          # the 10.0 line's investigation log

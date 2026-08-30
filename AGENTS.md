@@ -200,15 +200,18 @@ value in maintaining a separate history to eventually reconcile. Don't
 `git submodule add` it or try to reconnect it to that remote without
 being told to.
 
-The fork moved to the **10.0 root line** when the 7.14 line was archived
-under `rocm7.14/` (2026-08-29). It is being **re-targeted from the 7.14
-stack to the 10.0 stack**: the prebuilt `libgfx803gemm.so`/`libgfx803attn.so`
-currently link the 7.14 `hipcc` and `librocblas.so` is picked up via
-`LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`; on 10.0 those become `core-10.0`
-and the kernels must be recompiled with the 10.0 `hipcc` (the `.so` linkage
-is stack-specific). Re-verify on hardware after re-targeting -- the box's
-editable vLLM install tracks whichever ROCm stack the box runs, so the
-re-target happens when the box moves to 10.0.
+The fork lives at the **10.0 root line** (moved there when the 7.14 line
+was archived under `rocm7.14/`, 2026-08-29) and **targets the 10.0 stack
+by assumption**: the hand-written gfx803 kernels
+(`vllm/vllm/gfx803_kernels/*.hip`) are version-agnostic source compiled
+once with the stack's own `hipcc --offload-arch=gfx803` (see each loader's
+docstring for the exact invocation), and `librocblas.so` resolves through
+the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
+compiled `.so` files are built on the box next to their loaders and never
+committed, so nothing stack-specific is pinned in this repo. Hardware
+validation of vLLM on the 10.0 stack is pending -- the box's editable vLLM
+install tracks whichever ROCm stack the box runs, so validating means
+building the kernels on a 10.0 box install and running vLLM there.
 
 **It is not built from this repo's Dockerfile** (vLLM runs as a box-only
 editable install), and it is **not documented via `.patch.md` files under

@@ -148,17 +148,19 @@ back together -- see "Convergence" below.
 
 ### vLLM on gfx803
 
-The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line),
-moved there when the 7.14 line was archived. It is being re-targeted from
-the 7.14 stack to the 10.0 stack: the prebuilt `libgfx803gemm.so`/
-`libgfx803attn.so` currently link the 7.14 `hipcc` and `librocblas.so` is
-picked up via `LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`; on 10.0 those
-become `core-10.0` and the kernels must be recompiled with the 10.0 `hipcc`
-(the `.so` linkage is stack-specific). Re-verify on hardware after
-re-targeting -- the box's editable vLLM install tracks whichever ROCm stack
-the box runs, so the re-target happens when the box moves to 10.0. The full
-investigation and tuning notes for the 7.14-era state are in
-`rocm7.14/README.md`.
+The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line).
+It targets the **ROCm 10.0 stack** and is assumed to work against it: the
+hand-written gfx803 kernels (`vllm/vllm/gfx803_kernels/*.hip`) are
+version-agnostic source, compiled once with the stack's own
+`hipcc --offload-arch=gfx803 -O3 -shared -fPIC` (see each loader's
+docstring for the exact invocation), and `librocblas.so` resolves through
+the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
+compiled `.so` files are built on the box next to their loaders, never
+committed -- so there is nothing stack-specific pinned in this repo; a
+fresh build on the 10.0 stack just works. Hardware validation of vLLM on
+the 10.0 stack is pending (the box's editable vLLM install tracks whichever
+ROCm stack the box runs); the full investigation and tuning notes for the
+7.14-era state are in `rocm7.14/README.md`.
 
 ## Building
 
