@@ -1,0 +1,127 @@
+CLR (rocclr) D2H copy routing (gfx803): never write a pinned or
+registered/locked host buffer directly from the copy engine -- force the
+GPU-staging path (GPU staging buffer + CPU memcpy) for D2H copies.
+
+WHY
+---
+torch `.cpu()`/`.to('cpu')` D2H copies under alloc/free churn fault on
+gfx803 (7.14 and 10.0 alike, same torch 2.13) with "Memory access fault
+... Page not present" (write from TC). Root cause: the copy engine
+(blit/copy shader or SDMA) writes the pinned/registered host destination
+directly, and on gfx803 the engine's stores to host memory drain from L2
+to the host buffer only after the copy's completion -- a system-scope
+release fence does not change that on this hardware. The write-back
+therefore races the host buffer's unlock/teardown and faults on the
+removed mapping.
+
+Isolation: the fault needs a D2H copy into host memory under churn.
+A plain compute kernel writing the same registered host buffer is clean
+(scalar and vectorized stores), so it is specifically the copy engine's
+host write. Disabling host pinning (GPU_PINNED_MIN_XFER_SIZE huge /
+GPU_PINNED_XFER_SIZE=0) forces the staging path and the fault disappears;
+the pinned path faults 5/5 with both the shader copy (HSA_ENABLE_SDMA=0)
+and the SDMA copy (GPU_FORCE_BLIT_COPY_SIZE=0). Minimal repro:
+hipHostRegister a pageable buffer, hipMemcpy D2H into it, unregister,
+repeated with device alloc/free churn -- faults within a few rounds,
+fault address inside the registered buffer's GPUVM mapping.
+
+WHAT
+---
+Force the existing GPU-staging D2H path for all copies whose destination
+is host memory:
+
+- DmaBlitManager::readBuffer and KernelBlitManager::readBuffer: pass
+  kEnablePin=false to getBuffer so a pageable destination is copied into a
+  GPU staging buffer and landed by the CPU memcpy, never written directly
+  by the copy engine.
+- submitReadMemory (ReadMemoryCommand): when the destination resolves to a
+  registered/locked host buffer (hostMemory != nullptr), route through the
+  staged readBuffer instead of the accelerated copyBuffer.
+- copyMemory (CopyMemoryCommand): when the destination is
+  host-memory-direct-access, route through the staged readBuffer instead of
+  copyBuffer.
+
+The staging path is the same one the codebase already falls back to, and
+is correct on this hardware: the GPU writes its own staging buffer (whose
+mapping the fmm keeps alive) and the CPU memcpy lands the data, so no
+engine write is ever outstanding against the host buffer's lifetime. This
+costs an extra copy, which is the correct trade -- the direct host write
+is broken on gfx803.
+
+Applies AFTER graph-replay-batch-chunk-deadlock.patch (the rocvirtual.cpp
+hunk offsets assume its chunk-size change is present).
+
+VERIFIED ON REAL HARDWARE (gfx803 box, 2026-08-30): spliced into a
+10.0 image -- dblcpu churn 8/8 clean (was 5/5 faults), regchurn (the
+hipHostRegister minimal repro) 8/8 clean (was 10/10 faults), dcheck 8/8
+data-correct, GEMM numerics ~1e-6, correctness sweeps unchanged.
+diff --git a/projects/clr/rocclr/device/rocm/rocblit.cpp b/projects/clr/rocclr/device/rocm/rocblit.cpp
+--- a/projects/clr/rocclr/device/rocm/rocblit.cpp
++++ b/projects/clr/rocclr/device/rocm/rocblit.cpp
+@@ -52,7 +52,12 @@ bool DmaBlitManager::readBuffer(device::Memory& srcMemory, void* dstHost,
+     const_address addrSrc = gpuMem(srcMemory).getDeviceMemory() + origin[0];
+     address addrDst = reinterpret_cast<address>(dstHost);
+     constexpr bool kHostToDev = false;
+-    constexpr bool kEnablePin = true;
++    // GFX803: never pin the host destination for a D2H copy -- the copy
++    // engine's stores to a pinned host buffer drain from L2 after the copy
++    // completes and fault once the pin is unlocked (page not present, write
++    // from TC). Force the GPU-staging path: the copy writes a GPU staging
++    // buffer and the CPU memcpy below lands the data.
++    constexpr bool kEnablePin = false;
+     if (!hsaCopyStagedOrPinned(addrSrc, addrDst, copySize, kHostToDev, copyMetadata, kEnablePin)) {
+       LogError("DmaBlitManager:: readBuffer copy failure!");
+       return false;
+@@ -2155,7 +2160,9 @@ bool KernelBlitManager::readBuffer(device::Memory& srcMemory, void* dstHost,
+ 
+       while (totalSize > 0) {
+         BufferState outBuffer = {0};
+-        constexpr bool kEnablePin = true;
++        // GFX803: never pin the host destination for a D2H copy (see
++        // DmaBlitManager::readBuffer); force the GPU-staging path.
++        constexpr bool kEnablePin = false;
+         constexpr bool kFirstTx = false;
+         getBuffer(static_cast<const_address>(dstAddr + stagedCopyOffset), totalSize, kEnablePin,
+                   kFirstTx, outBuffer);
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -2856,9 +2866,17 @@ void VirtualGPU::submitReadMemory(amd::ReadMemoryCommand& cmd) {
+         size.c[0] *= elemSize;
+       }
+       if (hostMemory != nullptr) {
+-        // Accelerated transfer without pinning
+-        amd::Coord3D dstOrigin(offset);
+-        result = blitMgr().copyBuffer(*devMem, *hostMemory, origin, dstOrigin, size,
++        // GFX803: do NOT write the (registered/locked) host buffer directly
++        // from the copy engine. The engine's stores to host memory drain
++        // from L2 after the copy's completion and a system-scope fence does
++        // not change that on this hardware, so the write-back races the
++        // buffer's unlock/teardown and the GPU faults (page not present,
++        // write from TC -- confirmed on 7.14 and 10.0; a plain compute
++        // kernel writing the same buffer is clean). Route through the staged
++        // readBuffer: the copy writes a GPU staging buffer and a CPU memcpy
++        // lands the data, so no engine write is ever outstanding against the
++        // host buffer's lifetime.
++        result = blitMgr().readBuffer(*devMem, dst, origin, size,
+                                       cmd.isEntireMemory(), cmd.copyMetadata());
+       } else {
+         result = blitMgr().readBuffer(*devMem, dst, origin, size, cmd.isEntireMemory(),
+@@ -3216,7 +3234,15 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
+         realSize.c[0] *= elemSize;
+       }
+ 
+-      result = blitMgr().copyBuffer(*srcDevMem, *dstDevMem, realSrcOrigin, realDstOrigin, realSize,
+-                                    entire, copyMetadata);
++      if (dstDevMem->isHostMemDirectAccess()) {
++        // GFX803: same as submitReadMemory -- a D2H copy into a
++        // registered/locked host buffer must go through the staged
++        // readBuffer, not the copy engine writing the host buffer directly.
++        result = blitMgr().readBuffer(*srcDevMem, dstMem.getHostMem(), realSrcOrigin,
++                                      realSize, entire, copyMetadata);
++      } else {
++        result = blitMgr().copyBuffer(*srcDevMem, *dstDevMem, realSrcOrigin, realDstOrigin,
++                                      realSize, entire, copyMetadata);
++      }
+       break;
+     }

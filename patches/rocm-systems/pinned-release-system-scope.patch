@@ -1,0 +1,68 @@
+CLR (rocclr) rocvirtual.cpp (gfx803): make the pinned-memory-release
+marker a system-scope barrier so the pinned buffer is unlocked only after
+the copy shader's writes have drained from L2.
+
+WHY
+---
+A torch `.cpu()`/`.to('cpu')` D2H copy on gfx803 faults with "Memory
+access fault ... Page not present" (write from TC) under alloc/free churn,
+on both the 7.14 and 10.0 lines (same torch 2.13; the 6.4.4 line does not
+fault and is data-correct). Bisected to the CLR's pinned D2H path:
+KernelBlitManager::readBuffer pins the pageable host destination
+(hsa_amd_memory_lock) and a blit/copy shader writes that pinned buffer
+directly. The pinned buffer is then released via
+SchedulePinnedMemoryRelease, whose marker dispatched a NOP barrier
+(kCacheStateIgnore): the marker's CL_COMPLETE fires when the copy kernel
+retires, but the shader's TC stores to the pinned host buffer drain from
+L2 to host memory only at a system-scope boundary. The subsequent
+hsa_amd_memory_unlock (mapping removal) therefore races the write-back,
+and the GPU's late drain faults on the now-unmapped page.
+
+Controlled evidence: disabling host pinning (GPU_PINNED_MIN_XFER_SIZE
+huge, or GPU_PINNED_XFER_SIZE=0) forces the clean staging path (copy
+shader writes a GPU staging buffer; the fmm keeps it mapped) and the fault
+disappears 3/3; the pinned path faults 5/5 on the same loop. The sync
+(else) branch of addPinnedMem already does releaseGpuMemoryFence() before
+release -- a system-scope barrier plus CPU wait -- which is exactly what
+the async marker path was missing.
+
+WHAT
+---
+SchedulePinnedMemoryRelease's marker gets kCacheStateSystem instead of
+kCacheStateIgnore. submitMarker's kCacheStateSystem branch dispatches
+kBarrierPacketHeader (HSA_FENCE_SCOPE_SYSTEM acquire+release), whose
+completion signal fires only after the L2 has been flushed to system
+scope -- so by the time CL_COMPLETE runs ReleasePinnedMemoryCallback and
+unlocks the pinned buffer, no shader write to it can still be in flight.
+This is the same fence the codebase already relies on elsewhere
+(dispatchBarrierPacket(kBarrierPacketHeader), releaseGpuMemoryFence).
+
+gfx803-family-specific only in that gfx803 is where the race was
+confirmed; the unflushed-marker-vs-pinned-unlock ordering is generic CLR
+code, so the fix is strictly safer on every line.
+
+VERIFIED ON REAL HARDWARE (gfx803 box, 2026-08-30): the D2H churn fault
+is fixed by the combination of this patch with va-reuse-defer-mapping and
+d2h-staged-copy; on its own it only makes the batch-pinned-release marker
+ordering safe (a system-scope barrier before the pinned buffer is
+unlocked).
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -3621,5 +3631,15 @@ void VirtualGPU::SchedulePinnedMemoryRelease(amd::HostQueue& queue,
+     return;
+   }
+ 
+-  marker->setCommandEntryScope(amd::Device::kCacheStateIgnore);
++  // The marker must carry a SYSTEM-scope release fence, not the default
++  // kCacheStateIgnore NOP barrier: the pinned buffer this callback releases
++  // was just written by a blit/copy shader whose TC stores to it drain from
++  // L2 to host memory only at a system-scope boundary. A NOP-barrier
++  // completion fires before that drain, so the subsequent
++  // hsa_amd_memory_unlock (mapping removal) races the write-back and the
++  // GPU faults with "page not present" on gfx803 (confirmed via a
++  // repeatable torch .cpu()/D2H churn fault). The kCacheStateSystem branch
++  // in submitMarker dispatches a system-scope barrier whose completion
++  // implies the L2 flush finished, so the release below is safe.
++  marker->setCommandEntryScope(amd::Device::kCacheStateSystem);
+   constexpr bool kNonBlockingCallback = false;

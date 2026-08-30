@@ -1,0 +1,88 @@
+libhsakmt fmm.c (follow-on to va-reuse-defer.patch, gfx803): restore the
+defer window's mapping-alive promise that the hsa-runtime's free path
+defeats.
+
+WHY
+---
+va-reuse-defer.patch parks a freed object on a bounded FIFO ("the parked
+object keeps its BOs ALIVE (mapping + content intact) for the whole
+window") so a lagging access to the freed buffer is tolerated the way
+stock gets it from near-instant VA+phys reuse. That promise is broken on
+every line that carries the defer: the hsa-runtime's KfdDriver::FreeMemory
+calls hsaKmtUnmapMemoryToGPU BEFORE hsaKmtFreeMemory, so by the time the
+free reaches __fmm_release's park branch the GPU page-table entries are
+already gone (mapping_count == 0). The park then withholds the VA from the
+free list (good -- that is the gfx803 miscompute fix) but the object is
+reserved-but-unmapped. Any GPU access to a parked VA -- a lagging in-flight
+reader, or the late tail of a chunked copy -- now faults with
+"Page not present" instead of being tolerated, because stock's tolerance
+(recycle the VA and let the new owner remap it before the next touch) is
+exactly what the withholding removes.
+
+Reproduced as a hard, repeatable GPU page fault (write from TC, page in
+free VA space just past the most recently freed block) with a torch
+`x.double().cpu()` alloc/free churn loop on BOTH the 7.14 and 10.0 lines
+(same torch 2.13 source; 6.4.4, which recycles VAs immediately, does not
+fault and is data-correct). The write that faults is a legitimate late
+access of the class the defer is explicitly designed to tolerate -- not an
+OOB kernel -- so the correct fix is to make the defer actually keep the
+mapping alive, not to hunt the (correct) kernel. Isolated to the fmm with
+a minimal HIP repro: allocate + write a buffer, hipFree it, then write it
+again from a kernel; with the park unmapped this faults, with the remap
+below it writes the parked object's still-resident pages.
+
+WHAT
+---
+In __fmm_release's park branch, re-establish the GPU mapping the hsa
+runtime already removed, guarded on mapping_count == 0 (only when the
+unmap actually happened; a second release of an already-parked object is
+already a no-op via the deferred flag, and a still-mapped object needs no
+remap). _fmm_map_to_gpu is the same path the allocator used to create the
+mapping; it re-issues MAP_MEMORY_TO_GPU for each handle and sets
+mapping_count = 1. The KFD driver flushes the GPU TLB on map, so the
+re-established mapping is immediately visible. fmm_do_release() still
+tears the mapping down for real when the object ages out of the FIFO, so
+nothing leaks: a parked object occupies its VRAM and its VA exactly as the
+defer always intended.
+
+This is gfx803-family-specific only in that the defer itself exists for
+gfx803; the unmap-first is generic hsa-runtime code, so the fix is a
+strictly stronger version of the existing patch's intent on every line.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE against 10.0 -- source applies and
+reads correctly, but the parktest / churn-loop repro has not been re-run
+against a rebuild with this hunk yet.
+diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
+--- a/projects/rocr-runtime/libhsakmt/src/fmm.c
++++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
+@@ -209,6 +209,10 @@
+ };
+ 
+ static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object);
++static HSAKMT_STATUS _fmm_map_to_gpu(HsaKFDContext *ctx,
++			manageable_aperture_t *aperture,
++			void *address, uint64_t size, vm_object_t *obj,
++			uint32_t *nodes_to_map, uint32_t nodes_array_size);
+ 
+ /* A freed allocation whose VA is being withheld from reuse for a short while.
+  * The KV object is kept in the aperture tree (so the area stays reserved and
+@@ -2425,5 +2429,19 @@
+ 		 * lagging in-flight readers from faulting.
+ 		 */
+ 		object->deferred = true;
++		/* KfdDriver::FreeMemory (the hsa-runtime) calls
++		 * hsaKmtUnmapMemoryToGPU before it calls hsaKmtFreeMemory, so
++		 * by the time a free reaches the defer here its GPU mapping is
++		 * already gone (mapping_count == 0, PTEs removed). Re-establish
++		 * it: the defer window's whole point is to keep the VA mapped so
++		 * a lagging access to the freed buffer is tolerated (stock gets
++		 * the same tolerance from near-instant VA+phys reuse), and a
++		 * parked-but-unmapped VA turns any such access into a hard page
++		 * fault. fmm_do_release() tears the mapping down for real when
++		 * the object ages out of the window.
++		 */
++		if (object->mapping_count == 0)
++			_fmm_map_to_gpu(ctx, aperture, object->start,
++					object->size, object, NULL, 0);
+ 		fmm_defer_release(ctx, aperture, object);
+ 	}

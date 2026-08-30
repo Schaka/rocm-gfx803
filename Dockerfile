@@ -247,6 +247,27 @@ RUN sh /rocm-systems-patches/sdma-doorbell-missing-sfence.sh /rocm-systems-src
 # 52-shape harness") for the validation data.
 RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 
+# va-reuse-defer-mapping: va-reuse-defer keeps the deferred object's VA
+# reserved but the hsa-runtime's KfdDriver::FreeMemory unmaps the GPU PTEs
+# BEFORE hsaKmtFreeMemory reaches the fmm, so parked objects end up
+# reserved-but-unmapped and any lagging access to a freed buffer faults.
+# This re-establishes the mapping in the park branch, restoring the
+# defer's "keep the VA mapped through the window" promise. See the patch
+# header for the full WHY (root-caused via a repeatable torch
+# convert+D2H churn page fault on gfx803, 7.14 and 10.0 alike).
+RUN sh /rocm-systems-patches/va-reuse-defer-mapping.sh /rocm-systems-src
+
+# pinned-release-system-scope: gfx803 D2H churn page fault. torch's
+# .cpu()/.to('cpu') pins the pageable host destination and a copy shader
+# writes it directly; the pinned-buffer release marker dispatched a NOP
+# barrier (kCacheStateIgnore), whose completion fires before the shader's
+# TC stores drain from L2, so the hsa_amd_memory_unlock (mapping removal)
+# raced the write-back and the GPU faulted. Making the marker a
+# system-scope barrier (kCacheStateSystem) delays the unlock until the L2
+# flush finished. See the patch header for the full WHY (bisected via
+# GPU_PINNED_* env controls: staging path clean, pinned path faults).
+RUN sh /rocm-systems-patches/pinned-release-system-scope.sh /rocm-systems-src
+
 # HIP graph-replay batch dispatch deadlock: gfx803's HW queue caps out at
 # 64 packets (see graph-replay-batch-chunk-deadlock.patch's WHY -- root
 # cause of the small queue itself still under investigation), far below
@@ -255,6 +276,15 @@ RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 # Verified fix on real hardware: vLLM's graph-replay repro went from a
 # deterministic hang to completing every run.
 RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-src
+
+# d2h-staged-copy: the gfx803 D2H churn page fault. torch's .cpu()/.to('cpu')
+# D2H copy into a pinned or registered/locked host buffer is written
+# directly by the copy engine; on gfx803 the engine's stores drain from L2
+# to host memory after the copy completes (a system-scope fence does not
+# change that), so the write-back races the buffer's unlock and faults.
+# Force the GPU-staging path (GPU staging buffer + CPU memcpy) for all D2H
+# copies to host memory. Must run after graph-replay-batch-chunk-deadlock.
+RUN sh /rocm-systems-patches/d2h-staged-copy.sh /rocm-systems-src
 
 # Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
 # with the rest of gfx7/8 support. KFD still implements its half and still

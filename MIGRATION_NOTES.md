@@ -192,30 +192,66 @@ ROCm runtime or the rocBLAS/MIOpen/MIGraphX patches. Next step if pursued:
 reduce the fault to the single kernel and compile it with the 7.14-era hipcc
 to confirm the codegen hypothesis.
 
-### UPDATE 2026-08-29 (late): torch 2.13 does NOT fix it -- fault is the 10.0 stack
+### RESOLVED 2026-08-30: root cause found and fixed (d2h-staged-copy + va-reuse-defer-mapping)
 
-Built a gfx803 10.0 image with PYTORCH_REF=release/2.13 (the 7.14 line's
-proven torch, exactly what the mainline resolves for 2.13:
-ROCm/pytorch + release/2.13). It builds fine (the `python -m build` command
-handles both 2.13 and 2.14) and the same memory-churn double_test
-**faults identically** (Page not present, ~39GB VA). So the fault is NOT
-torch-version-specific -- the 10.0 gfx803 stack is the variable, as the
-user suspected. Decision: keep torch 2.14 as the line default (it's the
-mainline pin; 2.13 buys nothing).
+The operation-level bisection above (`.double().cpu()` in a churn loop
+faults; each op alone is clean) led to a full root cause on the gfx803 box:
 
-Operation-level bisection on the gfx803 10.0 image: `.double()` alone
-(convert) clean, `.cpu()` alone (D2H copy) clean, `.clone()` clean, but
-`.double().cpu()` in a churn loop faults. So the fault lives in the
-convert+D2H-copy combination under memory churn -- pointing at the
-SDMA/D2H path (notable given patches/rocm-systems/sdma-doorbell-missing-
-sfence.patch targets SDMA doorbell) or a convert-then-SDMA-read mapping
-race, rather than the convert kernel alone. A hand-written hipcc-10.0 HIP
-churn doing convert+hipMemcpy(D2H) with the same sizes passed once (single
-run -- may also be intermittent), so this needs a real investigation:
-prime suspects are the patched ROCR/CLR on 10.0 (va-reuse-defer or SDMA
-interaction) or hipcc-10.0 codegen for the specific torch kernel. Not yet
-split; a build with va-reuse-defer / sdma-sfence disabled would be the next
-experiment, or compiling the isolated kernel with the 7.14 hipcc.
+1. **Not a 10.0 regression and not torch-version-specific.** The same
+   `.double().cpu()` churn fault reproduces 5/5 on the real published 7.14
+   image (ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm7.14-gfx803,
+   torch 2.13.0+git18c52f2 -- the exact commit the 10.0 experiment used).
+   The "7.14 clean" baseline images on the box were actually ROCm 6.4.4
+   (torch 2.8). The fault appears in the 6.4.4 -> 7.14 transition and 10.0
+   inherited it unchanged. Confirmed not a kernel-codegen issue: `wr`-style
+   compute kernels (scalar and vectorized) writing the same host buffer are
+   clean; only the copy engine's direct host write faults.
+
+2. **Mechanism (fault address = the registered/pinned host buffer's GPUVM
+   mapping, "write from TC"):** the D2H copy engine (blit shader or SDMA)
+   writes the pinned/registered host destination directly. On gfx803 the
+   engine's stores to host memory drain from L2 to the host buffer only
+   after the copy's completion signal -- a system-scope release fence does
+   NOT change that on this hardware (verified: faults with the shader path
+   forced, with the SDMA path forced, and with a hipDeviceSynchronize
+   before the unlock). The write-back therefore races the host buffer's
+   unlock/teardown and faults on the removed mapping. The 6.4.4 line
+   escaped only because it recycled the VA fast enough that the write-back
+   landed on a re-mapped page; the 7.14+ VA-reuse defer removes that
+   accidental tolerance. Minimal repro: hipHostRegister a pageable buffer,
+   hipMemcpy D2H into it, unregister, repeated with device alloc/free
+   churn -- faults within a few rounds.
+
+3. **Fix (verified on hardware):** force the GPU-staging D2H path for all
+   copies whose destination is host memory -- the copy writes a GPU staging
+   buffer (whose mapping the fmm keeps alive) and a CPU memcpy lands the
+   data, so no engine write is ever outstanding against the host buffer's
+   lifetime. This is the same path GPU_PINNED_MIN_XFER_SIZE=4096 forces and
+   was proven clean. Implemented as patches/rocm-systems/d2h-staged-copy.patch
+   (kEnablePin=false in both DmaBlitManager::readBuffer and
+   KernelBlitManager::readBuffer, plus routing registered/locked host
+   destinations through the staged readBuffer in both submitReadMemory and
+   copyMemory). Costs an extra copy -- the correct trade, the direct host
+   write is broken on this hardware.
+
+4. **Also fixed the va-reuse-defer's broken park contract:**
+   patches/rocm-systems/va-reuse-defer-mapping.patch. The defer parks a
+   freed object (VA withheld) but the hsa-runtime's KfdDriver::FreeMemory
+   calls hsaKmtUnmapMemoryToGPU BEFORE hsaKmtFreeMemory, so parked objects
+   end up reserved-but-unmapped -- the park's "keep the mapping alive"
+   promise was false (parktest: writing a freed-but-parked VA faults). The
+   patch re-establishes the mapping in the park branch. Independent of the
+   D2H fault (verified: parktest now passes on 10.0), but the same
+   "mapping alive through the window" contract.
+
+Both patches applied and verified on the 10.0 line; d2h-staged-copy +
+va-reuse-defer-mapping also applied (source-verified) to the 7.14 line.
+10.0 on-hardware results (spliced test image): dblcpu churn 8/8 clean,
+regchurn 8/8 clean, parktest passes, dcheck 8/8 data-correct, GEMM
+numerics ~1e-6, reduce_extreme_sweep 32/32 (8 expected rejects), groupnorm
+sweep boundary rejects as expected. Full rebuild of the 10.0 image with the
+new patches is the user's next step; the 7.14 line needs a build + hardware
+re-run.
 
 ## Ref resolution method (recorded once, reused for all pins)
 
