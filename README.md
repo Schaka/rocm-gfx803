@@ -108,15 +108,11 @@ solid as 7.14 across the board, the lines get diffed and consciously merged
 back together -- see "Convergence" below.
 
 ## Status
-
-- **rocm10 (this repo's root)**: pin-bumped to TheRock 10.0 (see
-  `MIGRATION_NOTES.md`). **NOT yet built, NOT yet hardware-verified.** The
+- **rocm10 (this repo's root)**: built, **NOT yet hardware-verified.** The
   Dockerfile builds the same stages as the 7.14 line against the 10.0 refs
-  with the 7.14 patch set copied over un-re-diffed. A build has not been
-  attempted; do not treat the copied patches as confirmed. The 7.14 line's
+  with the 7.14 patch set copied over and some new additional patches made for correctness. The 7.14 line's
   full validation arc (build, `verify.py`, `tools/correctness-suite/`, ORT
-  backend-test series, real-model runs) must be re-run on this line against
-  a real gfx803 card before it can be called verified.
+  backend-test series, real-model runs) has been re-run on this line, however a full rebuild with the new correctness patches and retesting on a gfx803 card is still pending. Until then, this line is not hard-ware verified. See `MIGRATION_NOTES.md` for details.
 - **rocm7.14**: hardware-verified. `rocminfo` enumerates the card as a real
   `KERNEL_DISPATCH` agent; rocBLAS/MIOpen/MIGraphX/PyTorch/ORT all do real
   GPU work on it. The full `tools/correctness-suite/` (23 MIOpen op/solver
