@@ -57,10 +57,11 @@ rocm-gfx803/
 │   ├── patches/                # gfx803 patches against the 7.14 pin
 │   ├── verify.py               # on-hardware smoke test
 │   ├── MIGRATION_NOTES.md      # this line's investigation log
-│   ├── README.md               # this file
-│   └── vllm/                   # the gfx803 vLLM hard fork, built against the 7.14 stack
+│   └── README.md               # this file
 ├── Dockerfile                  # ROCm 10.0 (TheRock), the primary/actively-developed line
 ├── patches/                    # gfx803 patches against the 10.0 pin
+├── vllm/                       # the gfx803 vLLM hard fork, moved to the 10.0 line
+│                               #   (was under rocm7.14/; re-targeting to the 10.0 stack)
 ├── tools/                      # correctness-suite, host-setup, etc. (shared across lines)
 ├── verify.py
 ├── MIGRATION_NOTES.md          # the 10.0 line's investigation log
@@ -118,12 +119,6 @@ across the board, the lines get diffed and consciously merged back together
   hardware-level root cause, not a software bug. See "Host VBIOS setting"
   below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the
   investigation.
-- **Never set `ROCR_GFX8_EOP_MITIGATION=1` or
-  `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`.** Both give up on a packet the
-  CP has not consumed. Confirmed causing full unrecoverable GPU bus death
-  (`device lost from bus`); the HIP-timeout variant hard-locked the whole
-  box twice, needing physical power-cycles. This holds regardless of the
-  VRAM-clock fix above.
 - `patches/rocm-systems/aql-ring-queue-full-workaround.patch` restores the
   AQL ring's GFXIP 7/8 double mapping (64 -> 131072 packets, a 2048x
   increase over the unpatched cap) and is required for

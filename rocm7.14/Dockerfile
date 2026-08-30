@@ -252,21 +252,6 @@ RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 # deterministic hang to completing every run.
 RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-src
 
-# Defensive mitigation for the gfx7/8 EOP-completion-notification-loss
-# issue referenced above (root cause: undocumented firmware behavior,
-# not reachable from software -- confirmed via live kernel-fence
-# tracing showing the GPU genuinely finished the work while its specific
-# completion interrupt never arrives; see patches/rocm-systems/
-# blit-kernel-eop-interrupt-retry.patch's header for the full
-# investigation). Off by default, matching pristine upstream behavior --
-# on a system with a correctly-sized PCIe BAR (Resizable BAR / Above 4G
-# Decoding enabled, see README's hardware requirements), code-object
-# loads route around the erratum-prone path entirely and this rarely if
-# ever triggers. Opt in at runtime with ROCR_GFX8_EOP_MITIGATION=1 (see
-# the patch header for the full set of tuning env vars) on a system that
-# still sees it.
-RUN sh /rocm-systems-patches/blit-kernel-eop-interrupt-retry.sh /rocm-systems-src
-
 # Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
 # with the rest of gfx7/8 support. KFD still implements its half and still
 # expects the doubled size, so without this hsa_queue_create was stuck at a

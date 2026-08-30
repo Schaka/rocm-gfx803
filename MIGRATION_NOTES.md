@@ -160,12 +160,62 @@ elementwise convert + `.cpu()` + free). Differential on the SAME card:
 So the fault is in torch 2.14's gfx803 elementwise-convert path -- either a
 torch-2.14 kernel bug or a hipcc-10.0 codegen regression for gfx803 --
 NOT the patched ROCR/CLR/rocBLAS/MIOpen (which all validated clean). The
-7.14 line's torch is 2.8, so the differential is confounded (torch version
-and ROCm version moved together); disambiguating needs a cross build (torch
-2.14 against 7.14, or the failing kernel compiled both ways) or a
-torch/hipcc upstream report. The activ OOM and tensorop teardown crash are
-likely the same fault class and should be re-checked once this one is
-understood.
+activ OOM and tensorop teardown crash are likely the same fault class and
+should be re-checked once this one is understood.
+
+### Arch differential: gfx803-SPECIFIC, not a general ROCm 10.0 issue
+
+Re-ran the memory-churn fault (double_test) and GEMM numerics on the local
+machine's gfx1201 (RX 9070 XT), using a scratch image built from the cached
+rocm/dev-ubuntu-26.04:10.0.0-full base with AMD's pip-SDK torch devreleases
+snapshot (torch 2.11.0 + devrocm10.0.0.dev, resolved by the mainline repo's
+own rocm-devrelease-snapshot.py -- the arch test only needs a recent torch
+on ROCm 10, and 2.11 is actually closer to the 7.14 line's 2.8 than 2.14):
+
+| stack | GEMM numerics | memory-churn double_test |
+|---|---|---|
+| gfx803, ROCm 7.14, torch 2.8 (container) | correct | clean 3/3 |
+| gfx803, ROCm 10.0, torch 2.14 (this line) | correct | **faults 3/3** |
+| gfx1201, ROCm 10.0, torch 2.11 (pip-SDK) | correct | clean |
+
+So the fault is gfx803-specific, NOT a general ROCm-10/torch issue (the
+gfx1201 result rules that out). Still not yet split between the two gfx803
+10.0-line variables: (a) torch 2.14's gfx803 elementwise kernels compiled by
+hipcc-10.0, vs (b) the patched ROCR/CLR rebuilt against therock-10.0.
+Evidence so far favors the torch kernel build: raw hipcc-10.0 convert-churn
+kernels (hand-written HIP, same operation, same gfx803 box) run clean, so
+hipcc-10.0 gfx803 output and the patched 10.0 runtime handle the operation
+fine in general -- it is torch's *specific* elementwise-convert kernel
+(TensorIterator launch config / vectorization) that faults. Torch 2.14 stays
+(user requirement); the fix target is the torch gfx803 kernel build, not the
+ROCm runtime or the rocBLAS/MIOpen/MIGraphX patches. Next step if pursued:
+reduce the fault to the single kernel and compile it with the 7.14-era hipcc
+to confirm the codegen hypothesis.
+
+### UPDATE 2026-08-29 (late): torch 2.13 does NOT fix it -- fault is the 10.0 stack
+
+Built a gfx803 10.0 image with PYTORCH_REF=release/2.13 (the 7.14 line's
+proven torch, exactly what the mainline resolves for 2.13:
+ROCm/pytorch + release/2.13). It builds fine (the `python -m build` command
+handles both 2.13 and 2.14) and the same memory-churn double_test
+**faults identically** (Page not present, ~39GB VA). So the fault is NOT
+torch-version-specific -- the 10.0 gfx803 stack is the variable, as the
+user suspected. Decision: keep torch 2.14 as the line default (it's the
+mainline pin; 2.13 buys nothing).
+
+Operation-level bisection on the gfx803 10.0 image: `.double()` alone
+(convert) clean, `.cpu()` alone (D2H copy) clean, `.clone()` clean, but
+`.double().cpu()` in a churn loop faults. So the fault lives in the
+convert+D2H-copy combination under memory churn -- pointing at the
+SDMA/D2H path (notable given patches/rocm-systems/sdma-doorbell-missing-
+sfence.patch targets SDMA doorbell) or a convert-then-SDMA-read mapping
+race, rather than the convert kernel alone. A hand-written hipcc-10.0 HIP
+churn doing convert+hipMemcpy(D2H) with the same sizes passed once (single
+run -- may also be intermittent), so this needs a real investigation:
+prime suspects are the patched ROCR/CLR on 10.0 (va-reuse-defer or SDMA
+interaction) or hipcc-10.0 codegen for the specific torch kernel. Not yet
+split; a build with va-reuse-defer / sdma-sfence disabled would be the next
+experiment, or compiling the isolated kernel with the 7.14 hipcc.
 
 ## Ref resolution method (recorded once, reused for all pins)
 

@@ -152,8 +152,8 @@ jobs:
         with:
           debug: ${{ inputs.debug }}
           swap-size-gb: ${{ inputs.swap-size-gb }}
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          registry-username: ${{ secrets.GHCR_PAT != '' && github.repository_owner || github.actor }}
+          registry-password: ${{ secrets.GHCR_PAT != '' && secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute build date
         id: date
@@ -267,19 +267,38 @@ jobs:
       # no-cache bypasses cache-from entirely rather than just skipping cache-to,
       # so a bad/stale layer already sitting under cache-ref can't be reused --
       # this run still repopulates cache-ref with a fresh result.
+      #
+      # Plain `buildx build` (not docker/build-push-action) so a 429 from
+      # ghcr.io's lazy blob pull can be retried: BuildKit doesn't retry those
+      # on its own, and there is no way to wrap an arbitrary `uses:` step in a
+      # retry loop, only a shell command.
       - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
+        run: |
+          set -euo pipefail
+          args=(--push --file "${{ inputs.build-dir }}/Dockerfile")
+
           # Context is the build line's own directory, not necessarily the
           # repo root: rocm10 (build-dir '.') IS the repo root; rocm7.14 and
           # rocm6.4.4 are self-contained under their own directory and COPY
           # only from their own patches/ (see each Dockerfile's header).
-          context: ${{ inputs.build-dir }}
-          file: ${{ inputs.build-dir }}/Dockerfile
-          push: true
-          target: ${{ inputs.target }}
-          tags: ${{ steps.meta.outputs.tags }}
-          build-args: ${{ steps.meta.outputs.build-args }}
-          no-cache: ${{ inputs.no-cache }}
-          cache-from: ${{ inputs.no-cache && '' || format('type=registry,ref={0}', steps.meta.outputs.cache-ref) }}
-          cache-to: type=registry,ref=${{ steps.meta.outputs.cache-ref }},mode=${{ steps.meta.outputs.cache-mode }}
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+          while IFS= read -r build_arg; do
+            [ -n "$build_arg" ] && args+=(--build-arg "$build_arg")
+          done <<< "${{ steps.meta.outputs.build-args }}"
+
+          if [ -n "${{ inputs.target }}" ]; then
+            args+=(--target "${{ inputs.target }}")
+          fi
+
+          if [ "${{ inputs.no-cache }}" = "true" ]; then
+            args+=(--no-cache)
+          else
+            args+=(--cache-from "type=registry,ref=${{ steps.meta.outputs.cache-ref }}")
+          fi
+          args+=(--cache-to "type=registry,ref=${{ steps.meta.outputs.cache-ref }},mode=${{ steps.meta.outputs.cache-mode }}")
+
+          source scripts/lib/bake-retry.sh
+          build_push_with_retry "${args[@]}" "${{ inputs.build-dir }}"

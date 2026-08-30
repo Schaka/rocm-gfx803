@@ -59,13 +59,14 @@ rocm-gfx803/
 ├── tools/                  # correctness-suite, host-setup, etc. (shared across lines)
 ├── verify.py               # on-hardware smoke test
 ├── MIGRATION_NOTES.md      # running investigation log for the 10.0 line
+├── vllm/                   # the gfx803 vLLM hard fork (moved to the 10.0 line;
+│                           #   re-targeting from the 7.14 stack in progress)
 ├── rocm7.14/               # the hardware-verified TheRock 7.14 line
 │   ├── Dockerfile
 │   ├── patches/
 │   ├── verify.py
 │   ├── README.md           # incl. the full vLLM-on-gfx803 investigation
-│   ├── MIGRATION_NOTES.md
-│   └── vllm/               # the gfx803 vLLM hard fork, built against the 7.14 stack
+│   └── MIGRATION_NOTES.md
 ├── rocm6.4.4/              # the older, hardware-verified, classic-tag ROCm 6.4.4 line
 │   ├── Dockerfile
 │   ├── patches/
@@ -138,12 +139,6 @@ back together -- see "Convergence" below.
   hardware-level root cause, not a software bug. See "Host VBIOS setting"
   below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the
   investigation.
-- **Never set `ROCR_GFX8_EOP_MITIGATION=1` or
-  `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US`.** Both give up on a packet the
-  CP has not consumed. Confirmed causing full unrecoverable GPU bus death
-  (`device lost from bus`); the HIP-timeout variant hard-locked the whole
-  box twice, needing physical power-cycles. This holds regardless of the
-  VRAM-clock fix above.
 - `patches/rocm-systems/aql-ring-queue-full-workaround.patch` restores the
   AQL ring's GFXIP 7/8 double mapping (64 -> 131072 packets, a 2048x
   increase over the unpatched cap) and is required for
@@ -153,13 +148,17 @@ back together -- see "Convergence" below.
 
 ### vLLM on gfx803
 
-The gfx803 vLLM hard fork lives at `rocm7.14/vllm/`, built and verified
-against the 7.14 stack (the prebuilt `libgfx803gemm.so` links the 7.14
-`hipcc`; `librocblas.so` is picked up via `LD_LIBRARY_PATH=/opt/rocm/
-core-7.14/lib`). It is **not** yet re-targeted to the 10.0 line -- the box's
-editable vLLM install tracks whichever ROCm stack the box runs, so
-re-targeting happens when the box moves to 10.0. The full investigation and
-tuning notes are in `rocm7.14/README.md`.
+The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line),
+moved there when the 7.14 line was archived. It is being re-targeted from
+the 7.14 stack to the 10.0 stack: the prebuilt `libgfx803gemm.so`/
+`libgfx803attn.so` currently link the 7.14 `hipcc` and `librocblas.so` is
+picked up via `LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`; on 10.0 those
+become `core-10.0` and the kernels must be recompiled with the 10.0 `hipcc`
+(the `.so` linkage is stack-specific). Re-verify on hardware after
+re-targeting -- the box's editable vLLM install tracks whichever ROCm stack
+the box runs, so the re-target happens when the box moves to 10.0. The full
+investigation and tuning notes for the 7.14-era state are in
+`rocm7.14/README.md`.
 
 ## Building
 
