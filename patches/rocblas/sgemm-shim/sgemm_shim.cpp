@@ -108,11 +108,14 @@ static void route_f16(const void* a, const void* b, void* d, int m, int n, int k
     rocblas_get_stream(handle, &stream);
     if (getenv("GFX803_SGEMM_SHIM_DEBUG")) {
         // [f16-takeover] marker for the Dockerfile build guard
-        fprintf(stderr, "shim f16: m=%d n=%d k=%d [f16-takeover]\n", m, n, k);
+        fprintf(stderr, "shim f16: a=%p b=%p d=%p m=%d n=%d k=%d [f16-takeover]\n", a, b, d, m, n, k);
     }
-    // rocBLAS is column-major, the kernel row-major: dimension swap only
-    // (lda==m, ldb==k, ldc==m enforced by f16_layout_ok).
-    gfx803_gemm_launch(b, a, d, n, m, k, stream);
+    // rocBLAS receives torch's row-major tensors but passes them in its own
+    // col-major argument order -- the (a, b) it hands us are (B, A) in
+    // torch's terms (verified against torch's data_ptr in-process). The kernel
+    // computes C[m,n] = A[m,k] @ B[k,n], so pass them swapped to recover the
+    // row-major product.
+    gfx803_gemm_launch(b, a, d, m, n, k, stream);
 }
 
 typedef rocblas_status (*rocblas_sgemm_t)(rocblas_handle, rocblas_operation, rocblas_operation,
