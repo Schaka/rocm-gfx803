@@ -1,0 +1,38 @@
+torch bakes C10_WARP_SIZE=32 into every kernel compiled for gfx803 (Polaris,
+GCN3), because the macro returns 64 only for __GFX9__ and falls through to 32
+for every older arch. Polaris hardware is wave64-only (no wave32), so any
+kernel that uses C10_WARP_SIZE -- layer_norm, group_norm, softmax, the
+block_reduce/Reduce warp reductions, attention, indexing, TopK, sorting --
+reduces only 32 of the 64 lanes in each wave, dropping half the data. The
+result is silent garbage or NaN (reproduced on an RX 570: a warp reduction
+written against C10_WARP_SIZE=32 returns 32.0 for a 64-element sum of
+ones; against 64 it returns 64.0). It is a compile-time constant baked into
+libtorch's kernel binaries, so there is no runtime-side (HIP/HSA) substitute
+-- the header must be fixed and torch rebuilt. Same wave64 class the repo's
+triton patches already fix on the triton side (ISAFamily::GCN3 -> warpSize
+64, patches/triton/). No other arch is affected: gfx9 stays 64, gfx10+/
+NVIDIA stay 32.
+
+--- a/torch/headeronly/macros/Macros.h
++++ b/torch/headeronly/macros/Macros.h
+@@ -386,11 +386,11 @@ static __device__ inline int C10_WARP_SIZE_INTERNAL() {
+ #else // __SPIRV__
+ static __device__ inline constexpr int C10_WARP_SIZE_INTERNAL() {
+-#if defined(__GFX9__)
++#if defined(__GFX8__) || defined(__GFX9__)
+   return 64;
+-#else // __GFX9__
++#else // __GFX8__ || __GFX9__
+   return 32;
+-#endif // __GFX9__
++#endif // __GFX8__ || __GFX9__
+ }
+ #endif // __SPIRV__
+ #if defined(__SPIRV__)
+ #define C10_WARP_SIZE_LOWER_BOUND 32
+ #define C10_WARP_SIZE_UPPER_BOUND 64
+-#elif defined(__GFX9__)
++#elif defined(__GFX8__) || defined(__GFX9__)
+ #define C10_WARP_SIZE_LOWER_BOUND 64
+ #define C10_WARP_SIZE_UPPER_BOUND 64
+ #else
