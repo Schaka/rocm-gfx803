@@ -60,6 +60,61 @@
 #include <cstdio>
 #include <cstdlib>
 
+// fp16 path: same defect class as NOTE 2 but on the fp16 Tensile kernels --
+// rocBLAS's internal device-memory pool reuses memory across GEMM calls as
+// GlobalSplitU scratch without re-zeroing it, and gfx803's GSU-reduction
+// kernels (software CAS, assumes zeroed scratch) accumulate garbage into the
+// output on top of whatever the previous GEMM left there. The hand-written
+// kernel from the vLLM fork (gfx803_gemm_lib.hip, compiled into this
+// shim) stages through LDS with no scratch at all, so a preceding GEMM
+// cannot leak into it. Confirmed on real hardware: torch's fp16
+// bmm/matmul (2x128x64x128 etc.) produces scattered NaNs through rocBLAS
+// whenever a same-shape GEMM ran first; the hand-written kernel via the swap
+// mapping below is exact for every shape tested.
+//
+// rocBLAS is column-major; the kernel is row-major. For the no-transpose
+// contiguous case (lda==m, ldb==k, ldc==ldd==m) the mapping is a pure
+// dimension swap: kernel(M=n, N=m, K=k, A=b, B=a, C=d). Take-over
+// contract: fp16 in/out, no transpose, contiguous, in-place C==D,
+// alpha==1, beta==0 (the kernel computes C=A@B with no scaling), default
+// solution. Everything else falls through to real rocBLAS untouched.
+extern "C" void gfx803_gemm_launch(const void* A, const void* B, void* C,
+                                    int M, int N, int K, void* stream);
+
+static bool f16_layout_ok(rocblas_operation transA, rocblas_operation transB,
+                         rocblas_datatype a_type, rocblas_datatype b_type,
+                         rocblas_datatype c_type, rocblas_datatype d_type,
+                         rocblas_int m, rocblas_int n, rocblas_int k,
+                         const void* alpha, const void* beta,
+                         const void* c, const void* d,
+                         rocblas_int lda, rocblas_int ldb, rocblas_int ldc, rocblas_int ldd,
+                         rocblas_gemm_algo algo, int32_t solution_index,
+                         rocblas_stride stride_a, rocblas_stride stride_b,
+                         rocblas_stride stride_c, rocblas_stride stride_d) {
+    bool all_f16 = (a_type == rocblas_datatype_f16_r && b_type == rocblas_datatype_f16_r &&
+                    c_type == rocblas_datatype_f16_r && d_type == rocblas_datatype_f16_r);
+    bool scale_one = alpha && beta && *(const float*)alpha == 1.0f && *(const float*)beta == 0.0f;
+    bool contiguous = lda == m && ldb == k && ldc == m && ldd == m &&
+                     stride_a == (rocblas_stride)m * k && stride_b == (rocblas_stride)k * n &&
+                     stride_c == (rocblas_stride)m * n && stride_d == (rocblas_stride)m * n;
+    return all_f16 && transA == rocblas_operation_none && transB == rocblas_operation_none &&
+           c == d && scale_one && contiguous && algo == rocblas_gemm_algo_standard &&
+           solution_index == 0;
+}
+
+static void route_f16(const void* a, const void* b, void* d, int m, int n, int k,
+                   rocblas_handle handle) {
+    hipStream_t stream = 0;
+    rocblas_get_stream(handle, &stream);
+    if (getenv("GFX803_SGEMM_SHIM_DEBUG")) {
+        // [f16-takeover] marker for the Dockerfile build guard
+        fprintf(stderr, "shim f16: m=%d n=%d k=%d [f16-takeover]\n", m, n, k);
+    }
+    // rocBLAS is column-major, the kernel row-major: dimension swap only
+    // (lda==m, ldb==k, ldc==m enforced by f16_layout_ok).
+    gfx803_gemm_launch(b, a, d, n, m, k, stream);
+}
+
 typedef rocblas_status (*rocblas_sgemm_t)(rocblas_handle, rocblas_operation, rocblas_operation,
                                           rocblas_int, rocblas_int, rocblas_int,
                                           const float*, const float*, rocblas_int,
@@ -160,6 +215,20 @@ extern "C" rocblas_status rocblas_gemm_ex(rocblas_handle handle,
     bool take_over = all_f32 && algo == rocblas_gemm_algo_standard && solution_index == 0
                      && !env_shim_disabled() && c == d; // in-place C==D matches this kernel's beta-accumulate semantics
 
+    if (f16_layout_ok(transA, transB, a_type, b_type, c_type, d_type, m, n, k,
+                      alpha, beta, c, d, lda, ldb, ldc, ldd, algo, solution_index,
+                      /*unused strides*/ m * k, k * n, m * n, m * n)
+        && !env_shim_disabled()) {
+        route_f16(a, b, d, m, n, k, handle);
+        hipError_t herr = hipGetLastError();
+        if (herr != hipSuccess) {
+            fprintf(stderr, "gfx803_sgemm_shim: f16 gemm_ex kernel launch failed (%s), falling back to rocBLAS\n",
+                    hipGetErrorString(herr));
+        } else {
+            return rocblas_status_success;
+        }
+    }
+
     if (!take_over) {
         return real_rocblas_gemm_ex(handle, transA, transB, m, n, k, alpha,
                                     a, a_type, lda, b, b_type, ldb, beta,
@@ -239,6 +308,29 @@ extern "C" rocblas_status rocblas_gemm_strided_batched_ex(
                 "sc==sd=%d ldc==ldd=%d disabled=%d [sb-takeover-no-algo-gate]\n",
                 m, n, k, batch_count, all_f32, (int)algo, solution_index, c == d,
                 small_problem, stride_c == stride_d, ldc == ldd, env_shim_disabled());
+    }
+
+    if (f16_layout_ok(transA, transB, a_type, b_type, c_type, d_type, m, n, k,
+                      alpha, beta, c, d, lda, ldb, ldc, ldd, algo, solution_index,
+                      stride_a, stride_b, stride_c, stride_d)
+        && !env_shim_disabled()) {
+        for (rocblas_int i = 0; i < batch_count; i++) {
+            route_f16((const char*)a + i * stride_a * 2, (const char*)b + i * stride_b * 2,
+                     (char*)d + i * stride_d * 2, m, n, k, handle);
+            hipError_t herr = hipGetLastError();
+            if (herr != hipSuccess) {
+                fprintf(stderr,
+                        "gfx803_sgemm_shim: f16 strided_batched kernel launch failed (%s), "
+                        "falling back to rocBLAS\n",
+                        hipGetErrorString(herr));
+                return real_rocblas_gemm_strided_batched_ex(
+                    handle, transA, transB, m, n, k, alpha,
+                    a, a_type, lda, stride_a, b, b_type, ldb, stride_b, beta,
+                    c, c_type, ldc, stride_c, d, d_type, ldd, stride_d,
+                    batch_count, compute_type, algo, solution_index, flags);
+            }
+        }
+        return rocblas_status_success;
     }
 
     if (!take_over) {

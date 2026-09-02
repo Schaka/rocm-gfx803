@@ -550,10 +550,14 @@ RUN mkdir -p /opt/rocm-sgemm-shim
 COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
 RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
         /opt/rocm-sgemm-shim/sgemm_shim.cpp \
+        /opt/rocm-sgemm-shim/gfx803_gemm_lib.hip \
         -o /opt/rocm/lib/libgfx803_sgemm_shim.so \
         -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lrocblas -ldl \
     && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so 2>/dev/null | grep -q "sb-takeover-no-algo-gate"; then \
         echo "FATAL: shim built without the strided-batched takeover fix (algo gate)." >&2; exit 1; \
+    fi \
+    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so 2>/dev/null | grep -q "f16-takeover"; then \
+        echo "FATAL: shim built without the fp16 takeover fix." >&2; exit 1; \
     fi \
     && rm -rf /opt/rocm-sgemm-shim
 
@@ -877,6 +881,15 @@ ENV PATH=/build-venv/bin:$PATH
 
 RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodules \
         https://github.com/ROCm/pytorch.git /pytorch
+
+# gfx803-c10-warp-size-wave64: C10_WARP_SIZE compiles to 32 for gfx803
+# (only __GFX9__ gets 64), but Polaris is wave64-only -- every Eager kernel
+# that warp-reduces via C10_WARP_SIZE (layer_norm, group_norm, softmax,
+# attention, ...) drops half the wave's lanes and produces NaN/garbage. Baked
+# in at compile time, so it must be fixed here, not at the runtime. See the
+# patch header for the full WHY.
+COPY patches/pytorch/ /pytorch-patches/
+RUN bash /pytorch-patches/apply-gfx803-c10-warp-size-wave64.sh /pytorch
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
