@@ -257,6 +257,15 @@ RUN sh /rocm-systems-patches/va-reuse-defer.sh /rocm-systems-src
 # convert+D2H churn page fault on gfx803, 7.14 and 10.0 alike).
 RUN sh /rocm-systems-patches/va-reuse-defer-mapping.sh /rocm-systems-src
 
+# va-reuse-defer-noremap: the park branch's _fmm_map_to_gpu re-map leaves a
+# kernel GPUVM mapping behind that libhsakmt's aperture allocator then
+# re-hands out; the kernel rejects the overlap (EINVAL) and every
+# code-object load fails with HSA_STATUS_ERROR_OUT_OF_RESOURCES, which
+# vLLM 10.0 turns into a SIGSEGV on gfx803 (root-caused end to end on the
+# 10.0 line; verified on real hardware with the Qwen3.5-2B bench). See
+# the patch header for the full WHY. Must run after va-reuse-defer.
+RUN sh /rocm-systems-patches/va-reuse-defer-noremap.sh /rocm-systems-src
+
 # pinned-release-system-scope: gfx803 D2H churn page fault. torch's
 # .cpu()/.to('cpu') pins the pageable host destination and a copy shader
 # writes it directly; the pinned-buffer release marker dispatched a NOP
@@ -285,6 +294,14 @@ RUN sh /rocm-systems-patches/graph-replay-batch-chunk-deadlock.sh /rocm-systems-
 # Force the GPU-staging path (GPU staging buffer + CPU memcpy) for all D2H
 # copies to host memory. Must run after graph-replay-batch-chunk-deadlock.
 RUN sh /rocm-systems-patches/d2h-staged-copy.sh /rocm-systems-src
+
+# d2h-null-dsthost: d2h-staged-copy routes a host-direct-access D2H
+# destination through readBuffer with dstMem.getHostMem(), which is NULL for a
+# *device* allocation that happens to be host-accessible (large-BAR
+# gfx803) and made readBuffer memcpy to address 0, crashing vLLM 10.0
+# during inference (gdb-verified). Pass the destination device VA instead.
+# See the patch header for the full WHY. Must run after d2h-staged-copy.
+RUN sh /rocm-systems-patches/d2h-null-dsthost.sh /rocm-systems-src
 
 # Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
 # with the rest of gfx7/8 support. KFD still implements its half and still

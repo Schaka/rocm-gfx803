@@ -154,8 +154,13 @@ the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
 compiled `.so` files are built on the box next to their loaders, never
 committed -- so there is nothing stack-specific pinned in this repo; a
 fresh build on the 10.0 stack just works. Hardware validation of vLLM on
-the 10.0 stack is pending (the box's editable vLLM install tracks whichever
-ROCm stack the box runs); the full investigation and tuning notes for the
+the 10.0 stack is DONE (2026-09-02): the two crashes that blocked it
+were both in the ROCm 10.0 stack, not vLLM, and are fixed by
+`patches/rocm-systems/va-reuse-defer-noremap.patch` and
+`patches/rocm-systems/d2h-null-dsthost.patch` (see `AGENTS.md` for
+the WHY). Verified with `qwen35_2b_bench_v3.py` on the box: EXIT=0,
+prefill 311.0 tok/s, decode 30.2 tok/s (the 7.14 record for the same
+bench: 331.7 / 24.4). The full investigation and tuning notes for the
 7.14-era state are in `rocm7.14/README.md`.
 
 ## Building

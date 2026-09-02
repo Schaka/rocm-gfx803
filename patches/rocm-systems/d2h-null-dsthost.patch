@@ -1,0 +1,55 @@
+CLR (rocclr) D2H copy destination address (gfx803, ROCm 10.0): a D2H copy
+whose destination is a host-accessible *device* allocation (large-BAR
+gfx803) crashed writing to address 0x0 -- `memcpy(dst=0x0, ...)` inside
+KernelBlitManager::readBuffer's staging path.
+
+WHY
+---
+vLLM 10.0 (torch 2.14) on gfx803 faults in hipMemcpyAsync during
+inference. Root-caused with the 10.0 symbols build under gdb (crash
+backtrace: readBuffer -> VirtualGPU::copyMemory -> submitCopyMemory, fault
+address 0): the d2h-staged-copy routing added in this tree hands the
+host-visible destination address to readBuffer via `dstMem.getHostMem()`.
+For a *host-origin* allocation (hipHostMalloc/hipHostRegister) the owner's
+HostMemoryReference holds the host pointer, so that path was clean; for a
+*device* allocation that happens to be host-accessible (deviceLocalAlloc
+on large-BAR), getHostMem() is NULL and readBuffer then memcpy()s into
+address 0. Fix: pass the destination device memory's VA -- for a
+host-accessible memory the device VA *is* the host-visible address, and
+for host-origin memories it aliases the same location. Verified on real
+hardware: with this + the va-reuse-defer-noremap change, the full vLLM
+10.0 Qwen3.5-2B bench (qwen35_2b_bench_v3.py) completes with
+EXIT=0 (prefill 311.0 tok/s, decode 30.2 tok/s, 2101-token prompt /
+128 decode; 7.14 record for the same bench: 331.7 / 24.4).
+
+The re-map removal (va-reuse-defer-noremap.patch) must be applied for
+the same workload to get past the code-object load; this patch is the second
+half -- without it the no-re-map state reaches the D2H phase and faults
+here instead.
+
+Applies AFTER d2h-staged-copy.patch (it edits the branch that patch
+introduced).
+
+WHAT
+---
+In VirtualGPU::copyMemory's host-direct-access D2H branch, derive the
+readBuffer destination from the destination device memory's VA instead of the
+owner's hostMemRef.
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -3238,7 +3238,13 @@
+         // GFX803: same as submitReadMemory -- a D2H copy into a
+         // registered/locked host buffer must go through the staged
+         // readBuffer, not the copy engine writing the host buffer directly.
+-        result = blitMgr().readBuffer(*srcDevMem, dstMem.getHostMem(), realSrcOrigin,
++        // The host-visible address of a host-accessible destination is its
++        // device VA; the owner's hostMemRef is only set for host-origin
++        // allocations and is NULL for a device allocation that happens to be
++        // host-accessible, so getHostMem() alone would hand readBuffer a NULL
++        // destination.
++        void* dstHost = dstDevMem->getDeviceMemory();
++        result = blitMgr().readBuffer(*srcDevMem, dstHost, realSrcOrigin,
+                                       realSize, entire, copyMetadata);
+       } else {
+         result = blitMgr().copyBuffer(*srcDevMem, *dstDevMem, realSrcOrigin, realDstOrigin,

@@ -200,18 +200,30 @@ value in maintaining a separate history to eventually reconcile. Don't
 `git submodule add` it or try to reconnect it to that remote without
 being told to.
 
-The fork lives at the **10.0 root line** (moved there when the 7.14 line
-was archived under `rocm7.14/`, 2026-08-29) and **targets the 10.0 stack
-by assumption**: the hand-written gfx803 kernels
+The fork lives at the **10.0 root line** (copied there when the 7.14 line
+was archived under `rocm7.14/`, 2026-08-29; the pristine fork copy stays
+under `rocm7.14/vllm/`, untouched, for archival) and **targets the 10.0
+stack by assumption**: the hand-written gfx803 kernels
 (`vllm/vllm/gfx803_kernels/*.hip`) are version-agnostic source compiled
 once with the stack's own `hipcc --offload-arch=gfx803` (see each loader's
 docstring for the exact invocation), and `librocblas.so` resolves through
 the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
 compiled `.so` files are built on the box next to their loaders and never
 committed, so nothing stack-specific is pinned in this repo. Hardware
-validation of vLLM on the 10.0 stack is pending -- the box's editable vLLM
-install tracks whichever ROCm stack the box runs, so validating means
-building the kernels on a 10.0 box install and running vLLM there.
+validation of vLLM on the 10.0 stack is DONE (2026-09-02): the two
+crashes that blocked it were both in the ROCm 10.0 stack, not vLLM, and
+are fixed by `patches/rocm-systems/va-reuse-defer-noremap.patch` (the
+va-reuse-defer park-branch `_fmm_map_to_gpu` re-map left a kernel GPUVM
+mapping behind that libhsakmt's aperture allocator then re-handed out, so
+every code-object load collided with it -- kernel EINVAL ->
+`HSA_STATUS_ERROR_OUT_OF_RESOURCES` -> the HIP launch fallback's
+reinterpret_cast turned that into a SIGSEGV) and
+`patches/rocm-systems/d2h-null-dsthost.patch` (a D2H copy into a
+host-accessible *device* allocation handed `readBuffer` a NULL host
+destination because `getHostMem()` is unset for device-origin memory).
+Verified with `qwen35_2b_bench_v3.py` on the box: EXIT=0, prefill 311.0
+tok/s, decode 30.2 tok/s (2101-token prompt / 128 decode tokens; the
+7.14 record for the same bench: 331.7 / 24.4).
 
 **It is not built from this repo's Dockerfile** (vLLM runs as a box-only
 editable install), and it is **not documented via `.patch.md` files under
