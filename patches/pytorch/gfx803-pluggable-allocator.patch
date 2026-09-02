@@ -1,0 +1,301 @@
+torch's CUDAPluggableAllocator (the .so-based custom allocator API) is the
+escape hatch for the one torch memory bug left on gfx803 after the C10_WARP_SIZE
+fix. The default caching allocator's block layout can corrupt the next kernel's
+access after a GEMM -- silent scattered NaN in an op that reads correctly-written
+memory -- reproduced on every ROCm stack (6.4.4/7.14/10.0) with torch's
+own elementwise kernels as the victim (no GEMM kernel involved; raw hipMalloc in
+the same process is always clean, and a C++ replica of the exact torch pattern is
+always clean). A pluggable allocator whose raw allocations come from plain hipMalloc
+sidesteps that layout on the stacks where it reproduces: measured on the 7.14 host
+with the bmm+add repro, 7/8 rounds corrupt under the default allocator and 0/8
+under the hipMalloc-backed pluggable allocator.
+
+NOT a fix to the default allocator -- an opt-in alternative, OFF by default,
+enabled only when GFX803_PLUGGABLE_ALLOCATOR is set at runtime (any truthy
+value, or a path to the allocator .so; defaults to
+/opt/rocm/lib/libgfx803_pluggable.so). See the README's "torch memory:
+experimental pluggable allocator" section for usage. Experimental: it changes
+allocator semantics globally (every tensor's memory comes from per-allocation
+hipMalloc), stats are reported from simple counters, the graphs/IPC/snapshot
+parts of the allocator API become no-ops, and it does NOT help on every stack
+(verified on 10.0, where the corruption persists even under the pluggable
+allocator).
+
+Upstream threw for getDeviceStats/getMemoryFraction/cacheInfo/snapshot/
+recordHistory/attachOutOfMemoryObserver -- ComfyUI and other eager frameworks call
+memory_stats at startup, so the pluggable allocator crashed the process before it
+could serve. This implements those with simple counters tracked in malloc/raw_delete,
+and wires the runtime env-var hook into torch.cuda._lazy_init (before _cuda_init,
+so the allocator swap happens before anything allocates).
+
+The companion .so is gfx803_pluggable.hip (same directory), built with
+hipcc --offload-arch=gfx803 -O2 -fPIC -shared gfx803_pluggable.hip
+-o libgfx803_pluggable.so -lamdhip64, installed to /opt/rocm/lib.
+
+---
+diff --git a/torch/csrc/cuda/CUDAPluggableAllocator.cpp b/torch/csrc/cuda/CUDAPluggableAllocator.cpp
+index 1fb6795..edcf91d 100644
+--- a/torch/csrc/cuda/CUDAPluggableAllocator.cpp
++++ b/torch/csrc/cuda/CUDAPluggableAllocator.cpp
+@@ -1,5 +1,8 @@
+ #include <c10/cuda/CUDACachingAllocator.h>
+ #include <c10/cuda/CUDAGuard.h>
++#include <algorithm>
++#include <atomic>
++#include <limits>
+ #include <mutex>
+ #include <utility>
+ 
+@@ -88,6 +91,9 @@ void* CUDAPluggableAllocator::malloc(
+   {
+     const std::lock_guard<std::mutex> lock(allocator_mutex_);
+     allocation_metadata_.emplace(r, _AllocationMetadata(size, device, stream));
++    current_bytes_ += static_cast<int64_t>(size);
++    peak_bytes_ = std::max(peak_bytes_.load(), current_bytes_);
++    num_device_alloc_.fetch_add(1);
+   }
+   return r;
+ }
+@@ -137,6 +143,11 @@ void CUDAPluggableAllocator::raw_delete(void* ptr) {
+     allocation_metadata_.erase(ptr);
+   }
+   free_fn_(ptr, size, device_idx, stream);
++  {
++    const std::lock_guard<std::mutex> lock(allocator_mutex_);
++    current_bytes_ -= static_cast<int64_t>(size);
++    num_device_free_.fetch_add(1);
++  }
+ }
+ 
+ void CUDAPluggableAllocator::init(int device_count) {
+@@ -151,10 +162,7 @@ bool CUDAPluggableAllocator::initialized() {
+ }
+ 
+ double CUDAPluggableAllocator::getMemoryFraction(c10::DeviceIndex device) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support getMemoryFraction. "
+-      "If you need it, please file an issue describing your use case.");
++  return 1.0;
+ }
+ 
+ void CUDAPluggableAllocator::setMemoryFraction(
+@@ -182,10 +190,7 @@ void CUDAPluggableAllocator::emptyCache(
+ void CUDAPluggableAllocator::cacheInfo(
+     c10::DeviceIndex device,
+     size_t* largestBlock) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support cacheInfo. "
+-      "If you need it, please file an issue describing your use case.");
++  *largestBlock = static_cast<size_t>(peak_bytes_.load());
+ }
+ 
+ void* CUDAPluggableAllocator::getBaseAllocation(void* ptr, size_t* size) {
+@@ -206,33 +211,49 @@ void CUDAPluggableAllocator::recordStream(
+ 
+ c10::CachingDeviceAllocator::DeviceStats CUDAPluggableAllocator::getDeviceStats(
+     c10::DeviceIndex device) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support getDeviceStats. "
+-      "If you need it, please file an issue describing your use case.");
++  constexpr size_t kAgg = 0;
++  c10::CachingDeviceAllocator::DeviceStats stats;
++  int64_t current = 0;
++  int64_t blocks = 0;
++  {
++    const std::lock_guard<std::mutex> lock(allocator_mutex_);
++    current = current_bytes_;
++    blocks = allocation_metadata_.size();
++  }
++  stats.allocated_bytes[kAgg].current = current;
++  stats.allocated_bytes[kAgg].peak = peak_bytes_.load();
++  stats.reserved_bytes[kAgg].current = current;
++  stats.reserved_bytes[kAgg].peak = peak_bytes_.load();
++  stats.active_bytes[kAgg].current = current;
++  stats.active_bytes[kAgg].peak = peak_bytes_.load();
++  stats.segment[kAgg].current = blocks;
++  stats.num_alloc_blocks = blocks;
++  stats.num_segments = blocks;
++  stats.num_device_alloc = num_device_alloc_.load();
++  stats.num_device_free = num_device_free_.load();
++  stats.num_alloc_retries = num_alloc_retries_.load();
++  stats.num_ooms = num_ooms_.load();
++  stats.num_oom_rejections = 0;
++  stats.max_split_size = std::numeric_limits<int64_t>::max();
++  return stats;
+ }
+ 
+ void CUDAPluggableAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support resetAccumulatedStats. "
+-      "If you need it, please file an issue describing your use case.");
++  num_device_alloc_ = 0;
++  num_device_free_ = 0;
++  num_alloc_retries_ = 0;
++  num_ooms_ = 0;
+ }
+ 
+ void CUDAPluggableAllocator::resetPeakStats(c10::DeviceIndex device) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support resetPeakStats. "
+-      "If you need it, please file an issue describing your use case.");
++  const std::lock_guard<std::mutex> lock(allocator_mutex_);
++  peak_bytes_ = current_bytes_;
+ }
+ 
+ c10::cuda::CUDACachingAllocator::SnapshotInfo CUDAPluggableAllocator::snapshot(
+     c10::cuda::MempoolId_t mempool_id,
+     bool include_traces) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support snapshot. "
+-      "If you need it, please file an issue describing your use case.");
++  return {};
+ }
+ 
+ c10::cuda::CUDACachingAllocator::ShareableHandle CUDAPluggableAllocator::
+@@ -282,36 +303,16 @@ void CUDAPluggableAllocator::recordHistory(
+     size_t alloc_trace_max_entries,
+     c10::cuda::CUDACachingAllocator::RecordContext when,
+     bool clearHistory,
+-    const std::vector<std::string>& skip_actions) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support recordHistory. "
+-      "If you need it, please file an issue describing your use case.");
+-}
++    const std::vector<std::string>& skip_actions) {}
+ 
+ void CUDAPluggableAllocator::attachOutOfMemoryObserver(
+-    c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not yet support attachOutOfMemoryObserver. "
+-      "If you need it, please file an issue describing your use case.");
+-}
++    c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) {}
+ 
+ void CUDAPluggableAllocator::attachOomRejectionObserver(
+-    c10::cuda::CUDACachingAllocator::OomRejectionObserver observer) {
+-  TORCH_CHECK_NOT_IMPLEMENTED(
+-      false,
+-      "CUDAPluggableAllocator does not yet support attachOomRejectionObserver. "
+-      "If you need it, please file an issue describing your use case.");
+-}
++    c10::cuda::CUDACachingAllocator::OomRejectionObserver observer) {}
+ 
+ void CUDAPluggableAllocator::attachAllocatorTraceTracker(
+-    c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) {
+-  TORCH_CHECK(
+-      false,
+-      "CUDAPluggableAllocator does not support attachAllocatorTraceTracker. "
+-      "attachAllocatorTraceTracker is only used inside Pytorch.");
+-}
++    c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) {}
+ 
+ std::shared_ptr<c10::cuda::CUDACachingAllocator::AllocatorState>
+ CUDAPluggableAllocator::getCheckpointState(
+diff --git a/torch/csrc/cuda/CUDAPluggableAllocator.h b/torch/csrc/cuda/CUDAPluggableAllocator.h
+index 91b2179..5d76944 100644
+--- a/torch/csrc/cuda/CUDAPluggableAllocator.h
++++ b/torch/csrc/cuda/CUDAPluggableAllocator.h
+@@ -7,6 +7,7 @@
+ 
+ #include <c10/cuda/CUDACachingAllocator.h>
+ 
++#include <atomic>
+ #include <mutex>
+ 
+ namespace torch::cuda::CUDAPluggableAllocator {
+@@ -164,6 +165,15 @@ struct TORCH_CUDA_CPP_API CUDAPluggableAllocator
+   // We do the bookkeeping here in order to simplify custom allocators
+   std::unordered_map<void*, _AllocationMetadata> allocation_metadata_;
+ 
++  // Allocation stats for getDeviceStats. The gfx803 opt-in pluggable allocator
++  // reports these; the default caching allocator's own numbers are not available.
++  std::atomic<int64_t> current_bytes_{0};
++  std::atomic<int64_t> peak_bytes_{0};
++  std::atomic<int64_t> num_device_alloc_{0};
++  std::atomic<int64_t> num_device_free_{0};
++  std::atomic<int64_t> num_alloc_retries_{0};
++  std::atomic<int64_t> num_ooms_{0};
++
+   bool initialized_ = false;
+ };
+ } // namespace torch::cuda::CUDAPluggableAllocator
+diff --git a/torch/cuda/__init__.py b/torch/cuda/__init__.py
+index c405d77..5d39235 100644
+--- a/torch/cuda/__init__.py
++++ b/torch/cuda/__init__.py
+@@ -49,6 +49,7 @@ except ImportError:
+     _cudart = None
+ 
+ _initialized = False
++_gfx803_pluggable_attempted = False
+ _tls = threading.local()
+ _initialization_lock = threading.Lock()
+ _queued_calls: list[
+@@ -570,6 +571,51 @@ def init():
+     _lazy_init()
+ 
+ 
++
++
++def _maybe_install_gfx803_pluggable_allocator():
++    """gfx803: optionally swap in a hipMalloc-backed allocator (experimental).
++
++    Enabled only when GFX803_PLUGGABLE_ALLOCATOR is set at runtime, off by
++    default. On gfx803 the default caching allocator's block layout can corrupt
++    the next kernel's access after a GEMM (silent NaN/garbage). A pluggable
++    allocator whose raw allocations come from plain hipMalloc avoids that layout on
++    the stacks where it reproduces. Experimental: stats are reported (allocation
++    count and bytes), the rest of the allocator API (graphs, IPC, snapshots) is
++    best-effort no-ops, and per-allocator overhead differs from the caching
++    allocator. The env value is either a path to the allocator .so, or any
++    truthy value to use the default /opt/rocm/lib/libgfx803_pluggable.so.
++    """
++    global _gfx803_pluggable_attempted
++    if _gfx803_pluggable_attempted:
++        return
++    _gfx803_pluggable_attempted = True
++    setting = os.environ.get("GFX803_PLUGGABLE_ALLOCATOR")
++    if not setting:
++        return
++    so = "/opt/rocm/lib/libgfx803_pluggable.so"
++    if os.path.exists(setting):
++        so = setting
++    if not os.path.exists(so):
++        print(
++            f"[gfx803] GFX803_PLUGGABLE_ALLOCATOR set but {so} not found; "
++            "keeping the default allocator",
++            flush=True,
++        )
++        return
++    try:
++        from torch.cuda.memory import CUDAPluggableAllocator
++
++        alloc = CUDAPluggableAllocator(so, "gfx803_alloc", "gfx803_free")
++        torch.cuda.memory.change_current_allocator(alloc)
++        print(f"[gfx803] pluggable hipMalloc allocator active ({so})", flush=True)
++    except Exception as e:
++        print(
++            f"[gfx803] pluggable allocator install failed ({e}); "
++            "keeping the default allocator",
++            flush=True,
++        )
++
+ def _lazy_init():
+     global _initialized, _queued_calls
+     if is_initialized() or hasattr(_tls, "is_initializing"):
+@@ -592,6 +638,7 @@ def _lazy_init():
+             )
+         if not hasattr(torch._C, "_cuda_getDeviceCount"):
+             raise AssertionError("Torch not compiled with CUDA enabled")
++        _maybe_install_gfx803_pluggable_allocator()
+         if _cudart is None:
+             raise AssertionError(
+                 "libcudart functions unavailable. It looks like you have a broken build?"

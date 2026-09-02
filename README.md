@@ -163,6 +163,33 @@ prefill 311.0 tok/s, decode 30.2 tok/s (the 7.14 record for the same
 bench: 331.7 / 24.4). The full investigation and tuning notes for the
 7.14-era state are in `rocm7.14/README.md`.
 
+### torch memory: experimental pluggable allocator (env var `GFX803_PLUGGABLE_ALLOCATOR`)
+
+Torch's default caching allocator's block layout can corrupt the next kernel's
+access after a GEMM on gfx803 -- silent scattered NaN in an op that reads
+correctly-written memory (reproduced on every stack, 6.4.4/7.14/10.0;
+raw `hipMalloc` in the same process is always clean). `patches/pytorch/
+gfx803-pluggable-allocator.patch` gives torch an **opt-in** hipMalloc-backed
+pluggable allocator that sidesteps that layout on the stacks where it reproduces
+(measured on the 7.14 host: 7/8 rounds corrupt with the default allocator,
+0/8 with this one). It is **off by default** and does nothing unless the env
+var is set at runtime (pass it however the app is launched -- `docker run -e`,
+a shell export, a systemd unit, ...):
+
+```sh
+docker run -e GFX803_PLUGGABLE_ALLOCATOR=1 ...      # container: uses /opt/rocm/lib/libgfx803_pluggable.so
+docker run -e GFX803_PLUGGABLE_ALLOCATOR=/path/to/libfoo.so ...  # or an explicit .so path
+```
+
+**Experimental -- use at your own risk.** It changes allocator semantics
+globally (every tensor's memory comes from per-allocation `hipMalloc`;
+allocator stats are reported from simple counters and the graphs/IPC/snapshot
+parts of the allocator API become no-ops), and it does **not** help on every
+stack (verified on 10.0, where the corruption persists even under the pluggable
+allocator). It is the escape hatch for the last torch memory bug, not a general
+memory fix. The `.so` is built from `patches/pytorch/gfx803_pluggable.hip`
+by the same apply driver and installed to `/opt/rocm/lib/`.
+
 ## Building
 
 All lines build the same way -- multi-stage Dockerfile, patches applied

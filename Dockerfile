@@ -891,6 +891,13 @@ RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodul
 COPY patches/pytorch/ /pytorch-patches/
 RUN bash /pytorch-patches/apply-gfx803-c10-warp-size-wave64.sh /pytorch
 
+# gfx803-pluggable-allocator: opt-in hipMalloc-backed allocator for torch's
+# remaining memory bug (the default caching allocator's block layout corrupting
+# the next access after a GEMM). Inert by default -- activates only when
+# GFX803_PLUGGABLE_ALLOCATOR is set at runtime. Also builds the allocator .so
+# to /opt/rocm/lib/libgfx803_pluggable.so. Experimental; see the patch header.
+RUN bash /pytorch-patches/apply-gfx803-pluggable-allocator.sh /pytorch
+
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py
