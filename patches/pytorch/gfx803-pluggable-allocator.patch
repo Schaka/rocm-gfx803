@@ -51,7 +51,7 @@ index 1fb6795..edcf91d 100644
      const std::lock_guard<std::mutex> lock(allocator_mutex_);
      allocation_metadata_.emplace(r, _AllocationMetadata(size, device, stream));
 +    current_bytes_ += static_cast<int64_t>(size);
-+    peak_bytes_ = std::max(peak_bytes_.load(), current_bytes_);
++    peak_bytes_.store(std::max(peak_bytes_.load(), current_bytes_.load()));
 +    num_device_alloc_.fetch_add(1);
    }
    return r;
@@ -92,7 +92,7 @@ index 1fb6795..edcf91d 100644
  }
  
  void* CUDAPluggableAllocator::getBaseAllocation(void* ptr, size_t* size) {
-@@ -206,33 +211,49 @@ void CUDAPluggableAllocator::recordStream(
+@@ -206,33 +211,47 @@
  
  c10::CachingDeviceAllocator::DeviceStats CUDAPluggableAllocator::getDeviceStats(
      c10::DeviceIndex device) {
@@ -116,8 +116,6 @@ index 1fb6795..edcf91d 100644
 +  stats.active_bytes[kAgg].current = current;
 +  stats.active_bytes[kAgg].peak = peak_bytes_.load();
 +  stats.segment[kAgg].current = blocks;
-+  stats.num_alloc_blocks = blocks;
-+  stats.num_segments = blocks;
 +  stats.num_device_alloc = num_device_alloc_.load();
 +  stats.num_device_free = num_device_free_.load();
 +  stats.num_alloc_retries = num_alloc_retries_.load();
@@ -144,7 +142,7 @@ index 1fb6795..edcf91d 100644
 -      "CUDAPluggableAllocator does not yet support resetPeakStats. "
 -      "If you need it, please file an issue describing your use case.");
 +  const std::lock_guard<std::mutex> lock(allocator_mutex_);
-+  peak_bytes_ = current_bytes_;
++  peak_bytes_.store(current_bytes_.load());
  }
  
  c10::cuda::CUDACachingAllocator::SnapshotInfo CUDAPluggableAllocator::snapshot(
@@ -158,7 +156,7 @@ index 1fb6795..edcf91d 100644
  }
  
  c10::cuda::CUDACachingAllocator::ShareableHandle CUDAPluggableAllocator::
-@@ -282,36 +303,16 @@ void CUDAPluggableAllocator::recordHistory(
+@@ -282,36 +301,16 @@ void CUDAPluggableAllocator::recordHistory(
      size_t alloc_trace_max_entries,
      c10::cuda::CUDACachingAllocator::RecordContext when,
      bool clearHistory,
