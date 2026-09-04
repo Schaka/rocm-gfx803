@@ -303,6 +303,19 @@ RUN sh /rocm-systems-patches/d2h-staged-copy.sh /rocm-systems-src
 # See the patch header for the full WHY. Must run after d2h-staged-copy.
 RUN sh /rocm-systems-patches/d2h-null-dsthost.sh /rocm-systems-src
 
+# fmm-keep-userptr-map: libhsakmt's reserved_aperture_release() munmaps a
+# released host-VA range even while the kernel-side KFD userptr for it
+# (hsa_amd_memory_lock, e.g. torch's H2D staging windows) is still alive
+# and queued GPU work still reads it -- the eviction tears the PTEs down
+# under the GPU and the read faults. Reproduced deterministically on
+# gfx803 loading an sd1.5 checkpoint via torch (every run, faults at
+# teardown of each load cycle); on CIK the queues cannot be preempted
+# reliably so the fault wedges the CP (preemption-fail -> quiesce-fail ->
+# reset cascade) instead of being recovered like on newer parts. Keep the
+# mapping; the shmem-page reclaim is not worth a dead GPU. See the patch
+# header. Independent of the va-reuse-defer hunks (different function).
+RUN sh /rocm-systems-patches/fmm-keep-userptr-map.sh /rocm-systems-src
+
 # Restore the GFXIP 7/8 double-mapped AQL ring buffer that upstream deleted
 # with the rest of gfx7/8 support. KFD still implements its half and still
 # expects the doubled size, so without this hsa_queue_create was stuck at a

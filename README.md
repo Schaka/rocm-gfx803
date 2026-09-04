@@ -184,11 +184,17 @@ docker run -e GFX803_PLUGGABLE_ALLOCATOR=/path/to/libfoo.so ...  # or an explici
 **Experimental -- use at your own risk.** It changes allocator semantics
 globally (every tensor's memory comes from per-allocation `hipMalloc`;
 allocator stats are reported from simple counters and the graphs/IPC/snapshot
-parts of the allocator API become no-ops), and it does **not** help on every
-stack (verified on 10.0, where the corruption persists even under the pluggable
-allocator). It is the escape hatch for the last torch memory bug, not a general
-memory fix. The `.so` is built from `patches/pytorch/gfx803_pluggable.hip`
-by the same apply driver and installed to `/opt/rocm/lib/`.
+parts of the allocator API become no-ops). **Do not use it on the 10.0
+line**: re-measured there after the fmm/userptr fix (2026-09-04) with the
+GEMM-adjacent corruption pattern (`bmm_pattern`-style, 5 rounds each) --
+default allocator corrupts 5/5, pluggable corrupts 5/5 as well, and the
+pre-fix libhsa with pluggable corrupts too (3/3). It was never a working
+mitigation on this stack; the older 0/8-clean figure was a 7.14-host
+measurement. Whether pluggable still helps on 7.14 has not been re-checked
+since, and the 10.0 corruption remains an open gfx803 bug -- this escape
+hatch is for the 7.14-era stacks only. The `.so` is built from
+`patches/pytorch/gfx803_pluggable.hip` by the same apply driver and
+installed to `/opt/rocm/lib/`.
 
 ## Building
 

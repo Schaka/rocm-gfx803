@@ -1,0 +1,78 @@
+libhsakmt (fmm): never drop the CPU mapping of a released host-VA range
+(gfx803, ROCm 10.0)
+
+WHY
+---
+`reserved_aperture_release()` in projects/rocr-runtime/libhsakmt/src/fmm.c
+munmaps a released CPU-accessible host-VA range and re-reserves it as
+PROT_NONE "to release shmem pages for MAP_SHARED allocations". Releasing
+the *userspace* handle is not the end of that range's life: the kernel
+keeps the KFD userptr BO (created by `hsa_amd_memory_lock`, e.g. PyTorch's
+H2D staging windows) mapped in GPUVM until it is explicitly destroyed.
+Any GPU work still queued behind the unmap reads a VA whose PTEs the
+eviction path has already torn down -> VM_CONTEXT1_PROTECTION_FAULT on a
+live buffer.
+
+Reproduces deterministically on gfx803 loading ANY sd1.5-class checkpoint
+through torch (`safetensors.get_tensor` + `.to("cuda")` in a loop; ~2
+faults per 25 s pass, 100% of runs) and was the root cause of the
+intermittent ComfyUI SIGSEGV/hang on the 10.0 line. The same race exists
+on every architecture, but there the kernel recovers via userptr
+eviction/restore (upstream's own comment in `__fmm_release` warns that
+"munmap would cause an eviction"); on CIK the queues cannot be preempted
+reliably, so one fault wedges the CP: "Queue preemption failed",
+"Failed to quiesce KFD", GPU-reset cascades, and processes that hang at
+`DQM create queue` (this is the gpu_recovery=0 stall captured end-to-end
+on real Polaris hardware during this investigation).
+
+Keeping the mapping is exactly what the deferred-release FIFO already
+does for parked objects; the shmem-page reclaim it buys is not worth a
+wedged GPU.
+
+FIX
+---
+Drop the munmap()+mmap(PROT_NONE) pair from `reserved_aperture_release()`;
+the mbind() NUMA-policy reset stays. The VA range remains mapped (and
+userspace-reserved in fmm's vm tree) until process exit.
+
+Verified on RX 580 (gfx803), kernel 7.1.12 Fedora stock (gpu_recovery=1):
+before - 2 PROTECTION_FAULTs + resets on every repro run; after - 0 faults
+and 0 resets over 4x torch-load repros, 5x ComfyUI checkpoint loads, and a
+full sd1.5 txt2img generation (6 steps, EXIT=0).
+
+Applies with: git apply (rocm-systems is cloned as a real git repo).
+
+--- a/projects/rocr-runtime/libhsakmt/src/fmm.c
++++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
+@@ -707,24 +707,17 @@
+ 	}
+ 
+ 	if (app->is_cpu_accessible) {
+-		void *mmap_ret;
+-
+ 		/* Reset NUMA policy */
+ 		mbind(address, MemorySizeInBytes, MPOL_DEFAULT, NULL, 0, 0);
+ 
+-		/*
+-		 * Drop the CPU mapping to release shmem pages for MAP_SHARED
+-		 * allocations, then re-reserve the VA range as PROT_NONE.
+-		 * Callers hold fmm_mutex (see contract above), which serializes
+-		 * this against aperture allocations, so no allocation can claim
+-		 * the VA in the window between munmap() and mmap().
++		/* GFX803_FMM_KEEP_USERPTR_MAP: do NOT munmap here. A KFD
++		 * userptr (hsa_amd_memory_lock) keeps the kernel mapping of
++		 * this range alive after userspace released it, and queued
++		 * GPU work still reads it. Unmapping now evicts those PTEs
++		 * under the GPU; on gfx803 the resulting VM fault cannot be
++		 * recovered without a CP reset. Keep the mapping (the mbind
++		 * above already resets the NUMA policy).
+ 		 */
+-		munmap(address, MemorySizeInBytes);
+-		mmap_ret = mmap(address, MemorySizeInBytes, PROT_NONE,
+-			MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED,
+-			-1, 0);
+-		if (mmap_ret == MAP_FAILED)
+-			pr_err("Failed to reserve VA range %p: %s\n", address, strerror(errno));
+ 	}
+ }
+ 

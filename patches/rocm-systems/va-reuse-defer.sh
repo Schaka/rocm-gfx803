@@ -16,7 +16,11 @@ FLAGFILE="$SRC/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h"
 [ -f "$PATCH" ] || { echo "FATAL: no patch file at $PATCH" >&2; exit 1; }
 [ -d "$SRC/.git" ] || { echo "FATAL: $SRC is not a git checkout" >&2; exit 1; }
 
-if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
+# Marker check, not `apply --check --reverse`: va-reuse-defer-mapping/noremap
+# touch the same file after this one, so a clean reverse only holds on a tree
+# that contains nothing past this patch.
+if grep -q 'GFX803_VA_REUSE_DEFER_PATCH' "$FILE" \
+   && grep -q 'disable_fragment_alloc_ = (var == "0") ? false : true' "$FLAGFILE"; then
     echo "already patched, skipping"
     exit 0
 fi

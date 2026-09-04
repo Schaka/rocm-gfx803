@@ -16,7 +16,10 @@ FILE="$SRC/projects/clr/rocclr/device/rocm/rocvirtual.cpp"
 [ -d "$SRC/.git" ] || { echo "FATAL: $SRC is not a git checkout" >&2; exit 1; }
 [ -f "$FILE" ] || { echo "FATAL: $FILE missing" >&2; exit 1; }
 
-if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
+# Marker check, not `apply --check --reverse`: later chain drivers touch the
+# same file, so a clean reverse only holds on a tree that contains nothing
+# past this patch.
+if grep -q 'void\* dstHost = dstDevMem->getDeviceMemory();' "$FILE"; then
     echo "already patched, skipping"
     exit 0
 fi

@@ -12,7 +12,11 @@ QUEUE_FILE="$SRC/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_
 [ -f "$PATCH" ] || { echo "FATAL: no patch file at $PATCH" >&2; exit 1; }
 [ -d "$SRC/.git" ] || { echo "FATAL: $SRC is not a git checkout" >&2; exit 1; }
 
-if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
+# Marker check, not `apply --check --reverse`: later patches in this chain
+# touch the same files, so a clean reverse of this patch only applies while
+# the tree holds nothing after it.
+if grep -q "doorbell_type_ = agent->properties().Capability.ui32.DoorbellType;" "$QUEUE_FILE" \
+   && ! grep -q "DoorbellType != 2" "$AGENT_FILE"; then
     echo "already patched, skipping"
     exit 0
 fi

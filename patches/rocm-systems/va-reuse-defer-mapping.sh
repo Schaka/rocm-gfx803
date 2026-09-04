@@ -14,7 +14,12 @@ FILE="$SRC/projects/rocr-runtime/libhsakmt/src/fmm.c"
 [ -d "$SRC/.git" ] || { echo "FATAL: $SRC is not a git checkout" >&2; exit 1; }
 [ -f "$FILE" ] || { echo "FATAL: $FILE missing -- is va-reuse-defer applied?" >&2; exit 1; }
 
-if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
+# Marker check, not `apply --check --reverse`: noremap/fmm-keep-userptr-map
+# touch the same file after this one (noremap even removes the re-map CALL
+# this patch adds), so detect on this patch's forward declaration -- the
+# second occurrence of the signature line (pristine has only the definition
+# below), untouched by every later patch in the chain.
+if [ "$(grep -c '^static HSAKMT_STATUS _fmm_map_to_gpu(HsaKFDContext \*ctx,$' "$FILE")" -ge 2 ]; then
     echo "already patched, skipping"
     exit 0
 fi
