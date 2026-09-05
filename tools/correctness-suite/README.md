@@ -67,6 +67,23 @@ else here is a single function call. A rushed harness for something this complex
 risks a false result more than it is worth, so `mha` is a separate follow-up and
 is not covered here.
 
+### fp16_gemm_sweep.py
+
+Checks the SGEMM shim's f16 takeover against a float32 reference: 27 cases covering square
+and both non-square `mm` orientations, `K` values that are not a multiple of the
+kernel's 16-wide K tile, the batched form that attention dots use, and fp16
+convolutions, whose im2col shape is what exposed the operand-mapping bug. Run one
+case per process, since an out-of-range read faults the context and takes the rest
+of the grid with it:
+
+```sh
+for i in $(seq 0 26); do
+  podman exec C python3 tools/correctness-suite/fp16_gemm_sweep.py --case $i
+done
+```
+
+Expect `ok=true` on all 27. Against an older shim, expect the square cases to match
+and every non-square case to be wrong or to fault.
 ## Running it
 
 Build inside any container that has `hipcc` and MIOpen installed. Every image

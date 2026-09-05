@@ -4,13 +4,33 @@
 // unreliable on gfx803 for every shape tested so far -- see gfx803_sgemm.h's
 // header comment for the full investigation.
 //
+// FP16 ROUTE: rocblas_gemm_ex is also taken over when both operands and both outputs are
+// f16, alpha=1, beta=0, C==D, no transposes and tight leading dimensions. That route calls
+// the row-major kernel in gfx803_gemm_lib.hip, and the dimension order it passes matters:
+// under exactly the contract the gate checks, the row-major product that lands in the
+// output buffer is b @ a with M=n, N=m, K=k. Handing it (m, n) computes the transpose and
+// reads m*k elements out of a k*n buffer, so it is only right when m == n. Measured on the
+// card against a float32 reference, 27 cases (tools/correctness-suite/fp16_gemm_sweep.py):
+// the old order was correct on the 8 square cases and wrong or faulting on all 19 others,
+// including every fp16 convolution (im2col gives K = Cin*R*S and M = H*W, so m != n
+// essentially always -- a 3-channel 3x3 conv arrives as m=4096, n=64, k=27) and the
+// non-square batched dots. The fixed order is correct on all 27, and the 8 square cases
+// are unchanged, because for m == n the two calls are the same call.
+//
+// The kernel itself is not at fault: called directly on its own documented contract it is
+// correct at M=4096, N=64, K=27 (max abs error 7e-05 against a double reference), so this
+// was a caller bug, not a kernel bug.
+//
 // SCOPE: as of this patch, this intercepts ALL standard-algo f32
 // rocblas_sgemm/rocblas_gemm_ex calls, not just specific proven-broken
 // shapes -- there is no known-good subset to preserve Tensile's speed for
-// yet. Everything else (other dtypes, batched calls, explicit
-// solution_index requests, non-standard algo) falls through untouched to
-// the real rocBLAS symbol via dlsym(RTLD_NEXT, ...), so this only affects
-// the path it has actually replaced and verified.
+// yet -- plus the f16 gemm_ex case described above and the small-problem
+// strided-batched case described below. Anything outside those three
+// (bf16, i8, explicit solution_index requests, non-standard algo, large
+// batched problems) falls through untouched to the real rocBLAS symbol via
+// dlsym(RTLD_NEXT, ...). Each takeover is asserted at build time by a marker
+// string in the compiled .so, so a build that silently predates one of these
+// routes fails the image rather than shipping it.
 //
 // rocblas_gemm_strided_batched_ex is intercepted too, but only for
 // max(m,n,k) <= 32 -- the small-problem region where gfx803's assembly
@@ -108,14 +128,22 @@ static void route_f16(const void* a, const void* b, void* d, int m, int n, int k
     rocblas_get_stream(handle, &stream);
     if (getenv("GFX803_SGEMM_SHIM_DEBUG")) {
         // [f16-takeover] marker for the Dockerfile build guard
-        fprintf(stderr, "shim f16: a=%p b=%p d=%p m=%d n=%d k=%d [f16-takeover]\n", a, b, d, m, n, k);
+        fprintf(stderr, "shim f16: a=%p b=%p d=%p m=%d n=%d k=%d [f16-takeover] [f16-map-nm]\n", a, b, d, m, n, k);
     }
-    // rocBLAS receives torch's row-major tensors but passes them in its own
-    // col-major argument order -- the (a, b) it hands us are (B, A) in
-    // torch's terms (verified against torch's data_ptr in-process). The kernel
-    // computes C[m,n] = A[m,k] @ B[k,n], so pass them swapped to recover the
-    // row-major product.
-    gfx803_gemm_launch(b, a, d, m, n, k, stream);
+    // The kernel computes a row-major product: C[M,N] = X[M,K] @ Y[K,N], with X's
+    // row stride K and Y's row stride N. The caller's problem is the plain
+    // column-major contract D(i,j) = op(A)(i,k) op(B)(k,j) with no transposes and
+    // lda=m, ldb=k, ldd=m (the gate above insists on all three), and under that
+    // contract the buffers read row-major are: b -> [n,k] stride ldb=k,
+    // a -> [k,m] stride lda=m, d -> [n,m] stride ldd=m. So the row-major product
+    // that lands in d's memory is b @ a with M=n, N=m, K=k.
+    //
+    // Handing it (m, n) instead computes the transpose of the answer, which is
+    // only the same buffer layout when m == n. With m != n the kernel also walks
+    // m*k elements out of a k*n buffer, which is the out-of-bounds read that made
+    // convolutions fault: an im2col call arrives as m=4096, n=64, k=27 and read
+    // the 64x27-element operand as if it held 4096x27.
+    gfx803_gemm_launch(b, a, d, n, m, k, stream);
 }
 
 typedef rocblas_status (*rocblas_sgemm_t)(rocblas_handle, rocblas_operation, rocblas_operation,

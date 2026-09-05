@@ -109,15 +109,22 @@ merged deliberately. See "Convergence" below.
 
 - rocm10 (this repo's root): actively developed, and partly hardware-tested.
   The ROCm 10.0 stack on the test box runs rocBLAS, MIOpen, MIGraphX, PyTorch,
-  ORT, and the vLLM fork on a real card. The torch correctness suite is
-  202/202 PASS with the current patch set (see "Cross-dispatch coherence"). The
-  full image builds end to end, and the two libraries that carry these fixes were
-  taken out of that image and measured on the card: its `libamdhip64` gives 202/202
-  on the torch suite, and its `librocsolver.so.0` gives 13 of 13 `torch.linalg`
-  routines within 1.0e-5 of CPU. What is still missing is a `verify.py` run of the
-  whole image on the card, because the box's root filesystem has 31 GB free against
-  a 40 GB image. `MIGRATION_NOTES.md` has the details, and each patch header states
-  its own verification state.
+  ORT, and the vLLM fork on a real card. The torch correctness suite gives
+  202/202 PASS with the current patch set on the box stack (see "Cross-dispatch
+  coherence"). Inside the image the same suite reports 118 PASS, 0 BAD, 0 NONFINITE and
+  84 ERRORs that are all `/ INDUCTOR`, because the image ships no Triton. The full image
+  builds end to end, and `tools/imgvalidate.sh` now runs that whole gate against the
+  image itself on the card: its `libamdhip64` and its `librocsolver.so.0` (13 of 13
+  `torch.linalg` routines within 1.0e-5 of CPU) are the shipped binaries, not a
+  hand-built pair swapped in. `tools/imgvalidate.sh <image-tag>` is the on-card gate
+  for a whole image: it asserts the shipped libraries' markers, runs `verify.py`, the
+  coherence probes with a control arm that must reproduce the corruption, the fp16 GEMM
+  and convolution sweep with and without the shim's takeover, and the op suite. The last
+  run of it (2026-09-05) came back with verify.py all-pass, 0 anomalies in 480
+  cross-stream checks against 16 in the same-configuration control, 27/27 fp16 cases with
+  the shim and 27/27 against real rocBLAS, op suite `BAD 0, NONFINITE 0`, and no GPU reset
+  or ring timeout in dmesg. `MIGRATION_NOTES.md` has the details, and each patch header
+  states its own verification state.
 - rocm7.14: hardware-verified, and archived. CI no longer builds it.
   `rocminfo` lists the card as a real `KERNEL_DISPATCH` agent, and rocBLAS,
   MIOpen, MIGraphX, PyTorch, and ORT all do real GPU work on it. The full
@@ -153,7 +160,9 @@ merged deliberately. See "Convergence" below.
 - SSH user and password are both `user`, and the sudo password is `user`. There
   is no root login, so use `echo user | sudo -S <cmd>`. Put all work under
   `/data`. The host stack is 10.0: `/opt/rocm` plus `/opt/venv` (torch 2.14). The
-  7.14 line stays at `/data/rocm-7.14` and `/data/venv-7.14`.
+  7.14 line is no longer on the box: `/data/rocm-7.14` and `/data/venv-7.14`
+  were deleted on 2026-09-05 to reclaim space. Rebuild it from `rocm7.14/` if an
+  A/B against 7.14 is needed again.
 - `/opt/rocm/lib` is a symlink to `/etc/alternatives/rocm-lib`, which points at
   `/opt/rocm/core-10.0/lib`, so they are one directory. That symlink is broken
   inside a container, because `/etc/alternatives` is not part of the `/opt/rocm`
@@ -168,6 +177,18 @@ merged deliberately. See "Convergence" below.
   `rocrfix2` and kill every python process first. Unbinding amdgpu while a
   process holds `/dev/kfd` reboots the box through the watchdog. A `rocm-smi`
   line for `00:01.0` does not prove that the GPU agent exists.
+- `rocrfix2` is a build container that needs **two** mounts: `-v /data:/data` and
+  `-v /opt/rocm:/opt/rocm`. Without the second there is no `hipcc` in it and its
+  `/data/clrbuild4` tree cannot rebuild, because that tree points at
+  `/opt/rocm/core-10.0` for the compiler. Recreating it with only `/data` looks
+  like a working container until a build fails with `hipcc: No such file`.
+- `pkill -f <name>` and `pgrep -f <name>` match the shell that runs them, because
+  the pattern is in that shell's own command line. A cleanup line like
+  `pkill -9 -f f16sweep` inside `sudo sh -c "..."` therefore kills the command
+  before it launches anything. Write the first character as a bracket class
+  (`pkill -9 -f "[f]16sweep"`) and the same for `pgrep`.
+- A `podman rm -f` over `$(podman ps -aq)` also removes the long-lived build
+  containers. Name the containers you mean.
 - Do not set `amdgpu.noretry=1` on this card. GPUVM page-table retries are
   needed. With `gpu_recovery=0` a fault under it wedges the box completely, and
   pstore holds nothing.
@@ -193,7 +214,16 @@ merged deliberately. See "Convergence" below.
   `$(basename $D)`. Both `/opt/rocm/lib` and `/opt/rocm/core-10.0/lib` have the
   basename `lib`, so such a name overwrites one backup with the other.
 - Treat the GPU as single-tenant. Two torch jobs at once invalidate timing and
-  fault measurements.
+  fault measurements. `timeout N podman exec ...` kills the client and leaves the
+  process running inside the container holding its GPU context, so a later run
+  inherits a second tenant: it fails as `CUDA error: out of memory` or as an
+  illegal access, and looks like a library bug. Run
+  `podman exec <c> pkill -9 -f 'python3 /data'` between arms.
+- An SDMA ring timeout is terminal while `gpu_recovery=0`: dmesg says
+  `ring sdma1 timeout` then `GPU recovery disabled`, new GPU work never starts,
+  and processes go into `D` state, where even `kill -9` does not reach them and
+  `modprobe -r amdgpu` blocks forever. Only a reboot clears it, and a forced
+  reboot with those tasks present can leave the box down for a long fsck.
 
 ### vLLM on gfx803
 
@@ -220,8 +250,8 @@ from the 7.14 period.
 
 On gfx803 the CP ignores the AQL `SCACQUIRE` and `SCRELEASE` scope bits, and those
 bits are ROCm's only way to express cache coherence across dispatches. The compute
-shader's TC is also not maintained at a dispatch boundary. Two silent faults
-follow, and one packet fixes both.
+shader's TC is also not maintained at a dispatch boundary. Three silent faults
+follow, and one packet fixes all three.
 
 - A kernel that reads a virtual address that an earlier kernel overwrote can get
   the pre-overwrite bytes from a stale TC line. The correct data is already in
@@ -229,42 +259,60 @@ follow, and one packet fixes both.
 - A copy engine reads DRAM and never looks at the shader TC. So it copies out
   bytes that a compute kernel overwrote but has not written back. The GPU result
   is correct and the host copy of it is not.
+- Same as the one above, but the kernel that wrote the bytes ran on another queue.
+  Then there is no ring that holds both the writer and the read, so no writeback
+  placed on the reader's side can be ordered behind the writer. It has to be
+  published by the writing queue.
 
 Anything that recycles virtual addresses is exposed. That is why this appears
 under torch's caching allocator and not in a raw `hipMalloc`/`hipFree` program,
 which never re-reads an address that a kernel cached.
 
-`patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.patch` fixes both at the
-source. It publishes one PM4 `ACQUIRE_MEM` (`TC_ACTION_ENA|TC_WB_ACTION_ENA`, full
-address range) in its own AQL ring slot, in two places: ahead of every kernel
-dispatch, and inside `VirtualGPU::releaseGpuMemoryFence()` between that
-function's barrier and a second barrier. The second barrier makes sure that the
-completion signal a copy engine waits on retires only after the writeback. This
-is the same packet ROCr already emits when it loads a code object, moved onto the
-data path. It is on by default for ISA 8 and older. `CLR_GFX8_TC_INVALIDATE=0`
-turns it off for A/B runs.
+`patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.patch` fixes all three at
+the source. It publishes one PM4 `ACQUIRE_MEM` (`TC_ACTION_ENA|TC_WB_ACTION_ENA`, full
+address range) in its own AQL ring slot, in three places: ahead of every kernel
+dispatch, inside `VirtualGPU::releaseGpuMemoryFence()` between that function's
+barrier and a second barrier, and ahead of an event-record barrier in
+`VirtualGPU::submitMarker()`. The second barrier makes sure that the completion
+signal a copy engine waits on retires only after the writeback. The third site is
+what closes the cross-stream case: a queue that is about to be waited on publishes
+its own caches, because a writeback enqueued on the *reading* queue cannot be
+ordered behind a kernel on the *writing* one. It is the raw slot only, with no
+barrier and no completion signal, which is what keeps it out of the marker's
+signal bookkeeping. All sites are on by default for ISA 8 and older.
+`CLR_GFX8_TC_INVALIDATE=0` turns the whole thing off for A/B runs, and
+`CLR_GFX8_TC_RECORD_FENCE=0` turns off the event-record site alone.
 
 State on the 10.0 line (2026-09-05): the torch correctness suite
 `tools/correctness-suite/torch_op_suite.py` gives 202/202 PASS, 0 BAD, 0
-NONFINITE. With the knob off, the same library fails 13 of them, 5 with NONFINITE.
+NONFINITE on the box stack. Inside the image the same suite reports 118 PASS, 0
+BAD, 0 NONFINITE and 84 ERRORs that are all `/ INDUCTOR`, because the image ships
+no Triton and inductor therefore cannot compile: no wrong answer, but not a
+coverage claim either. With the knob off, the box stack fails 13 of them, 5 with
+NONFINITE.
 `tools/tc-staleness/` probes: bmm 0/40, soak 0/527 across 5 seeds, and a 60-step
 Adam training run that is bit-identical to the CPU loss trajectory. The same
 training run is not reproducible with the knob off. Cost: D2H +2.7%, H2D +1.5%,
 launch-bound tiny ops +2.4%, and compute unchanged (fp16 2048^3 GEMM +0.04%, conv
 and GPU-to-GPU clone unchanged).
 
-Two paths are still exposed, and the patch header lists them in its KNOWN
-LIMITATION section.
+The cross-stream case that this section used to leave open is closed. A producer on
+another `torch.cuda.Stream` feeding a host copy on the default stream went from 21
+anomalies in 960 checks to 0 in 2000, on one binary with
+`CLR_GFX8_TC_RECORD_FENCE` toggled; `multistream2.py` 0/1600, and `ms4.py`, which
+copies into pinned host memory and fans two producers into one consumer, 0/2400.
+Copy bandwidth is unchanged (D2H pinned 2.07 to 2.03 GiB/s), because no copy moved
+off the copy engine. Two fixes that look right and do not work are recorded in the
+patch header, because someone will try them again: attaching the producer's
+dependency to the consumer's fence barrier measures 11/960 either way, and a
+CP-side `WAIT_REG_MEM` does not execute inside an AQL ring at all.
 
-- Cross-stream handoff: a producer on another `torch.cuda.Stream` that feeds a
-  host copy on the default stream still corrupts at 5-11 of 240 checks. The
-  writeback has to run on the producer's own ring, and and the marker path that is the
-  natural place for it rejects extra barrier packets (heap corruption). Single-stream torch,
-  MIGraphX, and ORT are not affected.
+One path is still exposed, and the patch header lists it in its CAVEAT section.
+
 - The HIP graph replay batch path (`dispatchAqlPacketBatchFlat`) issues no
   `ACQUIRE_MEM`. A torch `CUDAGraph` capture of the poisoned sequence does not
   reproduce (0/40 with the knob off), so this gap is unproven rather than known
-  broken.
+  broken. `tools/tc-staleness/graphprobe.py` is the probe for it.
 
 ### torch.linalg on gfx803
 
@@ -310,6 +358,39 @@ between patched and unpatched builds of the same tree gave byte-identical output
 all 39 checks, at n=128, 256 and 512, non-square, rank-deficient and batched. So no
 `torch.linalg` result is known to depend on it, and it is recorded as latent rather
 than as a measured correction. See its header for what to exercise next.
+
+### fp16 GEMM and convolution on gfx803 (the SGEMM shim)
+
+Tensile's own SGEMM kernels are unreliable on this card, so the stack ships an
+`LD_PRELOAD` shim (`patches/rocblas/sgemm-shim/`) that answers three cases with
+kernels verified on hardware: the standard-algo f32 `rocblas_sgemm` and
+`rocblas_gemm_ex` path, the f16 `rocblas_gemm_ex` path, and the small-problem
+`rocblas_gemm_strided_batched_ex` path that MIGraphX's batched attention dots
+arrive in. Everything else falls through to the real rocBLAS symbol.
+
+The shim is compiled in its own always-executed Dockerfile stage (`sgemm-shim-builder`),
+because a build that supplies `ROCBLAS_IMAGE` skips `rocblas-builder` entirely: building
+the shim there would ship whatever `.so` the published image happens to carry, however
+current this tree's sources are. Each takeover is asserted by a marker string in the
+compiled library, in that stage and again in the final stage, so a stale shim fails the
+build instead of passing silently.
+
+The f16 route had a caller bug, not a kernel bug. Under the column-major contract
+that its own gate checks, the row-major product that lands in the output buffer is
+`b @ a` with `M=n, N=m, K=k`; it passed `(m, n)`. That computes the transpose and
+reads `m*k` elements from a `k*n` buffer, so it was only ever right when `m == n`.
+Convolutions are the common case where it is not: im2col makes `K = Cin*R*S` and
+`M = H*W`, so a 3-channel 3x3 conv arrives as `m=4096, n=64, k=27`, and the result
+was garbage (max ~5e4 where the true value is ~28) with an out-of-bounds read that
+later surfaced as `illegal memory access`, usually inside MIOpen's next kernel load
+rather than at the GEMM itself. Non-square batched dots were wrong too. Measured
+case by case against a float32 reference (`tools/correctness-suite/fp16_gemm_sweep.py`,
+27 cases, both shims, one case per process because a fault kills the context): the
+old mapping was correct on the 8 square cases and wrong or faulting on all 19
+others; the fixed mapping is correct on all 27, and the 8 square cases are
+unchanged, since for `m == n` the two calls are the same call. The kernel itself is
+innocent: called directly on its documented contract it gives max error 7e-05 at
+`M=4096, N=64, K=27`.
 
 ## Component images, pins, and line provenance
 
@@ -494,8 +575,11 @@ as a software bug.
 ## What needs real gfx803 hardware to validate, and what does not
 
 - The card is needed for anything that dispatches a GPU kernel: `verify.py`,
-  `tools/correctness-suite/`, any real transcription or inference run, and
-  MIOpen's own `MIOpenDriver -V 1` check. Silent miscompute is the common bug
+  `tools/correctness-suite/`, `tools/tc-staleness/`, any real transcription or inference
+  run, and MIOpen's own `MIOpenDriver -V 1` check. `tools/imgvalidate.sh <image-tag>`
+  runs the whole set against a built image in one pass, including the control arms that
+  must reproduce each bug with its fix switched off; run it before calling a release
+  validated. Silent miscompute is the common bug
   class here, where `rocblas_status_success` returns with wrong numbers. A CPU or
   an emulator cannot reproduce it, and a patch that only "applies clean" and
   "compiles" has proved nothing about correctness.

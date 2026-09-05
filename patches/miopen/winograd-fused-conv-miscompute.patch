@@ -95,6 +95,26 @@ patched lines), so this patch cannot regress them; see
 winograd-fused-conv-miscompute.sh for how this patch is applied and
 verified at build time.
 
+VERIFIED ON HARDWARE
+--------------------
+The applicability narrowing was measured on the card, both directions:
+
+  * 6.4.4, the model that found it: per-node ONNX bisection of CLAP's real audio
+    encoder, where the padded-1x1 shape that this patch now refuses reports
+    cos(CPU_EP, ROCM_EP) = 0.79-0.86 instead of ~1.0, and a standalone MIOpen
+    fusion-plan repro reproduces the same ~2% systematic error for that shape class.
+  * 10.0 (2026-09-05), with this patch in the built image: `conv_solver_sweep` with
+    `MIOPEN_DEBUG_FIND_ONLY_SOLVER` forcing the sibling general Winograd gives
+    17 shapes tested / 0 WRONG, and forcing `ConvBinWinograd3x3U` (the genuine 3x3
+    case this patch deliberately keeps) gives 18 shapes tested / 0 WRONG.
+
+This solver runs entirely inside its own transform kernels, so it shares no code path
+with the `patches/rocblas/sgemm-shim` fp16 GEMM route. That is measured rather than
+assumed: forcing either Winograd solver gives byte-identical sweep results with the
+shim at its current build, at the previous build, and with `LD_PRELOAD` cleared, and a
+fp16 1x1 conv of the CLAP shape class (C=64, K=24) records zero takeovers on either
+build. A numeric error in one cannot be evidence about the other.
+
 diff --git a/src/solver/conv_bin_winoRxS_fused.cpp b/src/solver/conv_bin_winoRxS_fused.cpp
 --- a/src/solver/conv_bin_winoRxS_fused.cpp
 +++ b/src/solver/conv_bin_winoRxS_fused.cpp

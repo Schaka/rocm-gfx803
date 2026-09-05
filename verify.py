@@ -7,7 +7,7 @@ import check does not: the MIGraphX EP, rocBLAS GEMM, MIOpen convolution, the
 rocSOLVER device code, torch.linalg, and cross-dispatch coherence. Every one of
 them can import cleanly and still fail, or fall back silently, on real hardware.
 
-See README.gfx803.md#verifying-on-hardware.
+See README.md, "Building", for how to start the container this runs in.
 """
 
 import sys
@@ -59,24 +59,20 @@ def main():
         fail("MIGraphXExecutionProvider not built into this wheel")
 
     step("MIGraphX EP inference")
-    # onnx's default IR/opset can outrun what ORT 1.21.1 supports
-    # (max IR version 10, ai.onnx opset ceiling 22). Pin both explicitly.
+    # The model is a single Relu over 4 floats, serialized here rather than built
+    # with python-onnx: the image ships onnxruntime, not onnx. opset 22 and IR
+    # version 10 are ORT 1.21.1's ceilings; a newer default makes the EP refuse
+    # the file instead of falling back, which would hide an EP regression.
+    import base64
+
     import numpy as np
-    import onnx
-    from onnx import helper, TensorProto
 
-    node = helper.make_node("Relu", ["x"], ["y"])
-    graph = helper.make_graph(
-        [node],
-        "g",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [4])],
+    relu_onnx = base64.b64decode(
+        "CAo6MwoMCgF4EgF5IgRSZWx1EgFnWg8KAXgSCgoICAESBAoCCARiDwoBeRIKCggIARIE"
+        "CgIIBEIECgAQFg=="
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 22)])
-    model.ir_version = 10
-    onnx.save(model, "/tmp/relu.onnx")
 
-    sess = ort.InferenceSession("/tmp/relu.onnx", providers=["MIGraphXExecutionProvider"])
+    sess = ort.InferenceSession(relu_onnx, providers=["MIGraphXExecutionProvider"])
     active = sess.get_providers()
     print("session providers:", active)
     if active[0] != "MIGraphXExecutionProvider":
@@ -200,7 +196,8 @@ spd = a @ a.T + 64 * torch.eye(64, device=dev)
 rv = {}
 q, r = torch.linalg.qr(a)
 rv["qr"] = torch.allclose(q @ r, a, atol=1e-3)
-rv["cholesky"] = torch.allclose(torch.linalg.cholesky(spd) @ torch.linalg.cholesky(spd).T.mT, spd, atol=1e-2)
+L = torch.linalg.cholesky(spd)
+rv["cholesky"] = torch.allclose(L @ L.mT, spd, atol=1e-2)
 rv["solve"] = torch.allclose(torch.linalg.solve(spd, a), spd.inverse() @ a, atol=1e-2)
 u, s, vh = torch.linalg.svd(a)
 rv["svd"] = torch.allclose(u @ torch.diag(s) @ vh, a, atol=1e-2)
@@ -228,13 +225,21 @@ raise SystemExit(1 if bad else 0)
     # under a caching allocator that recycles a handful of VAs. One round is
     # enough to catch it, because the copy-engine direction is deterministic and
     # not a race.
-    conv = nn.Conv2d(320, 320, 3, padding=1).cuda().double()
+    conv = nn.Conv2d(320, 320, 3, padding=1).cuda()
     xn = torch.randn(1, 320, 16, 16, device="cuda")
+    # The GPU runs fp32 because that is the shape and precision the fault showed
+    # on; the reference is fp64 on CPU so the comparison has headroom.
+    ref = nn.functional.conv2d(
+        xn.cpu().double(),
+        conv.weight.detach().cpu().double(),
+        conv.bias.detach().cpu().double(),
+        padding=conv.padding,
+    )
+    scale = max(ref.abs().max().item(), 1e-30)
     for _ in range(6):
-        y = conv(xn.float())
+        y = conv(xn)
         got = y.cpu().double()
-        ref = nn.functional.conv2d(xn.double(), conv.weight.detach().cpu(), conv.bias.detach().cpu())
-        rel = (got - ref).abs().max().item() / max(ref.abs().max().item(), 1e-30)
+        rel = (got - ref).abs().max().item() / scale
         if rel > 1e-3:
             fail(f"host copy of a conv disagrees with the CPU reference (max rel err {rel:.3g}) "
                  "-- stale-read/coherence regression")

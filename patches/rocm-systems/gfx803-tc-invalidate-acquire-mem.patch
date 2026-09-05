@@ -2,17 +2,20 @@ ROCclr (gfx7/gfx8, ROCm 10.0): on CIK the CP ignores the AQL acquire and
 release fence-scope bits, and nothing else maintains the compute shader's TC
 across a command boundary. One PM4 ACQUIRE_MEM packet
 (TC_ACTION_ENA|TC_WB_ACTION_ENA, whole address range), published in its own AQL
-ring slot, closes the two directions in which that silently corrupts data:
+ring slot, closes the three directions in which that silently corrupts data:
 
   1. Ahead of every kernel dispatch, so a kernel cannot be served stale shader-TC
      lines (the reader direction).
   2. Ahead of the barrier that a copy-engine transfer waits on, so a copy engine
      cannot read memory whose dirty lines are still in the caches (the
-     external-reader direction).
+     external-reader direction, same queue).
+  3. Ahead of an event-record barrier, so a copy engine on another queue cannot
+     read memory whose dirty lines are still in the caches (the
+     external-reader direction, foreign queue).
 
-Both sites are gated on `dev().isa().versionMajor() <= 8` and on the new
+All three sites are gated on `dev().isa().versionMajor() <= 8` and on the new
 `CLR_GFX8_TC_INVALIDATE` flag, which is on by default, so one binary can be
-measured both ways.
+measured both ways. Site 3 has its own flag, `CLR_GFX8_TC_RECORD_FENCE`.
 
 REASON 1: THE READER DIRECTION
 ------------------------------
@@ -103,29 +106,63 @@ barrier follows it. Both halves of that order are load-bearing, and the code
 comment at the call site states why. Measured with one binary and the knob
 toggled: 0/240 on, 90/240 off, and the op suite goes from 197-199/202 to 202/202.
 
-KNOWN LIMITATION: CROSS-QUEUE HANDOFF
--------------------------------------
-(2) closes same-stream producer-to-host traffic, and improves a cross-stream
-producer (`ev.record(side)` on another `torch.cuda.Stream`) from 90/240 to 5/240,
-but it does not close it. On this ISA the writeback has to be executed on the
-producer's own ring, and a flush on the consumer's ring does not cover it. Two
-experiments show this directly: one extra small kernel on the producer's ring
-after the producer's work gives 0/240, because that dispatch carries the (1) slot,
-while a full `torch.cuda.synchronize()` in the same place does not help, because
-the wait only polls signals and never flushes.
+REASON 3: THE CROSS-QUEUE HANDOFF
+---------------------------------
+Symptom after (1) and (2) were in: `tools/tc-staleness/multistream2.py`, a producer
+conv on a `torch.cuda.Stream` side stream, an event record, `wait_event` on the
+default stream, then a host copy of the side stream's result, still returns stale
+bytes on roughly 1 copy in 50. `tools/tc-staleness/ms3.py` (checked in with this
+change) is the same shape with each anomaly classified, and it says where the loss
+is: the first host copy is wrong, a *kernel* clone taken immediately afterwards is
+right, and a second host copy after a sync is right too. So nothing is destroyed;
+the copy engine read DRAM before the producer's dirty lines reached it.
 
-Adding the producer-side flush at its natural point, `VirtualGPU::submitMarker()`,
-is not viable and was reverted twice. Extra barrier packets there collide with the
-marker's own signal bookkeeping: `ShouldCoalesceMarker` and
-`last_barrier_hw_event_` end up attached to a recycled `ProfilingSignal`, and the
-process dies within a few hundred markers with `malloc(): smallbin double linked
-list corrupted`. That happens both through `releaseGpuMemoryFence(kSkipCpuWait)`
-and through the bare `dispatchBarrierPacket`/`insertTcFence`/
-`dispatchBarrierPacket` sequence. Anyone who revisits this must keep the raw PM4 slot free of signal
-publication, because that is why it is safe in the two places that use it now, and
-must find a hook that adds no packet inside the marker path.
-Single-stream torch, MIGraphX, and ORT are unaffected. A multi-stream pipeline is
-still exposed. Treat it as such.
+Two obvious fixes measured as no help at all, and one that measured as worse than
+nothing, all on one binary with knobs:
+
+  * Attaching the producer's completion signal to the barrier in front of the (2)
+    writeback, on the consumer's ring, in one place or in both: 11/960 with the
+    attach, 11/960 without. The barrier's `dep_signal` is honoured by the CIK
+    queue's AQL packet processor, and the CP does not consult that when it pulls a
+    raw PM4 packet out of the same ring.
+  * A CP-side `PM4 WAIT_REG_MEM` (the packet the kernel driver itself uses for
+    pipeline sync on this IP, `sid.h` 0x3C, 7 dwords, MEM_SPACE bit 4, poll
+    interval in its own dword, encoding taken from
+    `gfx_v8_0_ring_emit_pipeline_sync`) in front of the writeback: it does not
+    execute in an AQL ring. It stalls the queue for every comparison value tested,
+    including the one that means "do not wait", and the stall is real (the debug
+    kernel logged `Resetting wave fronts (cpsch)`). ROCr only ever emits this
+    packet on its legacy PM4 ring. Reverted.
+  * Routing the cross-stream copy through the shader instead of the copy engine:
+    13/960, i.e. no better than the control, because the blit that was redirected
+    is not the transfer that was exposed. Reverted. It also would have cost the
+    copy bandwidth of every such transfer for nothing.
+
+What does close it is the producer-side flush, which is the place the caches can
+actually be pushed from: `VirtualGPU::submitMarker()`, on the queue that is about
+to be waited on, when the marker is an event record (`vcmd.coalesceEvent() != 0`),
+which is the same test the marker's own coalescing logic uses.
+
+This is a different thing from what the earlier version of this header said was
+impossible at that spot. What is impossible there is an extra *barrier*, because a
+barrier takes a tracked completion signal and the marker path's own signal
+bookkeeping (`ShouldCoalesceMarker`, `last_barrier_hw_event_`) then ends up holding
+a recycled `ProfilingSignal`: the process dies of `malloc(): smallbin double linked
+list corrupted` within a few hundred markers, both through
+`releaseGpuMemoryFence(kSkipCpuWait)` and through a hand-built
+barrier/slot/barrier. The raw slot taken alone publishes no signal and touches no
+tracker, which is exactly the condition the earlier text told the next person to
+satisfy, and it is safe here for the same reason it is safe at the other two sites.
+
+Measured on the card with one binary and `CLR_GFX8_TC_RECORD_FENCE` toggled:
+`ms3.py` 0/2000 with the site on, 21/960 with it off; `multistream2.py` 0/1600;
+`ms4.py` (same shape, but the consumer copies into pinned host memory, and a second
+arm where two producer streams fan into one consumer) 0/2400 on, with its control
+reproducing; `xprobe2.py` (cross-queue kernel reader) 0/40; `pinnedhost.py` 0/60;
+`conbrace3.py` (the same-stream case of (2)) 0/800. Cost: one 64-byte ring slot per
+event record, on gfx7 and gfx8 only, and no change to any copy path's engine, so
+D2H and H2D keep the copy engine. Measured bandwidth is unchanged inside noise
+(D2H pinned 2.07 to 2.03 GiB/s, H2D pinned 4.83 to 4.76 GiB/s).
 
 WHAT
 ----
@@ -140,12 +177,17 @@ that ROCr's gfx8 `ExecutePM4()` already uses, with the payload inlined instead o
 fetched through an indirect buffer. dword 0 is stored last with release semantics,
 so the CP never sees a half-built packet, and the packet that follows rings the
 doorbell at a higher ring index, which covers this slot too. The slot publishes no
-completion signal of its own. Two call sites:
+completion signal of its own. Three call sites:
 
   * `dispatchGenericAqlPacket()`, for the kernel-dispatch packet types only.
   * `releaseGpuMemoryFence()`, between its barrier and a second barrier, which
     covers every non-shader reader of GPU memory, because both
     `DmaBlitManager::readBuffer` and `writeBuffer` fence there before SDMA.
+  * `submitMarker()`, when the marker is an event record
+    (`vcmd.coalesceEvent() != 0`), which is the point where this queue's results
+    become readable by whoever waits on that event. It is the raw slot only: no
+    barrier, no completion signal, so it takes no part in the marker's own signal
+    bookkeeping.
 
 CAVEAT FOR THE NEXT PERSON: the HIP graph replay path
 (`VirtualGPU::dispatchAqlPacketBatchFlat`) copies captured packets into the ring in
@@ -164,7 +206,8 @@ part, because the queue cap is 64 packets (see
 graph-replay-batch-chunk-deadlock.patch). The slot-stall wait in
 `WaitForQueueSlot()` keeps it correct when the ring fills. (2) adds
 barrier, slot, and barrier per pre-copy fence. A fence happens per host-visible
-transfer and per device sync, not per kernel. Measured on the card: D2H +2.7%,
+transfer and per device sync, not per kernel. (3) adds one slot per event record
+and nothing at all to a copy path's choice of engine, so D2H and H2D keep SDMA. Measured on the card: D2H +2.7%,
 H2D +1.5%, one-element sync 3.6 to 4.2 us, and compute unchanged (fp16 2048^3 GEMM
 +0.04%, conv and GPU-to-GPU clone unchanged).
 
@@ -184,21 +227,30 @@ not-reproducible-with-itself (53/60 gradient frozen-copy mismatches, 47/60 steps
 with the wrong loss against CPU) to bit-identical with the CPU loss trajectory.
 `ghost2.py` gives 0/40. External-reader direction: the conv probe went 90/240 to
 0/240.
-Torch op suite: 202/202 PASS, 0 BAD, 0 NONFINITE, both with a hand-built library
-and with `libamdhip64` taken from the image this patch chain produces. sd1.5
+Cross-queue direction, one binary with `CLR_GFX8_TC_RECORD_FENCE` toggled:
+`ms3.py` 0 anomalies in 2000 checks on, 21 in 960 off; `multistream2.py` 0/1600;
+`ms4.py` (pinned destination, and two producers fanning into one consumer) 0/2400.
+Same binary, other probes: `xprobe2.py` 0/40, `pinnedhost.py` 0/60, `conbrace3.py`
+0/800. Copy bandwidth unchanged inside noise (D2H pinned 2.07 to 2.03 GiB/s, H2D
+pinned 4.83 to 4.76 GiB/s), because no copy is moved off the copy engine.
+Torch op suite on the box stack: 202/202 PASS, 0 BAD, 0 NONFINITE, both with a
+hand-built library and with `libamdhip64` taken from the image this chain produces.
+Inside the image the suite reports 118 PASS, 0 BAD, 0 NONFINITE and 84 ERRORs that
+are all `/ INDUCTOR`: the image ships no Triton, so inductor cannot compile, which
+is a content question about the image and not a wrong answer. sd1.5
 txt2img x6 with no GPU resets, and dmesg clean of resets and VM faults
 throughout. `tools/tc-staleness/README.md` holds the harnesses and the expected
 numbers.
 
-Not measured, and open: HIP graph replay (see the caveat) and the cross-queue
-handoff (see KNOWN LIMITATION).
+Not measured, and open: HIP graph replay (see the caveat).
 
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -1411,6 +1411,72 @@
+@@ -1410,6 +1410,72 @@ void VirtualGPU::ringQueueDoorbell(uint64_t index) {
+   }
  }
  
- // ================================================================================================
++// ================================================================================================
 +// gfx7/gfx8 only: publish a PM4 ACQUIRE_MEM (TC invalidate + TC writeback) in its own AQL ring
 +// slot immediately ahead of a client kernel dispatch.
 +//
@@ -264,11 +316,10 @@ handoff (see KNOWN LIMITATION).
 +  return true;
 +}
 +
-+// ================================================================================================
+ // ================================================================================================
  template <typename AqlPacket>
  bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, uint16_t rest,
-                                           bool blocking, bool attach_signal, bool cluster_launch) {
-@@ -1418,6 +1484,11 @@
+@@ -1418,6 +1484,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
    const uint32_t queueMask = queueSize - 1;
    const uint32_t sw_queue_size = queueMask;
  
@@ -280,7 +331,7 @@ handoff (see KNOWN LIMITATION).
    // Check for queue full and wait if needed.
    uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
    adjustHeader(header);
-@@ -2177,6 +2248,23 @@
+@@ -2177,6 +2248,23 @@ bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
    if (hasPendingDispatch_ || isFenceDirty() || !Barriers().IsExternalSignalListEmpty()) {
      // Dispatch barrier packet into the queue
      dispatchBarrierPacket(kBarrierPacketHeader);
@@ -304,16 +355,37 @@ handoff (see KNOWN LIMITATION).
      hasPendingDispatch_ = false;
      skippedDispatches_ = 0;
      retainExternalSignals_ = false;
+@@ -5108,6 +5196,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+     SetCoalesceWindow(0, nullptr);
+   } else {
+     profilingBegin(vcmd);
++
++    // gfx7/gfx8: an event record is where another queue becomes allowed to read what this
++    // queue wrote. A writeback enqueued on the *reading* queue cannot be ordered behind a
++    // kernel on this one, because the CIK CP takes raw PM4 out of an AQL ring without
++    // consulting the AQL dependency chain (measured: 10-21 corruptions per 960 cross-stream
++    // host copies). Write it back here, in the queue that owns the dirty lines, where the
++    // ring order does put it behind those kernels and in front of the barrier whose
++    // completion signal the reader's wait chain is built from.
++    if (CLR_GFX8_TC_RECORD_FENCE && vcmd.coalesceEvent() != 0 && !insertTcFence()) {
++      LogError("gfx803: TC writeback at event record failed");
++    }
++
+     const Settings& settings = dev().settings();
+     hsa_signal_t ipc_s{0};
+     if (vcmd.ipcCompletionSignal() != nullptr) {
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
-@@ -722,6 +722,12 @@
+@@ -722,6 +722,14 @@ class VirtualGPU : public device::VirtualDevice {
                                    bool blocking = false,
                                    const std::vector<uint8_t>* flatMetadataData = nullptr) override;
  
-+  //! gfx7/gfx8: publish an ACQUIRE_MEM (TC invalidate + writeback) ring slot ahead of a
-+  //! kernel dispatch, so the dispatch cannot be served stale shader-TC lines, and ahead of
-+  //! the fence barrier, so a copy engine cannot read memory whose dirty lines are still in
-+  //! the shader TC. No-op (and always true) on other ISAs or when CLR_GFX8_TC_INVALIDATE=0.
++  //! gfx7/gfx8: publish an ACQUIRE_MEM (TC invalidate + writeback) ring slot, so a reader
++  //! cannot be served stale shader-TC lines or copied unwritten-back bytes. Three call
++  //! sites: ahead of a kernel dispatch, inside the pre-copy fence, and ahead of an
++  //! event-record barrier for the benefit of a queue on the other side of that event.
++  //! No-op (and always true) on other ISAs or when CLR_GFX8_TC_INVALIDATE=0. The slot
++  //! publishes no completion signal, which is what makes it safe inside the marker path.
 +  bool insertTcFence();
 +
    template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
@@ -321,7 +393,7 @@ handoff (see KNOWN LIMITATION).
                                                                bool attach_signal = false,
 --- a/projects/clr/rocclr/utils/flags.hpp
 +++ b/projects/clr/rocclr/utils/flags.hpp
-@@ -171,6 +171,12 @@
+@@ -171,6 +171,17 @@ release(uint, HIP_HOST_COHERENT, 0,                                           \
  release(uint, AMD_OPT_FLUSH, 1,                                               \
          "Kernel flush option , 0x0 = Use system-scope fence operations."      \
          "0x1 = Use device-scope fence operations when possible.")             \
@@ -331,6 +403,11 @@ handoff (see KNOWN LIMITATION).
 +work, because on CIK/VI the AQL acquire/release fence scope is ignored: a kernel \
 +can read bytes an earlier kernel overwrote, and SDMA can copy them out of \
 +physical memory before the writer's dirty lines are written back. 0 = off.")   \
++release(bool, CLR_GFX8_TC_RECORD_FENCE, true,                                      \
++        "gfx7/gfx8 only: also emit the ACQUIRE_MEM writeback ahead of an event-record     \
++        barrier, so a queue that is about to be waited on publishes its shader TC lines   \
++        in its own ring. Off leaves cross-stream host copies reading bytes the producer   \
++        has not written back.")                                                           \
  release(bool, AMD_DIRECT_DISPATCH, IS_LINUX,                                  \
          "Enable direct kernel dispatch.")                                     \
  release(uint, HIP_HIDDEN_FREE_MEM, 0,                                         \

@@ -633,30 +633,9 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-rocblas-ccache \
     fi \
     && echo "OK: librocblas.so resolves to a ${ROCM_ARCH} build with a ${fatbin_size}-byte .hip_fatbin."
 
-# rocBLAS/Tensile's own SGEMM kernels are unreliable on gfx803 for every shape
-# tested -- see patches/rocblas/sgemm-shim/gfx803_sgemm.h for the full
-# investigation. LD_PRELOAD shim that routes the standard-algo f32
-# rocblas_sgemm/rocblas_gemm_ex path to a correctness-verified replacement
-# kernel; the ENV enabling it lives in the final stage. This line also
-# intercepts rocblas_gemm_strided_batched_ex (small problems only) for the
-# batched attention dots MIGraphX lowers there -- rocm6.4.4 does NOT have
-# that interceptor yet. Kept as its own copy so this line can change without
-# touching the 6.4.4 build (see the header); the strided-batched takeover
-# fix is verified by the sb-takeover-no-algo-gate marker check below.
-RUN mkdir -p /opt/rocm-sgemm-shim
-COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
-RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
-        /opt/rocm-sgemm-shim/sgemm_shim.cpp \
-        /opt/rocm-sgemm-shim/gfx803_gemm_lib.hip \
-        -o /opt/rocm/lib/libgfx803_sgemm_shim.so \
-        -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lrocblas -ldl \
-    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so 2>/dev/null | grep -q "sb-takeover-no-algo-gate"; then \
-        echo "FATAL: shim built without the strided-batched takeover fix (algo gate)." >&2; exit 1; \
-    fi \
-    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so 2>/dev/null | grep -q "f16-takeover"; then \
-        echo "FATAL: shim built without the fp16 takeover fix." >&2; exit 1; \
-    fi \
-    && rm -rf /opt/rocm-sgemm-shim
+# The SGEMM shim is built in sgemm-shim-builder, not here: a build that supplies
+# ROCBLAS_IMAGE skips this stage, and a shim compiled from this tree's sources must
+# not depend on whether an upstream stage was reused.
 
 COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
 ARG GFX803_LINE
@@ -902,6 +881,36 @@ LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
       io.rocm.gfx803.pins="${GFX803_PINS}"
 RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="rocsolver" \
     /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
+# ---- SGEMM shim ---------------------------------------------------------------------------
+# rocBLAS/Tensile's own SGEMM kernels are unreliable on gfx803 for every shape tested, so this
+# LD_PRELOAD shim answers standard-algo f32 rocblas_sgemm/rocblas_gemm_ex with a kernel that was
+# verified on the card, plus the fp16 gemm_ex takeover and the small-problem
+# rocblas_gemm_strided_batched_ex takeover that MIGraphX's batched attention dots land in.
+# The enabling ENV lives in the final stage. The sources live in patches/rocblas/sgemm-shim/.
+#
+# It gets its own stage because a build that supplies ROCBLAS_IMAGE skips rocblas-builder
+# entirely. Building the shim there would ship whatever .so the published image happens to
+# carry, however current this tree's sources are.
+FROM rocsolver-builder AS sgemm-shim-builder
+COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
+RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
+        /opt/rocm-sgemm-shim/sgemm_shim.cpp \
+        /opt/rocm-sgemm-shim/gfx803_gemm_lib.hip \
+        -o /opt/rocm/lib/libgfx803_sgemm_shim.so \
+        -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lrocblas -ldl \
+    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "sb-takeover-no-algo-gate"; then \
+        echo "FATAL: shim built without the strided-batched takeover fix (algo gate)." >&2; exit 1; \
+    fi \
+    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "f16-takeover"; then \
+        echo "FATAL: shim built without the fp16 takeover." >&2; exit 1; \
+    fi \
+    && if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "f16-map-nm"; then \
+        echo "FATAL: shim built with the old fp16 operand mapping: it hands the kernel (m, n)" >&2 \
+        echo "       where the column-major contract needs (n, m), which transposes the answer" >&2 \
+        echo "       and reads past both operands whenever m != n." >&2; exit 1; \
+    fi \
+    && rm -rf /opt/rocm-sgemm-shim
 
 FROM ${ROCSOLVER_IMAGE} AS rocsolver-export
 
@@ -1466,6 +1475,12 @@ COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 # hipSOLVER needs no equivalent copy -- it carries no device code and delegates
 # into rocSOLVER, whose symbols resolve to this file at load time.
 COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
+# The SGEMM shim is always this build's own, never the base chain's copy.
+COPY --from=sgemm-shim-builder /opt/rocm/lib/libgfx803_sgemm_shim.so /opt/rocm/lib/
+RUN if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "f16-map-nm"; then \
+        echo "FATAL: installed SGEMM shim does not carry the fp16 operand-mapping fix." >&2; exit 1; \
+    fi \
+    && echo "OK: SGEMM shim built from this tree with the fp16 mapping fix."
 
 # The three HIP runtime libraries must come from our own rocr-clr build, but the
 # base image and every published chain image can still be carrying a stock twin

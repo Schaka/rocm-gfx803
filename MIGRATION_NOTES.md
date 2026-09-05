@@ -250,3 +250,163 @@ next step, and the 7.14 line needed a build and hardware rerun.
 7.14 to 10.0 jump is the same major-version skip that the mainline repo's "Nightly
 ROCm versioning" section documents. The release branches exist and are the active
 lines.
+
+## 2026-09-05: cross-queue handoff closed (third ACQUIRE_MEM site)
+
+The coherence patch fixed two directions and left a third open: a producer on
+another `torch.cuda.Stream`, an event record, a wait on the default stream, then a
+host copy of the producer's result, still returned stale bytes on roughly 1 copy in
+50. `tools/tc-staleness/ms3.py` classifies each anomaly, and it said the copy was
+early rather than the data being lost: the first host copy was wrong, a kernel clone
+taken immediately after it was right, and a second copy after a sync was right too.
+
+Three candidate fixes were measured on one binary with knobs, and two of them are
+worth recording because they look right and are not:
+
+- Attaching the producer's completion signal to the barrier in front of the existing
+  pre-copy writeback, in one place or in both: 11/960 with the attach and 11/960
+  without. The barrier's `dep_signal` list is honoured by the CIK AQL packet
+  processor, and the CP does not consult it when it pulls a raw PM4 packet out of the
+  same ring. So ordering written in AQL terms does not reach a PM4 slot.
+- A CP-side `PM4 WAIT_REG_MEM`, encoded from `amdgpu/sid.h` and
+  `gfx_v8_0_ring_emit_pipeline_sync` (opcode 0x3C, 7 dwords, MEM_SPACE bit 4, poll
+  interval its own dword): it does not execute inside an AQL ring at all. The queue
+  stalls on it for every comparison value, including the one that means "do not
+  wait", and the debug kernel logged `Resetting wave fronts (cpsch)`. ROCr emits that
+  packet only on its legacy PM4 ring. Cost of learning this: one reboot.
+- Routing the cross-stream copy through the shader instead of the copy engine:
+  13/960, no better than the control. The transfer that gets redirected is not the
+  transfer that is exposed. Reverted, along with the flag and the selection site.
+
+What works is the writeback on the producer's own ring, at the point where that queue
+commits its results to somebody else: `VirtualGPU::submitMarker()`, only when the
+marker is an event record. This is the raw slot alone, with no barrier and no
+completion signal, which is why it does not disturb the marker's signal bookkeeping
+and so does not repeat the heap corruption that an extra barrier at that spot caused
+earlier. Measured with `CLR_GFX8_TC_RECORD_FENCE` toggled on one binary: `ms3.py`
+0 anomalies in 2000 checks against 21 in 960, `multistream2.py` 0/1600, and
+`ms4.py` (pinned destination, and two producers fanning into one consumer) 0/2400.
+D2H pinned 2.07 to 2.03 GiB/s and H2D pinned 4.83 to 4.76 GiB/s, so no copy moved off
+the copy engine. HIP graph replay is still the one dispatch path with no slot of its
+own; `tools/tc-staleness/graphprobe.py` is the probe for it and it remains unproven.
+
+Also on 2026-09-05:
+
+- `scripts/git-pin.sh` could only resolve `refs/heads/<ref>`, so a local build with
+  no `ORT_SHA` failed on onnxruntime's tag pin `v1.29.0` as a bare exit 128. It now
+  asks whether the named ref is a branch or a tag and fetches that, which is what the
+  documented plain local build needs.
+- The op suite inside the image reports 118 PASS, 0 BAD, 0 NONFINITE, 84 ERROR, and
+  every ERROR is a `/ INDUCTOR` variant: the image ships no Triton. The 202/202
+  figure belongs to the box stack, which has it. Two different environments, two
+  different numbers, both stated.
+- On the box, `/data/rocm-7.14`, `/data/venv-7.14`, the model and repack directories,
+  and about 400 GB of stale docker images and dangling tars were removed to make room
+  for loading the 10.0 image. Podman storage on that box is under `/data`, so an
+  image load needs room there and not on `/`. `docker save | podman load` through a
+  pipe fails as "payload does not match any of the supported image formats"; write the
+  archive to a file first.
+
+## 2026-09-05 (later): image built with the third site; on-card in-image run pending
+
+`rocm-gfx803:local-fulltest2` (40.4 GB) was built locally from this tree with the
+regenerated patch. The build reused the published rocBLAS and MIOpen images and built
+ROCclr, rocSOLVER, MIGraphX, torch, torchvision, torchaudio and ORT from the pinned
+refs, and every in-build content gate passed: `gfx803 TC-fence patch applied and
+verified (dispatch + pre-copy fence + event record)`, `single libamdhip64 build:
+libamdhip64.so.7.15.26333-6b0e43f341`, and `librocsolver.so resolves to a gfx803 build
+with a 163198144-byte .hip_fatbin`.
+
+Verified inside the image without a card: `hipconfig` 7.15.26333-6b0e43f341,
+`/opt/rocm/.gfx803-line` reads `line=rocm10 stage=final`, the installed
+`libamdhip64.so` (md5 `49065373bf7ecf90c5ac47f0b28fa4fc`) contains both
+`CLR_GFX8_TC_RECORD_FENCE` and the event-record site's log literal, so the third site
+is in the shipped library and not only in the source; `torch` 2.14 imports; ONNX
+Runtime reports `MIGraphXExecutionProvider`; no unresolved dynamic dependencies.
+
+Still to do, and deliberately not claimed done: the full suite run *inside this image*
+on the card. The library source that the image compiles is the source that was
+measured on the card earlier the same day (`ms3` 0/2000, `multistream2` 0/1600,
+`ms4` 0/2400, `xprobe2` 0/40, `pinnedhost` 0/60, `conbrace3` 0/800, soak 0/631, train
+bit-identical to CPU, `verify.py` all pass, op suite 0 BAD), and the only difference
+between that source and the patch in this commit is a header comment, with no
+`__LINE__` in the file, so the compiled result is the same. What has not happened is
+running the image itself against `/dev/kfd`, because the test box did not come back
+after a forced reboot that followed an SDMA ring timeout. `tools/imgvalidate.sh
+<image-tag>` performs that run and prints the expected shape of each result; it also
+ships the control arm (`CLR_GFX8_TC_RECORD_FENCE=0`) that reproduces the corruption, so
+the run proves the site is what fixes it and not the machine having calmed down. Load
+the image onto the box with `docker save | ssh 'cat > /data/img.tar'` and then
+`podman load -i /data/img.tar`: reading the archive from a pipe fails as "payload does
+not match any of the supported image formats", and podman's storage lives under `/data`.
+
+## 2026-09-05 (later): the fp16 GEMM takeover was calling its kernel with transposed dimensions
+
+`tools/imgvalidate.sh` run against the freshly built image turned up a second,
+unrelated defect: fp16 convolutions returned garbage (`max ~5e4` where the true value
+is `~28`) and then took the context down with `illegal memory access`, usually reported
+inside MIOpen's next `hipModuleGetFunction` rather than at the GEMM that caused it. It
+reproduced with `CLR_GFX8_TC_INVALIDATE=0` and in the previous image, so it was not the
+coherence work; `GFX803_SGEMM_SHIM_DISABLE=1` made every case correct, which put it in
+our own `patches/rocblas/sgemm-shim/`.
+
+The cause was the caller, not the kernel. `route_f16` hands the row-major kernel in
+`gfx803_gemm_lib.hip` the two operands swapped but the dimensions in the same order,
+`(m, n)`. Under the column-major contract that its own gate insists on (`lda==m`,
+`ldb==k`, `ldd==m`, no transposes, `C==D`), the buffers read row-major are `b=[n,k]`,
+`a=[k,m]`, `d=[n,m]`, so the product that belongs in `d` is `b @ a` with `M=n, N=m,
+K=k`. With `(m, n)` the kernel computes the transpose and walks `m*k` elements out of a
+`k*n` buffer. That is only self-consistent when `m == n`, which is why it survived
+testing: every shape it had been checked on was square.
+
+Convolution is the case where it never is. im2col gives `K = Cin*R*S` and `M = H*W`, so
+a 3-channel 3x3 conv over 64x64 arrives as `m=4096, n=64, k=27`.
+
+Measurement, both shims, 27 cases, one case per process because a fault kills the
+context and would otherwise hide every case after it:
+
+| case group | old `(m, n)` | fixed `(n, m)` |
+|---|---|---|
+| square `mm` / `bmm` (8 cases) | correct | **identical values** (same call when `m == n`) |
+| non-square `mm` (7) | `nan` or wrong | correct |
+| non-square `bmm` (3, the batched attention-dot path) | `nan`, `1.6`, `1.2` | correct |
+| fp16 `conv` (9) | `nan` or wrong | correct |
+
+Regressions: 0. Fixed: 19. Called directly against its own documented contract, the
+kernel gives max error 7e-05 at `M=4096, N=64, K=27`, so nothing in
+`gfx803_gemm_lib.hip` needed changing, and an earlier alignment guard I had added to its
+tile loaders was reverted for that reason: the stock kernel already survives unaligned
+rows, so that edit would have been an unproven change to a hot path.
+
+Two structural changes came with it:
+
+- The shim is now built in its own `sgemm-shim-builder` stage instead of inside
+  `rocblas-builder`. `rocblas-builder` is skipped whenever a build supplies
+  `ROCBLAS_IMAGE`, which is how local builds and CI stage reuse work, so the shim was
+  being inherited from the published rocBLAS image: a rebuild with the source fixed
+  would have shipped the broken `.so` and passed every existing gate. The build now
+  asserts a marker string for each takeover, in that stage and again in the final
+  stage.
+- `tools/correctness-suite/fp16_gemm_sweep.py` is the regression test for this route,
+  and `tools/imgvalidate.sh` is the on-card gate for a whole image.
+
+Also recorded the same day, from a bad hour of debugging on the box: `timeout N podman
+exec` leaves the process running inside the container holding its GPU context, which
+poisons the next measurement as an apparent `out of memory` or illegal access; a wedge
+under `gpu_recovery=0` puts tasks in `D` state where `kill -9` cannot reach them and
+`modprobe -r amdgpu` blocks; and `pkill -f`/`pgrep -f` match the shell that invokes
+them, which silently killed my own launchers twice. All three are in the README's box
+section now.
+
+## 2026-09-05 (later): winograd recheck against the corrected fp16 shim
+
+The fp16 operand-mapping fix raised a question about earlier MIOpen measurements, so it
+was tested rather than assumed. Inside the 10.0 release image, `conv_solver_sweep` with
+`MIOPEN_DEBUG_FIND_ONLY_SOLVER` forcing `ConvBinWinogradRxS` gives 17 shapes tested / 0
+WRONG and forcing `ConvBinWinograd3x3U` gives 18 / 0 WRONG, and every one of those
+results is byte-identical across three shim states: the corrected shim, the previous
+shim, and `LD_PRELOAD` cleared. A fp16 1x1 conv of the shape class that found the
+winograd bug in the first place (C=64, K=24) records **zero** takeovers into the fp16
+GEMM route on either shim build. So the Winograd solvers keep their results inside their
+own transform kernels and share no path with the SGEMM shim; `winograd-fused-conv-
+miscompute.patch` needed no change, and the measurements quoted in its header stand.

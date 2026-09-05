@@ -34,11 +34,26 @@ if [ -n "$sha" ]; then
     git -C "$dest" fetch -q --depth 1 origin "$sha"
     git -C "$dest" checkout -q --detach FETCH_HEAD
 else
-    # No resolved commit, so follow the branch itself. This is deliberately loud,
-    # because a build that lands here compiles an unpinned tip.
-    echo "git-pin: WARNING: no *_SHA supplied for $ref; building whatever tip $url has right now." >&2
-    git -C "$dest" fetch -q --depth 1 origin "+refs/heads/$ref:refs/remotes/origin/$ref"
-    git -C "$dest" checkout -q --detach "refs/remotes/origin/$ref"
+    # No resolved commit, so follow the named ref itself. This is deliberately loud,
+    # because a build that lands here compiles something nobody pinned by hand.
+    echo "git-pin: WARNING: no *_SHA supplied for $ref; building whatever $url has for that ref right now." >&2
+    # Most pins are release branches, but onnxruntime pins a release tag, and
+    # `fetch refs/heads/v1.29.0` fails as a bare exit 128 that says nothing about the
+    # ref type. Ask which one it is, then fetch that, so a plain local build does not
+    # have to supply every *_SHA just to get past the clone.
+    if git -C "$dest" ls-remote --exit-code --heads origin "refs/heads/$ref" >/dev/null 2>&1; then
+        want="refs/heads/$ref"
+    elif git -C "$dest" ls-remote --exit-code --tags origin "refs/tags/$ref" >/dev/null 2>&1; then
+        want="refs/tags/$ref"
+    else
+        echo "git-pin: $url has neither a branch nor a tag named $ref" >&2
+        exit 1
+    fi
+    # One fixed local name, because a ref like release/2.14 contains a slash and a
+    # tag and a branch of the same name would otherwise land in different places.
+    git -C "$dest" fetch -q --depth 1 origin "+$want:refs/remotes/origin/pinned"
+    git -C "$dest" checkout -q --detach refs/remotes/origin/pinned
+    echo "git-pin: $ref resolved to $want" >&2
 fi
 
 echo "git-pin: $dest at $(git -C "$dest" rev-parse HEAD) ($ref)"
