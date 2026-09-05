@@ -1,6 +1,6 @@
 #!/bin/sh
-# Apply graph-replay-batch-chunk-deadlock.patch (see that file for the full
-# WHY/WHAT) via `git apply`, then verify the hunk actually landed.
+# Apply graph-replay-batch-chunk-deadlock.patch with `git apply`, then make sure
+# that the hunk landed. That patch file gives the reason and the change.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

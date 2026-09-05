@@ -1,8 +1,10 @@
 #!/bin/sh
-# Apply va-reuse-defer-mapping.patch (see that file for the full WHY/WHAT).
-# Must run AFTER va-reuse-defer.sh on the same checkout -- this patch's
-# context is the state va-reuse-defer.patch produces (the park branch and
-# the fmm_defer_release forward declaration).
+# Apply va-reuse-defer-mapping.patch with `git apply`, then make sure that the hunk
+# landed. That patch file gives the reason and the change.
+#
+# Run this after va-reuse-defer.sh on the same checkout. This patch's context is the
+# state that va-reuse-defer.patch produces, which is the park branch and the
+# fmm_defer_release forward declaration.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

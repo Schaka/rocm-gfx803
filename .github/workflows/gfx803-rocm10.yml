@@ -23,11 +23,18 @@ name: Build gfx803 (rocm10, main)
 # the from-source path. final assembles migraphx + miopen + pytorch +
 # torchvision + torchaudio + ort.
 #
-# This produces the *unsuffixed* :latest-gfx803/:gfx803/:cache-gfx803 tags --
-# rocm10 is this repo's main line. rocm7.14 (the line this one superseded,
-# see gfx803-rocm7.14.yml) and rocm6.4.4 (the older classic-tag line) publish
-# under a -rocm7.14 / -rocm6.4.4 suffix instead, see gfx803-rocm7.14.yml and
-# gfx803-rocm6.4.4.yml.
+# This is the repo's only build workflow: the rocm7.14 and rocm6.4.4 lines are
+# archived (their Dockerfiles, patches and verified-state notes stay under
+# rocm7.14/ and rocm6.4.4/ as the hardware-verified reference, and can still be
+# built by hand) and are no longer built or published here.
+#
+# Intermediate component images are tagged :gfx803-rocm10 via
+# intermediate-suffix below. That is deliberate: :gfx803 is what this repo
+# published before the main line moved to 10.0, so components whose 10.0 job has
+# not run since would otherwise be consumed as if they were 10.0 builds (seen
+# directly: the :gfx803 migraphx/torch images still contained /opt/rocm/core-7.14
+# and a torch 2.13 wheel). The final image keeps the names downstream pulls:
+# :latest-gfx803, :rocm10.0-gfx803 and :<date>-gfx803.
 #
 # Each component is individually skippable -- these builds are long and the
 # inputs rarely all change at once. A skipped component's downstream jobs
@@ -48,6 +55,11 @@ on:
         default: true
       build-miopen:
         description: 'Build MIOpen for gfx803 (uncheck to reuse the last published one)'
+        type: boolean
+        required: false
+        default: true
+      build-rocsolver:
+        description: 'Build rocSOLVER for gfx803 (uncheck to reuse the last published one)'
         type: boolean
         required: false
         default: true
@@ -109,6 +121,7 @@ jobs:
     secrets: inherit
     with:
       component: rocr-clr
+      intermediate-suffix: -rocm10
       target: rocr-clr-builder
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
@@ -134,6 +147,7 @@ jobs:
     secrets: inherit
     with:
       component: rocblas
+      intermediate-suffix: -rocm10
       target: rocblas-builder
       with-rocr-clr-image: true
       debug: ${{ inputs.debug }}
@@ -149,8 +163,30 @@ jobs:
     secrets: inherit
     with:
       component: miopen
+      intermediate-suffix: -rocm10
       target: miopen-builder
       with-rocr-clr-image: true
+      debug: ${{ inputs.debug }}
+      no-cache: ${{ inputs.no-cache }}
+
+  # rocSOLVER needs a gfx803 build of its own for a reason the other components
+  # do not: the one the pinned 10.0 stack ships has an empty .hip_fatbin -- host
+  # stubs and kernel-registration tables, no device code for any architecture --
+  # so every hipSOLVER-backed torch.linalg entry point SIGSEGVs at its first
+  # launch. It also links rocBLAS, hence the image dependency.
+  rocsolver:
+    needs: rocblas
+    if: ${{ !cancelled() && inputs.build-rocsolver && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gfx803-component.yml
+    secrets: inherit
+    with:
+      component: rocsolver
+      intermediate-suffix: -rocm10
+      target: rocsolver-builder
+      with-rocblas-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
@@ -169,6 +205,7 @@ jobs:
     secrets: inherit
     with:
       component: migraphx
+      intermediate-suffix: -rocm10
       target: migraphx-builder
       with-rocblas-image: true
       with-miopen-image: true
@@ -185,6 +222,7 @@ jobs:
     secrets: inherit
     with:
       component: pytorch
+      intermediate-suffix: -rocm10
       target: pytorch-builder
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
@@ -212,6 +250,7 @@ jobs:
     secrets: inherit
     with:
       component: torchvision
+      intermediate-suffix: -rocm10
       target: torchvision-builder
       with-pytorch-image: true
       torchvision-ref: ${{ inputs.torchvision-ref }}
@@ -228,6 +267,7 @@ jobs:
     secrets: inherit
     with:
       component: torchaudio
+      intermediate-suffix: -rocm10
       target: torchaudio-builder
       with-pytorch-image: true
       torchaudio-ref: ${{ inputs.torchaudio-ref }}
@@ -244,16 +284,18 @@ jobs:
     secrets: inherit
     with:
       component: ort
+      intermediate-suffix: -rocm10
       target: ort-builder
       with-migraphx-image: true
       debug: ${{ inputs.debug }}
       no-cache: ${{ inputs.no-cache }}
 
   final:
-    needs: [migraphx, miopen, pytorch, torchvision, torchaudio, ort]
+    needs: [migraphx, miopen, rocsolver, pytorch, torchvision, torchaudio, ort]
     if: ${{ !cancelled()
       && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
       && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.rocsolver.result == 'success' || (needs.rocsolver.result == 'skipped' && !inputs.build-rocsolver))
       && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
       && (needs.torchvision.result == 'success' || (needs.torchvision.result == 'skipped' && !inputs.build-torchvision))
       && (needs.torchaudio.result == 'success' || (needs.torchaudio.result == 'skipped' && !inputs.build-torchaudio))
@@ -265,9 +307,11 @@ jobs:
     secrets: inherit
     with:
       component: final
+      intermediate-suffix: -rocm10
       final: true
       with-migraphx-image: true
       with-miopen-image: true
+      with-rocsolver-image: true
       with-pytorch-image: true
       with-torchvision-image: true
       with-torchaudio-image: true

@@ -1,11 +1,13 @@
 #!/bin/sh
-# Apply graph-replay-queue-size-cap.patch (see that file for the full
-# WHY/WHAT -- READ IT FIRST, this patch requires a companion kernel patch
-# not shipped by this repo; applying only this half is dangerous, not just
-# ineffective). NOT called from the main Dockerfile on purpose -- run this
-# by hand only if you've already built and loaded the kernel companion
-# (patches/kernel/REFERENCE-amdkfd-gfx7-8-queue-size-writeback.patch) and
-# verified it with a real dispatch, not just hsa_queue_create succeeding.
+# Apply graph-replay-queue-size-cap.patch with `git apply`, then make sure that the
+# hunk landed. Read that patch file first. This patch needs a companion kernel patch
+# that this repo does not ship. Apply only this half and the result is dangerous,
+# and not merely ineffective.
+#
+# The main Dockerfile does not call this driver, on purpose. Run it by hand only
+# after you build and load the kernel companion
+# (patches/kernel/REFERENCE-amdkfd-gfx7-8-queue-size-writeback.patch) and test it
+# with a real dispatch. A successful hsa_queue_create is not that test.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

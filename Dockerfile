@@ -100,6 +100,7 @@ ARG BASE_IMAGE=rocm/dev-ubuntu-26.04:10.0.0-full
 ARG ROCR_CLR_IMAGE=rocr-clr-builder
 ARG ROCBLAS_IMAGE=rocblas-builder
 ARG MIOPEN_IMAGE=miopen-builder
+ARG ROCSOLVER_IMAGE=rocsolver-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
 ARG TORCHVISION_IMAGE=torchvision-builder
@@ -161,6 +162,33 @@ ARG ORT_VERSION=v1.29.0
 
 ARG BUILD_PARALLEL_LEVEL=auto
 
+# Resolved upstream commits. The workflow turns each *_REF branch pin above into
+# the commit it points at, once per run, and passes it here: the Dockerfile keeps
+# documenting branches as the policy (README's "Component ref pinning"), while the
+# build still puts a precise commit into every layer's cache key. That distinction
+# matters because a `git clone` of a branch inside a RUN is invisible to the layer
+# cache -- the cache key is the command text, which does not change when upstream
+# pushes to the branch -- so without a resolved SHA a build can silently reuse a
+# layer from an older tip. Empty means not supplied (manual build): scripts/git-pin.sh
+# then follows the branch and says so loudly on stderr.
+ARG ROCM_SYSTEMS_SHA=
+ARG ROCM_LIBRARIES_SHA=
+ARG MIGRAPHX_SHA=
+ARG PYTORCH_SHA=
+ARG TORCHVISION_SHA=
+ARG TORCHAUDIO_SHA=
+ARG ORT_SHA=
+
+# Line provenance, carried inside every component image at
+# /opt/rocm/.gfx803-line and asserted by the stages that inherit one (see
+# scripts/gfx803-line.sh). The tags alone cannot express this: the main line's
+# images are tagged ":gfx803" with no line suffix, so a component image published
+# by an earlier line of this repo is otherwise indistinguishable -- and it builds,
+# imports, and fails only on real hardware.
+ARG GFX803_LINE=rocm10
+ARG GFX803_SOURCE_REV=unrecorded
+ARG GFX803_PINS=unrecorded
+
 # Ubuntu 26.04's native python3 is 3.14 (confirmed: `rocm/dev-ubuntu-26.04:
 # 10.0.0-full` ships it), same situation the main Dockerfile's python-base
 # documents -- numpy/onnx dependency resolution needs 3.12. uv-managed 3.12
@@ -198,6 +226,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 FROM python-base AS rocr-clr-builder
 
 ARG ROCM_SYSTEMS_REF
+ARG ROCM_SYSTEMS_SHA
 ARG BUILD_PARALLEL_LEVEL
 
 # CLR's README prerequisite (rocm-llvm-dev) is an apt package name from
@@ -220,7 +249,7 @@ RUN git clone --filter=blob:none --no-checkout \
     && cd /rocm-systems-src \
     && git sparse-checkout init --cone \
     && git sparse-checkout set projects/rocr-runtime projects/clr projects/hip \
-    && git checkout "${ROCM_SYSTEMS_REF}"
+    && git checkout "${ROCM_SYSTEMS_SHA:-${ROCM_SYSTEMS_REF}}"
 
 COPY patches/rocm-systems/ /rocm-systems-patches/
 RUN sh /rocm-systems-patches/hsa-agent-rejects-legacy-doorbell.sh /rocm-systems-src
@@ -327,6 +356,22 @@ RUN sh /rocm-systems-patches/fmm-keep-userptr-map.sh /rocm-systems-src
 # hsa-agent-rejects-legacy-doorbell.sh restores.
 RUN sh /rocm-systems-patches/aql-ring-queue-full-workaround.sh /rocm-systems-src
 
+# gfx803 cross-dispatch read staleness (the long-running "torch reads stale
+# bytes after a Tensile GEMM" bug class). On CIK the shader TC is not dropped
+# at a dispatch boundary and the AQL SCACQUIRE/SCRELEASE scope bits do not drop
+# it either, so a kernel reading a VA that an earlier kernel overwrote can get
+# the pre-overwrite bytes while the correct data is provably already in VRAM.
+# ROCm expresses cross-dispatch coherence only through those scope bits, so
+# anything that recycles virtual addresses -- a caching allocator -- is exposed.
+# The patch publishes an ACQUIRE_MEM (TC_ACTION_ENA|TC_WB_ACTION_ENA), the same
+# packet ROCr already emits for code-object invalidation, in its own ring slot
+# ahead of every kernel dispatch on ISA <= 8. Verified on real hardware: torch
+# read-staleness repro 25/40 poisoned -> 0/40 with the patch, and reverts to
+# 22/40 with CLR_GFX8_TC_INVALIDATE=0 on the same binary; torch op suite 189 ->
+# 199/202 PASS. See patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.patch
+# for the full WHY, including the intervention table that localised it.
+RUN sh /rocm-systems-patches/gfx803-tc-invalidate-acquire-mem.sh /rocm-systems-src
+
 # ROCR-Runtime first: CLR's HIP build links against it, so the patched
 # runtime has to be installed into /opt/rocm before CLR configures.
 WORKDIR /rocm-systems-src/projects/rocr-runtime
@@ -370,6 +415,26 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-clr-ccache \
     && make -j"$jobs" \
     && make install \
     && cd .. && rm -rf build \
+    # Collapse each HIP runtime library family to exactly one real file. Which
+    # suffix `make install` writes is derived from the build id -- a commit hash
+    # under CI, the literal "-0000000" on a machine that supplies none, which is
+    # also what this base image's own stock files are called. So "ours" cannot be
+    # identified by its name later on; it can be identified here, where the
+    # freshest mtime is unambiguous proof of what this install just wrote.
+    && cd /opt/rocm/lib \
+    && for n in libamdhip64 libhiprtc libhiprtc-builtins; do \
+           ours="$(find . -maxdepth 1 -name "${n}.so.7.*" -type f -printf '%T@ %f\n' | sort -rn | head -1 | cut -d" " -f2)"; \
+           if [ -z "$ours" ]; then \
+               echo "FATAL: no real ${n}.so.7.* file after install." >&2; exit 1; \
+           fi; \
+           mv "$ours" "/tmp/${n}.keep"; \
+           rm -f "${n}.so" "${n}.so.7" ${n}.so.7.*; \
+           mv "/tmp/${n}.keep" "./${ours#./}"; \
+           ln -sf "${ours#./}" "${n}.so.7"; \
+           ln -sf "${n}.so.7" "${n}.so"; \
+           echo "single ${n} build: ${ours#./}"; \
+       done \
+    && cd /opt/rocm \
     # Verify the patched runtime actually landed: the doorbell throw's error
     # string should no longer be present in the installed HSA runtime lib,
     # and rocminfo/hipcc should still run cleanly (no GPU on this build box,
@@ -389,15 +454,34 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-clr-ccache \
     && echo "OK: patched HSA runtime installed, no deprecated-doorbell throw string present, patched libamdhip64 active." \
     && /opt/rocm/bin/hipconfig --version
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=rocr-clr
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="rocr-clr" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="rocr-clr" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${ROCR_CLR_IMAGE} AS rocr-clr-export
 
 FROM python-base AS rocblas-builder
 
 ARG ROCM_LIBRARIES_REF
+ARG ROCM_LIBRARIES_SHA
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
 
 COPY --from=rocr-clr-export /opt/rocm /opt/rocm
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
 # libmsgpack-dev is a transitional dummy package on Ubuntu 26.04 (unlike
 # 24.04, where rocm6.4.4/Dockerfile's identical line still works) -- the real
@@ -428,7 +512,7 @@ RUN git clone --filter=blob:none --no-checkout \
     # of shared/tensile, and the repo-root `cmake` directory is added to match
     # it -- rocBLAS's CMakeLists reaches up into it.
     && git sparse-checkout set cmake shared projects/rocblas \
-    && git checkout "${ROCM_LIBRARIES_REF}"
+    && git checkout "${ROCM_LIBRARIES_SHA:-${ROCM_LIBRARIES_REF}}"
 ENV ROCBLAS_SRC=/rocblas-src-root/projects/rocblas
 
 # WGM8 miscompute -- source-level fix (Tensile/SolutionStructs.py, gated on
@@ -574,11 +658,24 @@ RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
     fi \
     && rm -rf /opt/rocm-sgemm-shim
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=rocblas
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="rocblas" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="rocblas" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${ROCBLAS_IMAGE} AS rocblas-export
 
 FROM python-base AS miopen-builder
 
 ARG ROCM_LIBRARIES_REF
+ARG ROCM_LIBRARIES_SHA
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
 
@@ -602,7 +699,7 @@ RUN git clone --filter=blob:none --no-checkout \
     && cd /miopen-src-root \
     && git sparse-checkout init --cone \
     && git sparse-checkout set projects/miopen shared \
-    && git checkout "${ROCM_LIBRARIES_REF}"
+    && git checkout "${ROCM_LIBRARIES_SHA:-${ROCM_LIBRARIES_REF}}"
 ENV MIOPEN_SRC=/miopen-src-root/projects/miopen
 
 # NOT applied here: conv-direct-fwd-grouped-oob (6.4.4's grouped-conv OOB
@@ -687,7 +784,127 @@ RUN echo "Copying MIOpen gfx803 build into /opt/rocm..." \
     fi \
     && echo "OK: MIOpen gfx803 build is in place."
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=miopen
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="miopen" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="miopen" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${MIOPEN_IMAGE} AS miopen-export
+
+FROM python-base AS rocsolver-builder
+
+ARG ROCM_LIBRARIES_REF
+ARG ROCM_LIBRARIES_SHA
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+COPY --from=rocblas-export /opt/rocm /opt/rocm
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
+
+# libfmt-dev: rocSOLVER's CMakeLists does find_package(fmt REQUIRED) and, unlike
+# MIOpen, has no install_deps.cmake to fetch it -- and this base image ships no fmt
+# development package (checked: no fmt/format.h, no lib/cmake/fmt).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config ccache libfmt-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/ROCm/rocm-libraries.git /solver-src-root \
+    && cd /solver-src-root \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set projects/rocsolver shared \
+    && git checkout "${ROCM_LIBRARIES_SHA:-${ROCM_LIBRARIES_REF}}"
+
+ENV ROCSOLVER_SRC=/solver-src-root/projects/rocsolver
+
+COPY patches/rocsolver/ /rocsolver-patches/
+RUN sh /rocsolver-patches/rocsolver-wavesize-gfx8.sh "${ROCSOLVER_SRC}"
+
+# -DCMAKE_CXX_COMPILER=hipcc is not stylistic: rocSOLVER's sources are .cpp files
+# carrying __global__ kernels, and it gets the offload flags from hip::device
+# rather than by switching the language. Left to CMake's default, every one of them
+# dies on "unrecognised command-line option '--offload-arch=gfx803'" from g++
+# (reproduced). -DUSE_HIPCXX=ON is not an alternative: check_language(HIP) fails on
+# this base image, so USE_HIPCXX stays off and the AMDGPU_TARGETS default block --
+# gfx900/gfx906/gfx908 + probed newer, no gfx8xx -- is bypassed only because we
+# define the variable ourselves.
+#
+# ROCM_PATH=/opt/rocm is correct here because COPY --from lays /opt/rocm/lib down
+# as a real directory. On a host whose /opt/rocm/lib is a symlink into
+# /etc/alternatives (rocm-core's Fedora-style layout, e.g. the gfx803 test box) that
+# symlink dangles inside a container -- /etc/alternatives is not part of the mount --
+# and find_package(hip CONFIG) then fails naming only hipConfig.cmake. Point the
+# prefix at the versioned directory when building that way.
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-rocsolver-ccache \
+    jobs="${BUILD_PARALLEL_LEVEL}"; \
+    if [ "$jobs" = "auto" ]; then \
+        jobs=$(awk '/MemAvailable/{printf "%d", $2/1024/1024/4}' /proc/meminfo); \
+        cpu=$(nproc); [ "$jobs" -gt "$cpu" ] && jobs=$cpu; \
+        [ "$jobs" -lt 1 ] && jobs=1; \
+    fi; \
+    echo "rocSOLVER build: arch ${ROCM_ARCH}, $jobs parallel jobs"; \
+    cmake -S "${ROCSOLVER_SRC}" -B /rs-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DROCM_PATH=/opt/rocm -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+        -DAMDGPU_TARGETS="${ROCM_ARCH}" \
+        -DBUILD_WITH_SPARSE=OFF \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_CLIENTS_TESTS=OFF -DBUILD_CLIENTS_BENCHMARKS=OFF \
+        -DBUILD_CLIENTS_SAMPLES=OFF \
+        -DBUILD_OFFLOAD_COMPRESS=OFF -DBUILD_COMPRESSED_DBG=OFF \
+    && cmake --build /rs-build -j"$jobs" \
+    && cp -a /rs-build/library/src/librocsolver.so* /tmp/ \
+    && rm -rf /rs-build
+
+RUN echo "Copying rocSOLVER gfx803 build into /opt/rocm..." \
+    && resolved="$(readlink -f /opt/rocm/lib/librocsolver.so)" \
+    && stock_size="$(stat -c%s "$resolved" 2>/dev/null || echo 0)" \
+    && built="$(find /tmp -maxdepth 1 -iname 'librocsolver.so.*' ! -iname '*.so' -type f | head -1)" \
+    && cp -a "$built" "$resolved" \
+    && rm -f /tmp/librocsolver.so* \
+    && new_size="$(stat -c%s "$resolved")" \
+    && echo "librocsolver resolved path: $resolved (stock ${stock_size} bytes -> new ${new_size} bytes)" \
+    && if [ "$new_size" = "$stock_size" ]; then \
+        echo "FATAL: librocsolver is still ${new_size} bytes -- our build did not land." >&2; \
+        exit 1; \
+    fi \
+    && echo "Verifying librocsolver.so embeds real ${ROCM_ARCH} device code..." \
+    && objcopy -O binary --only-section=.hip_fatbin "$resolved" /tmp/rocsolver_fatbin_check.bin \
+    && fatbin_size="$(stat -c%s /tmp/rocsolver_fatbin_check.bin)" \
+    && rm -f /tmp/rocsolver_fatbin_check.bin \
+    && if [ "$fatbin_size" -lt 100000 ]; then \
+        echo "FATAL: librocsolver.so's .hip_fatbin is only ${fatbin_size} bytes -- too small to contain real ${ROCM_ARCH} device code (expect MBs)." >&2; \
+        exit 1; \
+    fi \
+    && echo "OK: librocsolver.so resolves to a ${ROCM_ARCH} build with a ${fatbin_size}-byte .hip_fatbin."
+
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=rocsolver
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="rocsolver" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="rocsolver" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
+FROM ${ROCSOLVER_IMAGE} AS rocsolver-export
+
 
 FROM python-base AS migraphx-builder
 
@@ -714,8 +931,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pybind11 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch "${MIGRAPHX_REF}" \
-        https://github.com/ROCm/AMDMIGraphX.git /migraphx-src
+COPY scripts/git-pin.sh /usr/local/libexec/git-pin
+ARG MIGRAPHX_SHA
+RUN /usr/local/libexec/git-pin /migraphx-src \
+        "https://github.com/ROCm/AMDMIGraphX.git" "${MIGRAPHX_REF}" "${MIGRAPHX_SHA}"
 
 # src/targets/gpu/lowering.cpp calls gpu::gfx_default_rocblas()
 # unconditionally, but its only declaration/definition are gated behind
@@ -864,6 +1083,18 @@ RUN if ! find /opt/rocm -iname "migraphx.cpython-312-*.so" | grep -q .; then \
     fi \
     && echo "OK: migraphx python module built for cpython-312."
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=migraphx
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="migraphx" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="migraphx" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${MIGRAPHX_IMAGE} AS migraphx-export
 
 FROM python-base AS pytorch-builder
@@ -877,6 +1108,15 @@ ARG TENSOR_TOPK_OPT_LEVEL=-O3
 # rocBLAS AND MIOpen, which only migraphx-export's /opt/rocm carries (same
 # reasoning as ort-builder below).
 COPY --from=migraphx-export /opt/rocm /opt/rocm
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -892,8 +1132,12 @@ RUN uv venv /build-venv --python 3.12 --seed \
     && /build-venv/bin/pip install --no-cache-dir numpy pyyaml typing_extensions requests six build
 ENV PATH=/build-venv/bin:$PATH
 
-RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodules \
-        https://github.com/ROCm/pytorch.git /pytorch
+COPY scripts/git-pin.sh /usr/local/libexec/git-pin
+ARG PYTORCH_SHA
+RUN /usr/local/libexec/git-pin /pytorch \
+        "https://github.com/ROCm/pytorch.git" "${PYTORCH_REF}" "${PYTORCH_SHA}" \
+    && git -C /pytorch submodule sync --recursive \
+    && git -C /pytorch submodule update --init --recursive --depth 1 --jobs 4
 
 # gfx803-c10-warp-size-wave64: C10_WARP_SIZE compiles to 32 for gfx803
 # (only __GFX9__ gets 64), but Polaris is wave64-only -- every Eager kernel
@@ -903,13 +1147,6 @@ RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodul
 # patch header for the full WHY.
 COPY patches/pytorch/ /pytorch-patches/
 RUN bash /pytorch-patches/apply-gfx803-c10-warp-size-wave64.sh /pytorch
-
-# gfx803-pluggable-allocator: opt-in hipMalloc-backed allocator for torch's
-# remaining memory bug (the default caching allocator's block layout corrupting
-# the next access after a GEMM). Inert by default -- activates only when
-# GFX803_PLUGGABLE_ALLOCATOR is set at runtime. Also builds the allocator .so
-# to /opt/rocm/lib/libgfx803_pluggable.so. Experimental; see the patch header.
-RUN bash /pytorch-patches/apply-gfx803-pluggable-allocator.sh /pytorch
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
@@ -965,6 +1202,18 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-pytorch-ccache \
 RUN pip install --no-cache-dir dist/torch*.whl \
     && mkdir -p /wheels && cp dist/torch*.whl /wheels/
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=pytorch
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="pytorch" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="pytorch" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${PYTORCH_IMAGE} AS pytorch-export
 
 # Own image/CI job rather than folded into pytorch-builder: each of MIGraphX,
@@ -975,6 +1224,9 @@ FROM ${PYTORCH_IMAGE} AS pytorch-export
 # mainline Dockerfile -- gfx803 has never had one published for torch or its
 # companions, so this always takes the from-source path.
 FROM ${PYTORCH_IMAGE} AS torchvision-builder
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
 ARG ROCM_ARCH=gfx803
 ARG TORCHVISION_REF
@@ -983,14 +1235,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libjpeg-dev libpng-dev libfreetype6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --recursive --branch "${TORCHVISION_REF}" --depth 1 --shallow-submodules \
-        https://github.com/pytorch/vision.git /vision
+COPY scripts/git-pin.sh /usr/local/libexec/git-pin
+ARG TORCHVISION_SHA
+RUN /usr/local/libexec/git-pin /vision \
+        "https://github.com/pytorch/vision.git" "${TORCHVISION_REF}" "${TORCHVISION_SHA}" \
+    && git -C /vision submodule sync --recursive \
+    && git -C /vision submodule update --init --recursive --depth 1 --jobs 4
 WORKDIR /vision
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-vision-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 \
         python3 setup.py bdist_wheel \
     && mkdir -p /wheels && cp dist/torchvision-*.whl /wheels/
+
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=torchvision
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="torchvision" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="torchvision" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
 
 FROM ${TORCHVISION_IMAGE} AS torchvision-export
 
@@ -999,6 +1267,9 @@ FROM ${TORCHVISION_IMAGE} AS torchvision-export
 # exactly (torchvision stays on upstream pytorch/vision; only audio has a
 # ROCm-specific fork in this repo's own build logic).
 FROM ${PYTORCH_IMAGE} AS torchaudio-builder
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+RUN /usr/local/libexec/gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
 ARG ROCM_ARCH=gfx803
 ARG TORCHAUDIO_REF
@@ -1008,14 +1279,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --recursive --branch "${TORCHAUDIO_REF}" --depth 1 --shallow-submodules \
-        https://github.com/ROCm/audio.git /audio
+COPY scripts/git-pin.sh /usr/local/libexec/git-pin
+ARG TORCHAUDIO_SHA
+RUN /usr/local/libexec/git-pin /audio \
+        "https://github.com/ROCm/audio.git" "${TORCHAUDIO_REF}" "${TORCHAUDIO_SHA}" \
+    && git -C /audio submodule sync --recursive \
+    && git -C /audio submodule update --init --recursive --depth 1 --jobs 4
 WORKDIR /audio
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-audio-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
         FORCE_CUDA=0 USE_FFMPEG=1 \
         python3 setup.py bdist_wheel \
     && mkdir -p /wheels && cp dist/torchaudio*.whl /wheels/
+
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=torchaudio
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="torchaudio" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="torchaudio" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
 
 FROM ${TORCHAUDIO_IMAGE} AS torchaudio-export
 
@@ -1059,8 +1346,12 @@ RUN uv venv /build-venv --python 3.12 --seed \
     && /build-venv/bin/pip install --no-cache-dir numpy packaging cmake
 ENV PATH=/build-venv/bin:$PATH
 
-RUN git clone --recursive --branch "${ORT_VERSION}" --depth 1 \
-        https://github.com/microsoft/onnxruntime.git /onnxruntime
+COPY scripts/git-pin.sh /usr/local/libexec/git-pin
+ARG ORT_SHA
+RUN /usr/local/libexec/git-pin /onnxruntime \
+        "https://github.com/microsoft/onnxruntime.git" "${ORT_VERSION}" "${ORT_SHA}" \
+    && git -C /onnxruntime submodule sync --recursive \
+    && git -C /onnxruntime submodule update --init --recursive --jobs 4
 
 # rocm6.4.4/Dockerfile's two ORT patches (mha-basic-mode-no-viable-op,
 # topk-radix-tiebreak-nondeterministic) are NOT carried over here: both
@@ -1120,11 +1411,41 @@ RUN built_whl="$(ls /onnxruntime/build/Release/dist/*.whl)" \
     && mkdir -p /onnxruntime/dist \
     && python3 -m wheel pack "$unpack_dir/$new_name" -d /onnxruntime/dist
 
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=ort
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="ort" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="ort" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"
+
 FROM ${ORT_IMAGE} AS ort-export
 
 FROM python-base
 
 COPY --from=migraphx-export /opt/rocm /opt/rocm
+
+# Line-identity guard for the whole assembly. Every component image here is
+# tagged ":gfx803" with no per-line suffix (the root line predates the suffix
+# convention the 7.14/6.4.4 workflows pass), and ghcr is still holding
+# 7.14-era content under rocm-migraphx-builder:gfx803 and
+# rocm-migraphx-torch-builder:gfx803 -- the 10.0 jobs for those two stages have
+# never republished them (verified directly: those images contain
+# /opt/rocm/core-7.14 and a torch 2.13 wheel, and the resulting build dies on
+# "No module named 'migraphx'" several steps later). A mixed-line image
+# assembles, imports, and only misbehaves on real hardware, so fail here, at the
+# first layer that inherits a whole ROCm tree, naming what was found.
+RUN set -eu; \
+    if [ ! -d /opt/rocm/core-10.0 ]; then \
+        echo "FATAL: the inherited /opt/rocm has no core-10.0 (found: $(ls -d /opt/rocm/core-* 2>/dev/null | tr '\n' ' '))." >&2; \
+        echo "       A *-builder image from a different ROCm line is being reused via MIGRAPHX_IMAGE/PYTORCH_IMAGE/etc.;" >&2; \
+        echo "       rebuild that component from this Dockerfile instead of passing its stale image in." >&2; \
+        exit 1; \
+    fi
 # Only the MIOpen library files, not the whole /opt/rocm tree: miopen-builder
 # chains from rocr-clr-export, not from rocblas-export/migraphx-export, so its
 # own /opt/rocm never received the gfx803 rocBLAS or the from-source MIGraphX --
@@ -1140,23 +1461,39 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # MIOPEN_IMAGE/with-miopen-image input), not as the only place this file
 # reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
+# Only the library file again: rocsolver-builder chains from rocblas-export, so
+# copying its whole /opt/rocm here would revert MIOpen and the patched runtime.
+# hipSOLVER needs no equivalent copy -- it carries no device code and delegates
+# into rocSOLVER, whose symbols resolve to this file at load time.
+COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
 
-# The base image ships its own stock "-0000000"-suffixed build of
-# libamdhip64/libhiprtc/libhiprtc-builtins side by side with the
-# "-<commit>"-suffixed ones CLR's `make install` adds -- both are real
-# regular files sharing the same SONAME, not a symlink pair. `ldconfig`
-# picks which one the SONAME symlink resolves to by its own version
-# comparison, and it prefers "-0000000" over a commit-hash suffix
-# (reproduced directly: `ldconfig` alone, no cache/copy involved, rewrites
-# libamdhip64.so.7 from the patched file back to the stock one). Deleting
-# the stock file before `ldconfig` runs removes the ambiguity instead of
-# hoping the version comparison goes our way -- the patched file is the
-# only one that should ever ship in this image regardless. Check the
-# RESOLVED library, not the symlink target name, so this still fails loudly
-# if a future stock/patched filename pair confuses this again.
-RUN cd /opt/rocm/lib && rm -f libamdhip64.so.*-0000000 libhiprtc.so.*-0000000 libhiprtc-builtins.so.*-0000000 \
-    && echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig \
-    && if ! strings "$(readlink -f /opt/rocm/lib/libamdhip64.so)" 2>/dev/null | grep -q "Image extension queries failed"; then \
+# The three HIP runtime libraries must come from our own rocr-clr build, but the
+# base image and every published chain image can still be carrying a stock twin
+# under the same SONAME (the base image ships "-0000000"; our build ships
+# "-<commit>" when CI supplies a build id and "-0000000" when a local build
+# supplies none -- so a filename pattern cannot tell them apart, and one that
+# assumes it can will delete the wrong file, silently taking hiprtc with it).
+# Install from the stage's own lib directory instead, which holds exactly one
+# real file per family because rocr-clr-builder normalised it -- a published
+# rocr-clr image from before that normalisation still carries both, and picking
+# the stock one there is caught by the content check at the end of this step
+# rather than shipping quietly.
+COPY --from=rocr-clr-export /opt/rocm/lib /opt/rocm-clr-lib/
+RUN set -eu; \
+    for n in libamdhip64 libhiprtc libhiprtc-builtins; do \
+        ours="$(find /opt/rocm-clr-lib -maxdepth 1 -name "${n}.so.7.*" -type f | head -1)"; \
+        if [ -z "$ours" ]; then \
+            echo "FATAL: ${n} missing from rocr-clr-export." >&2; exit 1; \
+        fi; \
+        rm -f "/opt/rocm/lib/${n}.so" "/opt/rocm/lib/${n}.so.7" "/opt/rocm/lib/${n}".so.7.*; \
+        cp -a "$ours" "/opt/rocm/lib/$(basename "$ours")"; \
+        ln -sf "$(basename "$ours")" "/opt/rocm/lib/${n}.so.7"; \
+        ln -s "${n}.so.7" "/opt/rocm/lib/${n}.so"; \
+    done; \
+    rm -rf /opt/rocm-clr-lib; \
+    echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf; \
+    ldconfig; \
+    if ! strings "$(readlink -f /opt/rocm/lib/libamdhip64.so)" 2>/dev/null | grep -q "Image extension queries failed"; then \
         echo "FATAL: active libamdhip64.so does not carry the gfx8 opencl patch marker." >&2; \
         exit 1; \
     fi
@@ -1206,7 +1543,20 @@ COPY --from=ort-export /onnxruntime/dist/*.whl /tmp/ort/
 COPY --from=pytorch-export /wheels/*.whl /tmp/torch/
 COPY --from=torchvision-export /wheels/*.whl /tmp/torch/
 COPY --from=torchaudio-export /wheels/*.whl /tmp/torch/
-RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torch/*.whl \
+# One wheel per distribution, newest mtime wins -- not a glob. All three torch
+# stage images drop into the same /tmp/torch, and a published stage image can
+# carry a wheel from before its own most recent rebuild (seen directly: a
+# rocm-migraphx-torch-builder:gfx803 whose /wheels held both 2.13.0 and 2.14.0),
+# which a glob hands to pip as two conflicting versions of the same package --
+# ResolutionImpossible, with nothing in the message naming the stale file.
+RUN set -eu; \
+    picked="$(for w in /tmp/ort/*.whl /tmp/torch/*.whl; do \
+                [ -e "$w" ] || continue; \
+                printf '%s\t%s\t%s\n' "$(stat -c %Y "$w")" \
+                    "$(basename "$w" | sed -E 's/-.*//' | tr 'A-Z.' 'a-z_')" "$w"; \
+              done | sort -k1,1nr | awk -F'\t' '!seen[$2]++ {print $3}')"; \
+    echo "wheels to install:"; echo "$picked" | sed 's/^/  /'; \
+    "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy $picked \
     && rm -rf /tmp/ort /tmp/torch \
     && "$VIRTUAL_ENV/bin/python3" -c "import onnxruntime as ort; p=ort.get_available_providers(); print('ORT providers:', p); assert 'MIGraphXExecutionProvider' in p" \
     && "$VIRTUAL_ENV/bin/python3" -c "import torch; print('torch', torch.__version__, 'HIP built:', torch.version.hip)" \
@@ -1247,3 +1597,20 @@ ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
 ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
+
+# Record what this image actually contains, where the box can read it: the
+# resolved upstream commits and the rocm-gfx803 revision this image was built
+# from go into /opt/rocm/.gfx803-line and the image labels, so "which ROCm
+# commits am I running?" is answerable from inside a container without any
+# registry metadata.
+COPY scripts/gfx803-line.sh /usr/local/libexec/gfx803-line
+ARG GFX803_LINE
+ARG GFX803_SOURCE_REV
+ARG GFX803_PINS
+ENV GFX803_STAGE=final
+LABEL io.rocm.gfx803.line="${GFX803_LINE}" \
+      io.rocm.gfx803.stage="final" \
+      io.rocm.gfx803.source-rev="${GFX803_SOURCE_REV}" \
+      io.rocm.gfx803.pins="${GFX803_PINS}"
+RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803_STAGE="final" \
+    /usr/local/libexec/gfx803-line stamp /opt/rocm "${GFX803_LINE}"

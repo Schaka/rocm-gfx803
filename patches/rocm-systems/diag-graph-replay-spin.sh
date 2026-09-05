@@ -1,6 +1,6 @@
 #!/bin/sh
-# Apply diag-graph-replay-spin.patch (DIAGNOSTIC ONLY, see that file) via
-# `git apply`, then verify the hunks actually landed.
+# Apply diag-graph-replay-spin.patch with `git apply`, then make sure that the
+# hunks landed. This patch is a diagnostic and nothing else. See the patch file.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

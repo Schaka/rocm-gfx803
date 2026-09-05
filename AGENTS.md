@@ -1,302 +1,294 @@
 # Agent instructions for rocm-gfx803
 
-Read `README.md` first for repo layout and status. This file is
-process/judgment guidance for working in this repo specifically -- the
-parts that aren't obvious from the code or the patch headers alone.
+Read `README.md` first. It gives the layout and the status of each line. This
+file gives the process rules and the judgment calls. You cannot get either one
+from the code or from a patch header alone.
 
 ## Standing philosophy
 
-- **Build locally, never push.** All work in this repo builds locally (the
-  host or the box at 192.168.1.214) -- never trigger remote CI, never push,
-  never commit, unless the user explicitly instructed that specific commit
-  or push. Committing and pushing are the user's tasks. A remote workflow
-  run builds whatever is on the remote branch at that moment, so pushing is
-  a prerequisite to any remote build anyway -- but the rule is simpler than
-  that: don't. Build locally, verify locally, hand the user the diff or the
-  local build, and let them decide about commit/push. This includes `gh
-  workflow run` -- dispatching a remote run without being told is the same
-  violation as pushing.
-- **Fix at the source. No workarounds.** A gfx803 bug gets fixed where it
-  actually lives -- the broken Tensile logic, the broken MIOpen solver, the
-  broken MIGraphX pass -- not papered over with a retry loop, a narrower
-  input-shape gate that avoids triggering it, a fallback to a slower-but-
-  working path chosen defensively without knowing if the fast path is
-  actually broken, or a try/catch that swallows the failure. If you can't
-  fix it at the source (upstream code you don't control, or a genuine
-  hardware limitation), say so explicitly and stop -- don't ship a
-  workaround dressed up as a fix. `wgm-miscompute.sh` is the model:
-  root-caused down to the exact broken instruction sequence, fixed by
-  correcting the actual parameter Tensile computes wrong, not by avoiding
-  the shapes that expose it.
-- **Correctness costs performance sometimes -- that's fine, up to a point.**
-  5-10% throughput lost to a correctness fix is an acceptable, expected
-  trade, not something to negotiate around. Past that, flag it explicitly
-  and ask rather than silently accepting a large regression or silently
-  picking a workaround to avoid it. Never trade correctness for speed
-  without saying so out loud first.
-- **Comments say WHY, never WHAT.** Code should be legible enough that the
-  WHAT doesn't need restating in prose next to it -- a comment that
-  describes what the next three lines do is dead weight the moment the
-  code changes and stops matching it. Write a comment only when there's a
-  non-obvious reason behind the code: why this bound, why this order, why
-  this workaround-shaped thing is actually correct here, what broke last
-  time someone tried the obvious approach. This repo's patch headers are
-  the reference model -- WHY (how the bug was found, what it looks like)
-  before WHAT (the actual diff).
-- **Comments are not commit history.** Don't write "changed X to Y",
-  "added this for the Z fix", "removed unused W" -- that's what `git log`
-  and `git blame` are for, and it rots the moment the described change is
-  no longer the most recent one. A comment should make sense read cold, by
-  someone with no idea what the last edit was.
-- **Never comment on absence.** Don't write a comment explaining that
-  something *isn't* there, *used to be* there, or *isn't being done* --
-  "no libomp-dev here", "removed the X workaround", "we don't do Y
-  anymore". A reader sees only the code that exists; a note about code
-  that doesn't exist is unverifiable noise the moment they check, and dead
-  weight forever after. If a line was dropped, dropping it needs no
-  comment -- the absence speaks for itself. Only write a comment when it
-  justifies something *present*.
-- **Comments don't describe cross-component architecture.** If a comment
-  needs to explain how this file relates to three other files, why a
-  particular Dockerfile stage exists in the overall pipeline, or how the
-  patch fits into the broader gfx803-vs-mainline story, that belongs in
-  `README.md`/`MIGRATION_NOTES.md`/a patch header -- not in an inline code
-  comment. A code comment's job is to explain the code immediately around
-  it, not to teach the reader the whole system. If you're tempted to write
-  three paragraphs above a function about how the pipeline works, that's a
-  docs edit, not a code comment.
+### Build locally. Never push.
 
-## Why this repo exists, and why it matters for how you work here
+All work in this repo builds locally. You build on the host or on the box at
+192.168.1.214. Do not trigger remote CI. Do not push. Do not commit. Do these
+only when the user asks for that one commit or push. Committing and pushing are
+the user's jobs. A remote workflow builds whatever the remote branch holds at
+that moment, so a push is a prerequisite for it anyway. The rule is
+shorter than that: do not. Build locally, test locally, and give the user the
+diff or the local build. Then they decide. This rule also covers
+`gh workflow run`. Starting a remote run without being asked is the same
+violation as a push.
 
-gfx803 (Polaris) is unsupported upstream since ROCm 6.0. Every fix here is
-local -- nothing gets upstreamed to AMD, nothing gets fixed by a ROCm
-version bump unless you go check. That has two consequences for how to
-approach work in this repo:
+### Fix at the source. Do not use workarounds.
 
-1. **Assume nothing is fixed until you've checked the current pinned
-   source.** A patch's own header saying "confirmed broken as of ROCm X"
-   is a snapshot, not a permanent fact. Before re-diffing or investigating
-   further, grep the current pinned commit for the target function/struct
-   and read what's actually there now -- this repo's own history has
-   examples both ways: patches that turned out to already be obsolete
-   (the fix landed upstream on its own) and patches whose target code was
-   *replaced* by something with unknown, unverified behavior on the same
-   bug class (not fixed, not necessarily still broken -- genuinely
-   unknown until checked).
-2. **A patch that applies clean has confirmed nothing about correctness.**
-   The recurring bug class on this hardware is silent miscompute --
-   `rocblas_status_success` with wrong numbers, a kernel that dispatches
-   fine and returns garbage. Re-diffing a patch so it compiles again is
-   necessary but not sufficient; say so explicitly ("NOT YET RE-VERIFIED
-   ON REAL HARDWARE") in the patch/notes until someone actually re-runs
-   the original repro against the new binaries, not just confirms the
-   diff applies.
+Fix a gfx803 bug where the bug lives. That can be the broken Tensile logic, the
+broken MIOpen solver, or the broken MIGraphX pass. Do not hide it with a retry
+loop. Do not hide it with a narrower input-shape rule that avoids the trigger.
+Do not hide it with a fallback to a slower path that you picked because you were
+afraid, without proof that the fast path is broken. Do not hide it with a
+try/catch that swallows the failure. Some bugs have no source fix. The code is
+upstream and you do not control it, or the hardware cannot do it. Say that in
+plain words and stop. Do not ship a workaround that looks like a fix.
+`wgm-miscompute.sh` is the model. It found the exact broken instruction
+sequence, and it fixed the one parameter that Tensile computes wrong. It did not
+avoid the shapes that show the bug.
 
-## Investigation workflow (what's worked repeatedly in this repo's history)
+### Correctness costs speed sometimes. That is fine, to a point.
 
-1. **Trace before you patch.** `MIOPEN_ENABLE_LOGGING_CMD=1
-   MIOPEN_LOG_LEVEL=6` and `MIGRAPHX_TRACE_COMPILE=1` reveal the actual
-   dispatched solver/op graph, not what you'd guess from reading the
-   Dockerfile or the op name. Several "obvious" hypotheses in this repo's
-   history turned out wrong once traced (a ConvTranspose investigation
-   assumed a specific MIOpen solver was responsible; the trace showed a
-   completely different code path -- MIGraphX's own graph rewrite, not
-   MIOpen at all).
-2. **Isolate before you conclude.** If a bug reproduces through the full
-   stack (ORT -> MIGraphX -> MIOpen -> rocBLAS), test each layer standalone
-   before assuming which one is broken -- `MIOpenDriver <op> ... -V 1` runs
-   MIOpen's own GPU-vs-CPU-reference check with zero ORT/MIGraphX
-   involvement and has repeatedly cleared MIOpen as a suspect in favor of a
-   layer above it (or vice versa).
-3. **Differential test against a different architecture before assuming
-   something is gfx803-specific.** A failure that also reproduces on a
-   modern arch (gfx900+/gfx12x) under the exact same source pin is an
-   upstream/generic bug, not gfx803's to fix here -- report it upstream
-   instead. A failure that's unique to gfx803 under identical source is
-   fair game for a local patch. Get this distinction right *before*
-   writing a patch, not after -- a gfx803-only patch for a generic bug
-   fixes nothing for anyone else hitting the same code path, and isn't
-   this repo's job.
-4. **Ablation-test before crediting a patch.** If several patches are
-   candidates for fixing an observed symptom, build a variant with each
-   disabled (keep everything else identical) and compare -- this repo's
-   history has a case where two rocBLAS patches were confirmed *partially*
-   responsible for a symptom (removing them made it much worse, not just
-   "no different"), which is a different and more useful finding than
-   either "yes" or "no."
-5. **When something works on one line but not the other, check whether
-   it's actually comparable before calling it a regression.** New ORT/
-   ROCm/MIGraphX versions add real new functionality (new ONNX opsets, new
-   parser features) that the older line literally could not have
-   exercised -- a test failing on the new line but not existing/loadable
-   on the old one isn't a regression, it's new-and-still-buggy. Only count
-   something as "broken here, worked there" once you've confirmed the
-   older line actually ran the same code path and got it right.
+A correctness fix that costs 5 to 10 percent of throughput is an acceptable and
+expected trade. Do not negotiate around it. Beyond that, say so and ask. Do not
+accept a large regression in silence, and do not pick a workaround in silence to
+avoid one. Never trade correctness for speed without saying it out loud first.
+
+### Comments say WHY. They never say WHAT.
+
+Write code that is clear enough to read on its own. A comment that repeats what
+the next three lines do is dead weight, and it becomes wrong the first time the
+code changes. Write a comment only for a reason you cannot see in the code: why
+this bound, why this order, why a thing that looks like a workaround is actually
+correct here, and what broke the last time someone tried the obvious approach.
+The patch headers in this repo are the model. Each one states WHY (how the bug
+was found and what it looks like) before WHAT (the diff itself).
+
+### A comment is not commit history.
+
+Do not write "changed X to Y", "added this for the Z fix", or "removed unused
+W". `git log` and `git blame` do that job, and such a comment becomes wrong as
+soon as a later edit lands. A comment must make sense to a reader who has no
+idea what the last edit was.
+
+### Never write a comment about something that is absent.
+
+Do not explain that something *is not* there, *used to be* there, or *is not
+done*. Examples of bad comments: "no libomp-dev here", "removed the X
+workaround", "we do not do Y anymore". A reader sees only the code that exists.
+A reader cannot test a note about code that does not exist, so it is dead weight
+forever. A dropped line needs no comment, because its absence is visible. Write
+a comment only to justify something that is present.
+
+### A comment does not describe the whole system.
+
+Some comments need to explain how one file relates to three others, why a
+Dockerfile stage exists in the larger pipeline, or how a patch fits the
+gfx803-versus-mainline story. That text belongs in `README.md`, in
+`MIGRATION_NOTES.md`, or in a patch header. It does not belong in an inline
+code comment. A code comment explains the code next to it. If you want to write
+three paragraphs above a function about how the pipeline works, that is a docs
+change, not a comment.
+
+## Why this repo exists, and what that means for your work
+
+AMD dropped support for gfx803 (Polaris) in ROCm 6.0. Every fix here is local.
+Nothing goes upstream to AMD, and a ROCm version bump fixes nothing unless you
+go and look. Two results follow.
+
+1. Assume nothing is fixed until you read the pinned source. A patch header
+   that says "confirmed broken as of ROCm X" is one moment in time, not a
+   permanent fact. Before you re-diff a patch or investigate again, grep the
+   pinned commit for the target function or struct and read what is there now.
+   This repo's history has both outcomes. Some patches were already obsolete,
+   because the fix landed upstream on its own. In others the target code was
+   replaced by something new whose behavior on the same bug class is unknown
+   and unverified. That case is not fixed and not proven broken. It is unknown
+   until you read the pinned source.
+2. A patch that applies cleanly proves nothing about correctness. The common
+   bug class on this hardware is a silent wrong answer. `rocblas_status_success`
+   returns with bad numbers, or a kernel dispatches fine and returns garbage.
+   Re-diffing a patch so it compiles again is necessary and not enough. Say so
+   in the patch or the notes: "NOT YET RE-VERIFIED ON REAL HARDWARE". Keep that
+   note until someone runs the original repro against the new binaries, instead
+   of only confirming that the diff applies.
+
+## Investigation workflow
+
+These steps worked many times in this repo's history.
+
+1. Trace before you patch. `MIOPEN_ENABLE_LOGGING_CMD=1 MIOPEN_LOG_LEVEL=6` and
+   `MIGRAPHX_TRACE_COMPILE=1` show the solver and op graph that really ran. They
+   do not show what you guess from the Dockerfile or the op name. Several
+   "obvious" explanations here were wrong after a trace. One ConvTranspose
+   investigation blamed a specific MIOpen solver. The trace showed a different
+   code path: MIGraphX's own graph rewrite, and MIOpen was not involved.
+2. Isolate before you conclude. When a bug shows through the whole stack (ORT to
+   MIGraphX to MIOpen to rocBLAS), test each layer alone before you pick a
+   suspect. `MIOpenDriver <op> ... -V 1` runs MIOpen's own GPU-versus-CPU
+   reference comparison with no ORT or MIGraphX in the process. It cleared MIOpen
+   in favor of a layer above it, and the other way around, more than once.
+3. Compare against another architecture before you call a bug gfx803-specific.
+   A failure that also happens on a newer arch (gfx900+ or gfx12x) with the same
+   source pin is an upstream bug, and it is not gfx803's to fix here. Report it
+   upstream. A failure only on gfx803 with identical source is a fair target for
+   a local patch. Make this distinction before you write the patch, not after. A
+   gfx803-only patch for a generic bug helps nobody else who hits the same code
+   path, and that work is not this repo's job.
+4. Turn patches off one at a time before you credit one. When several patches
+   can explain a symptom, build one variant per disabled patch and keep
+   everything else the same. History: two rocBLAS patches were each *partly*
+   responsible. Removing them made the symptom much worse, which is a different
+   and more useful result than "no difference" or "yes".
+5. When one line works and the other does not, first ask whether the two are
+   comparable. Newer ORT, ROCm, and MIGraphX add real new features (new ONNX
+   opsets, new parser paths) that the older line cannot run at all. A test
+   that fails on the new line and does not even load on the old one is not a
+   regression. It is new and still broken. Count something as "worked there,
+   broken here" only after you make sure that the older line ran the same code
+   path and got it right.
 
 ## Patch conventions
 
-- Every patch header states WHY (how the bug was found, what it looks
-  like, hardware measurements if applicable) before WHAT. If you can't
-  write the WHY convincingly, you haven't finished the investigation.
-- Two apply dialects, on purpose: `git apply` for anything cloned as a
-  real git repo (`rocm-systems`); `patch -p1` for anything that's a
-  sparse-checked-out monorepo subdirectory, because `git apply --check`
-  silently no-ops ("Skipped patch", exit 0, nothing modified) on those
-  in this box's git version. Match whichever dialect the sibling patches
-  in that directory already use.
-- Every `.sh` driver verifies its own result after applying -- greps for a
-  marker string, fails loudly (`exit 1`) if it's missing. Don't add a
-  driver that trusts the patch tool's exit code alone.
-- The three lines (`rocm10`/root, `rocm7.14/`, `rocm6.4.4/`) are
-  independent copies on purpose. Do not make one line reference another's
-  `patches/` -- the root, `rocm7.14/` and `rocm6.4.4/` each carry their own
-  patch set, all under active development, and a shared file risks a
-  bug-in-progress on one reaching the hardware-verified state of the
-  other. Copy, don't link, until the deliberate convergence step (see
-  README's "Convergence" section) is actually happening. `tools/` is the
-  deliberate exception: it's hardware/arch-level tooling (host-setup,
-  correctness-suite), not version-specific, so it lives once at the root
-  and all three lines use it from there.
+- Each patch header states WHY before WHAT: how the bug was found, what it looks
+  like, and the hardware measurements where they apply. If you cannot write a
+  convincing WHY, your investigation is not finished.
+- Two apply styles exist on purpose. Use `git apply` for a tree that is a real
+  git repo, such as `rocm-systems`. Use `patch -p1` for a sparse checkout of a
+  monorepo subdirectory, because `git apply --check` there reports success and
+  changes nothing ("Skipped patch", exit 0) on this box's git version. Match the
+  style that the other patches in that directory already use.
+- Every `.sh` driver makes sure that its own apply worked. It greps for a marker
+  string, and it stops with `exit 1` when the marker is absent. Do not add a driver
+  that trusts only the exit code of the patch tool.
+- The three lines (`rocm10` at the root, `rocm7.14/`, and `rocm6.4.4/`) are
+  separate copies by design. Do not make one line point at another line's
+  `patches/`. Each one carries its own patch set, and a shared file risks a
+  half-fixed bug on one line reaching the hardware-tested state of another.
+  Copy, do not link, until the planned merge in README's "Convergence" section
+  actually happens. `tools/` is the one exception. It holds hardware and arch
+  level tooling (host-setup, correctness-suite) rather than version-specific
+  code, so it lives once at the root and every line uses it from there.
 
-## Component ref pinning -- branches, not commit SHAs, no nightlies
+## Component pins: branches, not commit SHAs, and no nightlies
 
-Every upstream component this repo builds from source (`ROCM_SYSTEMS_REF`,
-`ROCM_LIBRARIES_REF`, `MIGRAPHX_REF`, `PYTORCH_REF`, etc. in the Dockerfile)
-is pinned to a named release *branch* -- `release/therock-10.0`,
-`release/rocm-rel-10.0`, and so on -- not a frozen commit SHA and not a
-per-run resolution of `develop`/`main`. Same convention the mainline
-(`rocm-migraphx-ort-builder`) repo's `release.yml` uses. (The `rocm7.14/`
-line uses the corresponding `release/therock-7.14` / `release/rocm-rel-7.14`
-branches.)
+Every upstream component that this repo builds from source is pinned to a named
+release branch. The Dockerfile args are `ROCM_SYSTEMS_REF`,
+`ROCM_LIBRARIES_REF`, `MIGRAPHX_REF`, and `PYTORCH_REF`, and the values are
+`release/therock-10.0`, `release/rocm-rel-10.0`, and similar. Do not pin a
+frozen commit SHA, and do not resolve `develop` or `main` per run. The mainline
+repo (`rocm-migraphx-ort-builder`) uses the same convention in its
+`release.yml`. The archived `rocm7.14/` line uses `release/therock-7.14` and
+`release/rocm-rel-7.14`.
 
-This works only because CI here is manual-dispatch only, with no schedule --
-there's no nightly job re-running against a moving branch tip unattended. A
-branch pin means "build whatever's on that branch the day someone runs the
-workflow"; two manual runs weeks apart can legitimately land different
-commits if upstream pushed a cherry-pick to the branch in between. That's
-expected, not drift to chase down -- if a build starts failing that
-previously passed and nothing in this repo changed, check the branch's
-current tip against what the last successful build actually used before
-assuming a local regression.
+This is safe only because CI here runs on manual dispatch and has no schedule.
+No nightly job re-runs against a moving tip while nobody watches. A branch pin
+means: build what that branch holds on the day a person runs the workflow. Two
+manual runs weeks apart can land different commits, because upstream can push a
+cherry-pick to the branch in between. That is expected. It is not drift to chase. If
+a build starts to fail and nothing in this repo changed, compare the branch tip
+with the commit that the last good build used, before you suspect a local
+regression.
 
-If you ever add a component that has no such release branch (rocBLAS/MIOpen
-before the `rocm-libraries` monorepo restructure, or a component whose
-upstream only tags releases rather than branching them), pin that one to an
-exact commit SHA instead and say so explicitly in the Dockerfile comment --
-don't default to `develop`/`main` to avoid the question.
+Two additions to that rule matter for how the build finds the tip. CI resolves
+each branch to its commit once per run and passes it as a `*_SHA` build-arg, so
+a moved tip changes the layer cache key instead of being reused invisibly. See
+"Component images, pins and line provenance" in `README.md`. Nobody sets these
+values by hand, and the Dockerfile keeps the branch names as the readable pin.
 
-## vLLM support lives in vllm/ as a hard fork -- not patch files, not a submodule
+If you add a component that has no release branch, pin that one to an exact
+commit SHA and say why in the Dockerfile comment. This happens for a component
+whose upstream only tags releases, or for rocBLAS and MIOpen before the
+`rocm-libraries` monorepo restructure. Do not answer the question by defaulting
+to `develop` or `main`.
 
-`vllm/` in this repo is a **hard fork**: upstream gfx906 vLLM
-support, taken and adjusted for gfx803, tracked directly by this repo's own
-git history as of 2026-08-29. It started life as a separate checkout with its
-own `.git` (remote `ai-infos/vllm-gfx906-mobydick`) and was deliberately
-un-forked from that -- `.git` removed, no `.gitmodules`, no gitlink, no
-independent history, no relationship to that upstream repo going forward.
-This was an explicit, discussed decision (not a submodule, not "local
-only either way" -- fully folded into `rocm-gfx803`'s own tracking) made
-on the reasoning that this fork will never be upstreamed, so there's no
-value in maintaining a separate history to eventually reconcile. Don't
-`git submodule add` it or try to reconnect it to that remote without
-being told to.
+## vLLM lives in vllm/ as a hard fork, not as patch files and not as a submodule
 
-The fork lives at the **10.0 root line** (copied there when the 7.14 line
-was archived under `rocm7.14/`, 2026-08-29; the pristine fork copy stays
-under `rocm7.14/vllm/`, untouched, for archival) and **targets the 10.0
-stack by assumption**: the hand-written gfx803 kernels
-(`vllm/vllm/gfx803_kernels/*.hip`) are version-agnostic source compiled
-once with the stack's own `hipcc --offload-arch=gfx803` (see each loader's
-docstring for the exact invocation), and `librocblas.so` resolves through
-the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
-compiled `.so` files are built on the box next to their loaders and never
-committed, so nothing stack-specific is pinned in this repo. Hardware
-validation of vLLM on the 10.0 stack is DONE (2026-09-02): the two
-crashes that blocked it were both in the ROCm 10.0 stack, not vLLM, and
-are fixed by `patches/rocm-systems/va-reuse-defer-noremap.patch` (the
-va-reuse-defer park-branch `_fmm_map_to_gpu` re-map left a kernel GPUVM
-mapping behind that libhsakmt's aperture allocator then re-handed out, so
-every code-object load collided with it -- kernel EINVAL ->
-`HSA_STATUS_ERROR_OUT_OF_RESOURCES` -> the HIP launch fallback's
-reinterpret_cast turned that into a SIGSEGV) and
-`patches/rocm-systems/d2h-null-dsthost.patch` (a D2H copy into a
-host-accessible *device* allocation handed `readBuffer` a NULL host
-destination because `getHostMem()` is unset for device-origin memory).
-Verified with `qwen35_2b_bench_v3.py` on the box: EXIT=0, prefill 311.0
-tok/s, decode 30.2 tok/s (2101-token prompt / 128 decode tokens; the
-7.14 record for the same bench: 331.7 / 24.4).
+`vllm/` in this repo is a hard fork. It carries upstream gfx906 vLLM support,
+adjusted for gfx803, and this repo's own git history tracks it directly as of
+2026-08-29. It began as a separate checkout with its own `.git` and a remote
+named `ai-infos/vllm-gfx906-mobydick`. That link was removed on purpose: no
+`.git`, no `.gitmodules`, no gitlink, and no independent history. The decision
+was discussed and explicit. The fork will never be upstreamed, so a separate
+history to reconcile later has no value. Do not run `git submodule add` on it,
+and do not reconnect it to that remote unless you are told to.
 
-**It is not built from this repo's Dockerfile** (vLLM runs as a box-only
-editable install), and it is **not documented via `.patch.md` files under
-`patches/vllm/`** -- that convention existed once, for a version of this
-repo that didn't vendor vLLM at all, and was deliberately removed
-(commit `a8485b4`, "[Build] Bring working vLLM in"). It must not be
-revived now either. Whatever gets figured out for gfx803 in vLLM goes
-directly into the real source files in `vllm/`, the same way any
-other fix in this repo lands in real code, not a doc describing a
-hypothetical patch.
+The fork lives on the 10.0 root line. It was copied there when the 7.14 line was
+archived under `rocm7.14/` on 2026-08-29. The untouched fork copy stays under
+`rocm7.14/vllm/` for the record. The fork targets the 10.0 stack by assumption.
+Its hand-written gfx803 kernels in `vllm/vllm/gfx803_kernels/*.hip` are
+version-agnostic source. They compile once with the stack's own
+`hipcc --offload-arch=gfx803`, and each loader's docstring gives the exact
+command. `librocblas.so` resolves through the stack's `LD_LIBRARY_PATH`, which
+is `/opt/rocm/core-10.0/lib` on 10.0. The compiled `.so` files are built on the
+box next to their loaders and are never committed, so this repo pins nothing
+stack-specific.
 
-**Gotcha: `vllm/` is double-nested.** `vllm/` itself is the fork's
-own root (has its own `AGENTS.md`, `README.md`, `benchmarks/`, etc. --
-`vllm/AGENTS.md` is upstream's *own* contribution-policy doc, about
-submitting PRs to `vllm-project/vllm`; irrelevant here, ignore it, we are
-never upstreaming); the actual importable `vllm` package is one level
-deeper, at `vllm/vllm/` (`vllm/vllm/model_executor/
-layers/...`, `vllm/vllm/v1/attention/ops/...`). Writing to
-`vllm/model_executor/...` instead of
-`vllm/vllm/model_executor/...` silently lands nothing (or the
-wrong thing) and is easy to do by accident if the shell's cwd has drifted
-(this tool's working directory persists between commands in a session) --
-verify with an absolute path, not a relative guess, when in doubt.
+Hardware validation of vLLM on the 10.0 stack is done, on 2026-09-02. Two
+crashes blocked it, and both were in the ROCm 10.0 stack rather than in vLLM.
+`patches/rocm-systems/va-reuse-defer-noremap.patch` fixes the first one. The
+va-reuse-defer park branch re-mapped a buffer in `_fmm_map_to_gpu` and left a
+kernel GPUVM mapping behind. libhsakmt's aperture allocator handed that range
+out again, so every code-object load collided with it. The kernel load returned
+EINVAL, that became `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, and the HIP launch
+fallback's reinterpret_cast turned it into a SIGSEGV.
+`patches/rocm-systems/d2h-null-dsthost.patch` fixes the second one. A D2H copy
+into a host-accessible *device* allocation passed `readBuffer` a NULL host
+destination, because `getHostMem()` is not set for memory that came from the
+device. Verified on the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0
+tok/s, decode 30.2 tok/s, on a 2101-token prompt and 128 decode tokens. The
+7.14 record for the same bench is 331.7 and 24.4.
 
-**Hand-written gfx803 HIP kernel source lives in `vllm/vllm/
-gfx803_kernels/`** (`gfx803_gemm_lib.hip`, `gfx803_attn_split.hip`), a
-dedicated folder, not alongside the Python loaders that `ctypes`-load their
-compiled output. `vllm/.gitignore` blanket-excludes `*.hip`
-repo-wide with the comment "hip files generated by PyTorch" -- true for
-upstream's actual hipify output (auto-translated from `.cu` CUDA source as a
-build step) but wrong for these two, which are hand-written originals with
-no `.cu` to regenerate from. `gfx803_kernels/` is explicitly whitelisted
-back (`!/vllm/gfx803_kernels/*.hip` in `vllm/.gitignore`) instead of
-routinely force-adding files past the blanket rule -- put any new
-hand-written gfx803 `.hip` kernel source there and it tracks normally. The
-compiled `.so` still needs to land next to its Python loader (e.g.
-`vllm/vllm/model_executor/layers/libgfx803gemm.so`) for that
-loader's `__file__`-relative ctypes path to find it -- only the source
-moved, the `hipcc -o` output path did not; see the loader's own docstring
-for the exact compile invocation.
+The fork is not built by this repo's Dockerfile. vLLM runs as a box-only editable
+install. It is also not documented with `.patch.md` files under `patches/vllm/`.
+That convention belonged to an older version of this repo that did not vendor
+vLLM at all, and commit `a8485b4` ("[Build] Bring working vLLM in") removed it on
+purpose. Do not bring it back. Every gfx803 finding in vLLM goes into the real
+source files under `vllm/`, the same way every other fix in this repo lands in
+real code rather than in a document about a hypothetical patch.
 
-**Syncing box-only work back**: real gfx803 vLLM fixes get iterated and
-verified live on the box at 192.168.1.214 (`/data/vllm-mobydick/`, see
-"Hardware access" below), then the actual changed/new files get copied
-back into this local `vllm/vllm/...` checkout so the real diff
-lands here -- not summarized into a separate document. The usual
-commit/push rule applies same as everywhere else in this repo: build and
-stage locally, never commit or push without being told to for that
-specific commit.
+One trap: `vllm/` is nested twice. `vllm/` is the fork's own root, with its own
+`AGENTS.md`, `README.md`, and `benchmarks/`. That `vllm/AGENTS.md` is upstream's
+contribution policy, about pull requests to `vllm-project/vllm`. It does not
+apply here, because this fork is never upstreamed. The importable package is one
+level deeper, at `vllm/vllm/`. Real examples are
+`vllm/vllm/model_executor/layers/...` and `vllm/vllm/v1/attention/ops/...`. A
+write to `vllm/model_executor/...` lands nowhere, or in the wrong file. This is
+easy to do when your shell's working directory has drifted, because the tool's
+working directory persists between commands in a session. Use an absolute path
+when you are unsure.
+
+Hand-written gfx803 HIP kernel source goes in `vllm/vllm/gfx803_kernels/`
+(`gfx803_gemm_lib.hip`, `gfx803_attn_split.hip`), a folder of its own, not next
+to the Python loaders that `ctypes`-load the compiled output. `vllm/.gitignore`
+excludes `*.hip` repo-wide with the comment "hip files generated by PyTorch".
+That is true of upstream's hipify output, which is translated from `.cu` CUDA
+source during the build, and it is wrong for these two files, which are
+hand-written originals with no `.cu` to regenerate them from. The folder is
+whitelisted back with `!/vllm/gfx803_kernels/*.hip` in `vllm/.gitignore`, rather
+than force-added past the rule each time. Put any new hand-written gfx803 `.hip`
+source there, and it tracks normally. The compiled `.so` must still sit next to
+its Python loader, for example
+`vllm/vllm/model_executor/layers/libgfx803gemm.so`, because the loader builds its
+`ctypes` path from `__file__`. Only the source moved. The `hipcc -o` output path
+did not move. The loader's docstring gives the exact command.
+
+Box-only work flows back like this. Iterate on a real gfx803 vLLM fix live on the
+box at 192.168.1.214 under `/data/vllm-mobydick/` (see "Hardware access" below),
+test it there, then copy the changed and new files back into this local
+`vllm/vllm/...` checkout, so the real diff lands here. Do not summarize it into
+a separate document. The usual rule still applies: build and stage locally, and
+do not commit or push unless you are told to for that specific commit.
 
 ## Hardware access
 
-Real-hardware validation requires the actual gfx803 card -- this cannot be
-emulated or approximated on a different GPU. If you don't have access to
-one, say so explicitly rather than reporting a patch as "verified" based on
-a clean build/apply alone. Container needs `--device=/dev/kfd
---device=/dev/dri --group-add video` passed through; `rocminfo` inside the
-container should enumerate the card as a real `KERNEL_DISPATCH` agent
-before trusting anything else it reports.
+Real-hardware validation needs a real gfx803 card. You cannot emulate it, and
+another GPU will not do. If you do not have one, say so. Do not report a patch as
+"verified on hardware" because it only built and applied cleanly. The container needs
+`--device=/dev/kfd --device=/dev/dri --group-add video` passed through. Inside
+the container, `rocminfo` must list the card as a `KERNEL_DISPATCH` agent before
+you trust anything else it reports.
 
-Known device-side pitfalls when instrumenting on real hardware: device-side
-`printf` can hang the kernel rather than just being slow; adding *any* extra
-device-side write for debugging can itself mask a race you're trying to
-observe (changes timing); always verify you're actually running against the
-patched binary you think you are (a stale image/container is a recurring
-false lead), not just that the patch file on disk looks right.
+Known traps when you add instrumentation on real hardware:
 
-## What doesn't need the hardware
+- Device-side `printf` can hang the kernel instead of only slowing it down.
+- Any extra device-side write for debugging changes timing, and it can hide the
+  race you are looking for.
+- Always make sure that you run against the patched binary you think you are
+  testing. A stale image or container is a repeated false lead here. Make sure
+  of that, and not only that the patch file on disk looks right.
 
-Whether a Dockerfile builds, whether a patch applies against a given pin,
-source-level tracing of where a bug lives (reading the actual pinned
-source, diffing across ROCm versions, following a compiler pass through
-its actual invoking code rather than assuming), and setting up cross-arch
-differential tests (the test itself needs a card of *some* kind, but not
-necessarily gfx803, to establish "is this generic or gfx803-specific"
-before spending real-hardware time on the gfx803 side of that comparison).
+## What does not need the card
+
+You can answer these without hardware. Does the Dockerfile build. Does a patch
+apply against a given pin. Where does a bug live, read from the actual pinned
+source, diffed across ROCm versions, or followed through the code that really
+calls a compiler pass instead of the code you assume calls it. You can also set
+up a cross-arch comparison test without gfx803, because that step needs a card of
+some kind and not necessarily this one. Do that first, to learn whether a bug is
+generic, before you spend hardware time on the gfx803 side of the comparison.

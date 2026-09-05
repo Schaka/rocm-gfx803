@@ -1,10 +1,11 @@
 #!/bin/sh
-# Apply d2h-null-dsthost.patch (see that file for the full WHY/WHAT).
-# D2H copy destination for host-accessible *device* allocations: pass the
-# destination device VA (getHostMem() is NULL for a device allocation that
-# happens to be host-accessible, which made readBuffer memcpy to address 0
-# and crash vLLM 10.0 during inference). Must run AFTER d2h-staged-copy.sh
-# (this patch edits the branch that patch introduced).
+# Apply d2h-null-dsthost.patch with `git apply`, then make sure that the hunk
+# landed. That patch file gives the reason and the change. In short: for a device
+# allocation that is also host-accessible, getHostMem() returns NULL, so a D2H copy
+# passed address 0 to memcpy and crashed vLLM 10.0 during inference. The change
+# passes the destination device VA instead.
+#
+# Run this after d2h-staged-copy.sh, because it edits the branch that patch adds.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

@@ -1,12 +1,14 @@
 #!/bin/sh
-# See winograd-fused-conv-miscompute.patch (copied unchanged from the
-# 6.4.4-era rocm6.4.4/patches/miopen/) for the full WHY. Re-verified applying
-# cleanly against the pinned 7.14 source (only a small line-number offset,
-# no content drift) before being carried over here.
+# Apply winograd-fused-conv-miscompute.patch. That file gives the full reason.
+# The patch came unchanged from rocm6.4.4/patches/miopen/, and it was confirmed to
+# apply cleanly against the pinned 7.14 source before it was carried here. Only
+# line numbers moved, and no content drifted.
 #
-# Uses `patch`, not `git apply` -- see
-# ../rocblas/small-gemm-assembly-miscompute.sh for why (git-apply-specific
-# "Skipped patch" quirk on this git version, not a defect in the patch).
+# This driver uses `patch` and not `git apply`. On this git version,
+# `git apply --check` on a sparse checkout of a monorepo subdirectory reports
+# success and changes nothing ("Skipped patch", exit 0). That is a quirk of
+# `git apply` here, and not a defect in the patch. See
+# ../rocblas/small-gemm-assembly-miscompute.sh.
 set -eu
 SRC="${1:-/miopen-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

@@ -13,7 +13,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: 'Component name -- drives the package and the Dockerfile target (rocr-clr|rocr|rocblas|miopen|migraphx|pytorch|torchvision|torchaudio|ort|final)'
+        description: 'Component name -- drives the package and the Dockerfile target (rocr-clr|rocr|rocblas|miopen|rocsolver|migraphx|pytorch|torchvision|torchaudio|ort|final)'
         required: true
         type: string
       target:
@@ -26,14 +26,12 @@ on:
         required: false
         type: boolean
         default: false
-      # This repo holds three build lines (root: Dockerfile on ROCm 10.0;
-      # rocm7.14/Dockerfile on the TheRock 7.14 line; rocm6.4.4/Dockerfile on
-      # the classic ROCm 6.4.4 tags). They publish to the same packages, so a
-      # line MUST carry its own tag suffix or it overwrites the other line's
-      # images -- including :latest-gfx803, the one downstream consumers
-      # actually pull. Defaults are rocm10 (the main line, unsuffixed);
-      # rocm7.14 and rocm6.4.4 are called with build-dir/tag-suffix
-      # overrides below.
+      # Only the ROCm 10.0 line is built in CI today; these inputs stay so an
+      # archived line (rocm7.14/, rocm6.4.4/) can still be built by pointing the
+      # reusable workflow at its own directory. Two lines publishing to the same
+      # package without distinct suffixes overwrite each other -- including
+      # :latest-gfx803, the one downstream consumers actually pull -- which is why
+      # the suffix exists at all.
       build-dir:
         description: 'Directory holding the Dockerfile, and the build context (. | rocm7.14 | rocm6.4.4)'
         required: false
@@ -41,6 +39,11 @@ on:
         default: '.'
       tag-suffix:
         description: 'Appended to every tag and to the cache ref, e.g. -rocm7.14. Empty for the rocm10 (main) line.'
+        required: false
+        type: string
+        default: ''
+      intermediate-suffix:
+        description: 'Suffix on the INTERMEDIATE component tags and cache refs only, e.g. -rocm10. Defaults to tag-suffix; the main line sets it because its component images are published under the unsuffixed ":gfx803" tag that an earlier line of this repo also used -- so a component whose job has not republished since still resolves to the other line, and nothing but an explicit name catches that. The final image keeps the tag people actually pull (latest-gfx803).'
         required: false
         type: string
         default: ''
@@ -66,6 +69,11 @@ on:
         default: false
       with-miopen-image:
         description: 'Pass MIOPEN_IMAGE so this build COPYs from the prebuilt MIOpen image'
+        required: false
+        type: boolean
+        default: false
+      with-rocsolver-image:
+        description: 'Pass ROCSOLVER_IMAGE so this build COPYs from the prebuilt rocSOLVER image'
         required: false
         type: boolean
         default: false
@@ -179,6 +187,7 @@ jobs:
               rocr)     echo "${owner}/rocm-rocr-builder" ;;
               rocblas)  echo "${owner}/rocm-rocblas-builder" ;;
               miopen)   echo "${owner}/rocm-miopen-builder" ;;
+              rocsolver) echo "${owner}/rocm-rocsolver-builder" ;;
               migraphx) echo "${owner}/rocm-migraphx-builder" ;;
               pytorch)  echo "${owner}/rocm-migraphx-torch-builder" ;;
               torchvision) echo "${owner}/rocm-torchvision-builder" ;;
@@ -193,7 +202,13 @@ jobs:
           # build lines never see each other's images -- an intermediate
           # pulled without it would silently mix a 6.4.4/7.14 component into
           # a 10.0 build, which fails much later and very confusingly.
-          arch="gfx803${{ inputs.tag-suffix }}"
+          arch="gfx803${{ inputs.intermediate-suffix != '' && inputs.intermediate-suffix || inputs.tag-suffix }}"
+          # The final image's tags keep following tag-suffix only: "latest-gfx803"
+          # is what downstream Dockerfiles and users pull, and the line is already
+          # spelled out by the release-tag form (rocm10.0-gfx803). Only the
+          # intermediate component images -- the ones stages consume by name -- get
+          # the line made explicit in their tag.
+          farch="gfx803${{ inputs.tag-suffix }}"
 
           {
             echo "build-args<<ARGS_EOF"
@@ -209,6 +224,9 @@ jobs:
             fi
             if [ "${{ inputs.with-miopen-image }}" = "true" ]; then
               echo "MIOPEN_IMAGE=$(pkg miopen):${arch}"
+            fi
+            if [ "${{ inputs.with-rocsolver-image }}" = "true" ]; then
+              echo "ROCSOLVER_IMAGE=$(pkg rocsolver):${arch}"
             fi
             if [ "${{ inputs.with-migraphx-image }}" = "true" ]; then
               echo "MIGRAPHX_IMAGE=$(pkg migraphx):${arch}"
@@ -232,18 +250,73 @@ jobs:
             [ -n "${{ inputs.torchvision-ref }}" ] && echo "TORCHVISION_REF=${{ inputs.torchvision-ref }}"
             [ -n "${{ inputs.torchaudio-ref }}" ] && echo "TORCHAUDIO_REF=${{ inputs.torchaudio-ref }}"
             [ -n "${{ inputs.tensor-topk-opt-level }}" ] && echo "TENSOR_TOPK_OPT_LEVEL=${{ inputs.tensor-topk-opt-level }}"
+
+            # Resolve each branch pin to whatever its tip is right now, per run,
+            # and pass that down. Nobody sets these by hand: the Dockerfile's
+            # *_REF branches remain the only human-authored pins, and the resolved
+            # commits land in the image's own /opt/rocm/.gfx803-line + labels.
+            # The Dockerfile keeps the branch as the documented policy; this is
+            # what makes a moved upstream tip visible to the layer cache (the
+            # clone happens inside a RUN, so the command text -- the cache key --
+            # would otherwise be identical across AMD's pushes) and is what the
+            # component image's .gfx803-line marker records. Resolution failure is
+            # fatal on purpose: silently building an untracked tip is the thing
+            # this guards.
+            df="${{ inputs.build-dir }}/Dockerfile"
+            pins=""
+            resolve() { # ref_arg sha_arg url override
+              local ref sha mp attempt
+              ref="$4"
+              if [ -z "$ref" ]; then
+                ref="$(grep -m1 -E "^ARG $1=" "$df" | cut -d= -f2- | tr -d '\"')"
+              fi
+              if printf '%s' "$ref" | grep -qE '^[0-9a-f]{40}$'; then
+                sha="$ref"
+              else
+                # "<sha>\t<refname>" from ls-remote; a tag can name a tag object,
+                # so prefer the peeled "<tag>^{}" commit when the server offers it.
+                # Retry, because a transient github failure should not fail a
+                # build -- but no resolution at all is fatal: an image that
+                # cannot say which commit it holds is the thing this guards.
+                mp=""
+                for attempt in 1 2 3; do
+                  mp="$(git ls-remote "$3" "refs/tags/$ref^{}" "refs/heads/$ref" "refs/tags/$ref" 2>/dev/null || true)"
+                  [ -n "$mp" ] && break
+                  sleep $((attempt * 5))
+                done
+                sha="$(printf '%s\n' "$mp" | awk -v w="refs/tags/$ref^{}" '$2==w {print $1; exit}')"
+                if [ -z "$sha" ]; then
+                  sha="$(printf '%s\n' "$mp" | awk -v a="refs/heads/$ref" -v b="refs/tags/$ref" '$2==a || $2==b {print $1; exit}')"
+                fi
+              fi
+              if [ -z "$sha" ]; then
+                echo "FATAL: could not resolve $1=\"$ref\" against $3" >&2
+                exit 1
+              fi
+              echo "$2=$sha"
+              pins="$pins $1=$sha"
+            }
+            resolve ROCM_SYSTEMS_REF   ROCM_SYSTEMS_SHA   https://github.com/ROCm/rocm-systems.git   ''
+            resolve ROCM_LIBRARIES_REF ROCM_LIBRARIES_SHA https://github.com/ROCm/rocm-libraries.git ''
+            resolve MIGRAPHX_REF       MIGRAPHX_SHA       https://github.com/ROCm/AMDMIGraphX.git    ''
+            resolve PYTORCH_REF        PYTORCH_SHA        https://github.com/ROCm/pytorch.git        '${{ inputs.pytorch-ref }}'
+            resolve TORCHVISION_REF    TORCHVISION_SHA    https://github.com/pytorch/vision.git      '${{ inputs.torchvision-ref }}'
+            resolve TORCHAUDIO_REF     TORCHAUDIO_SHA     https://github.com/ROCm/audio.git          '${{ inputs.torchaudio-ref }}'
+            resolve ORT_VERSION        ORT_SHA            https://github.com/microsoft/onnxruntime.git ''
+            echo "GFX803_SOURCE_REV=${GITHUB_SHA}"
+            echo "GFX803_PINS=${pins# }"
             echo "ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
           if [ "${{ inputs.final }}" = "true" ]; then
             {
               echo "tags<<TAGS_EOF"
-              echo "${self}:latest-${arch}"
+              echo "${self}:latest-${farch}"
               # No suffix on this one: the ROCm release already names the line
               # (rocm6.4.4-gfx803 vs rocm7.14-gfx803 vs rocm10.0-gfx803), so
               # adding it would just read as rocm10.0-gfx803-rocm10.
               echo "${self}:${{ inputs.release-tag }}-gfx803"
-              echo "${self}:${{ steps.date.outputs.date }}-${arch}"
+              echo "${self}:${{ steps.date.outputs.date }}-${farch}"
               echo "TAGS_EOF"
             } >> "$GITHUB_OUTPUT"
           else

@@ -1,8 +1,8 @@
 #!/bin/sh
-# Apply pinned-release-system-scope.patch (see that file for the full
-# WHY/WHAT). gfx803 D2H churn page fault: the pinned-buffer release marker
-# must be a system-scope barrier so the buffer is unlocked only after the
-# copy shader's L2 writes have drained.
+# Apply pinned-release-system-scope.patch with `git apply`, then make sure that
+# the hunk landed. That patch file gives the reason and the change. In short: the
+# pinned-buffer release marker must be a system-scope barrier, because the buffer
+# may only be unlocked after the copy shader's L2 writes have drained.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

@@ -1,13 +1,14 @@
 #!/bin/sh
-# See reduce-prod-wrong-identity.patch (copied unchanged from the
-# 6.4.4-era rocm6.4.4/patches/miopen/) for the full WHY. Re-verified applying
-# cleanly against the pinned 7.14 source (only a 1-line offset, no content
-# drift) before being carried over here. Not gfx803-specific -- see the
-# patch header.
+# Apply reduce-prod-wrong-identity.patch. That file gives the full reason, and it
+# states that the fault is not gfx803-specific. The patch came unchanged from
+# rocm6.4.4/patches/miopen/, and it was confirmed to apply cleanly against the
+# pinned 7.14 source before it was carried here. Only one line number moved, and no
+# content drifted.
 #
-# Uses `patch`, not `git apply` -- see
-# ../rocblas/small-gemm-assembly-miscompute.sh for why (git-apply-specific
-# "Skipped patch" quirk on this git version, not a defect in the patch).
+# This driver uses `patch` and not `git apply`. On this git version,
+# `git apply --check` on a sparse checkout of a monorepo subdirectory reports
+# success and changes nothing ("Skipped patch", exit 0). See
+# ../rocblas/small-gemm-assembly-miscompute.sh.
 set -eu
 SRC="${1:-/miopen-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

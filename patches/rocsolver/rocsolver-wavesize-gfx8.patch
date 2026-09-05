@@ -1,0 +1,111 @@
+rocSOLVER (gfx803, ROCm 10.0): WarpSize must be 64 on every wave64 ISA, not only
+on gfx9xx. The upstream gate `#if defined(__GFX9__)` leaves gfx8xx, which is also
+wave64, on the 32-lane branch, and the wave-partial reductions then store each
+wave's result twice.
+
+REASON
+------
+A gfx803 rocSOLVER exists only once this repo builds one. The
+`rocsolver-builder` stage does that with `-DAMDGPU_TARGETS=gfx803`, because
+upstream's default target list is `gfx900 / gfx906 / gfx908` plus newer. hipSOLVER
+needs no build of its own: it carries no device code and is a host wrapper over
+rocSOLVER. A rocSOLVER that is built must also be checked for device code, because
+the stock 10.0 binary ships host stubs and a kernel registration table with an
+empty `.hip_fatbin` (0 bytes from `objcopy --only-section=.hip_fatbin`, against
+4.7 MB for our own rocBLAS build and 43 MB for `libtorch_hip`), and every
+hipSOLVER-backed `torch.linalg` entry point then dies in `hipLaunchKernel` on an
+unregistered kernel handle. The `rocsolver-builder` stage gates on that size, the
+same way the rocBLAS stage does.
+
+The second, separate defect is a wrong constant in the device sources.
+`lib_device_helpers.hpp` defines
+
+    #if defined(__GFX9__)
+    __device__ static constexpr int WarpSize = 64;
+    #else
+    __device__ static constexpr int WarpSize = 32;   /* gfx803 lands here */
+    #endif
+
+while the DPP reductions further down are enabled for `__GFX8__` on purpose and
+pick `is_cdna = true`, the wave64 instruction sequence, for anything that is not
+GFX10, GFX11, or GFX12. So gfx803 runs wave64 reductions while `WarpSize` says 32.
+
+The constant's consumers are the standard one-partial-per-wave shape:
+
+    __shared__ S sval[BLOCK / WarpSize];
+    reduce_wave_sum(sum);          /* afterwards every lane holds the full 64-lane sum */
+    if (tid % WarpSize == 0)       /* true on lane 0 and again on lane 32 */
+        sval[tid / WarpSize] = sum;/* so one wave's sum is stored twice */
+    ... combine sval[0 .. BLOCK / WarpSize - 1] /* and counted twice */
+
+`reduce_wave_sum` itself is correct: its final broadcast uses HIP's own `warpSize`,
+and `row_bcast:15` and `row_bcast:31` really do exist on GCN3, which is why
+`__GFX8__` belongs in the DPP guard. The fault is only in the consumers of the
+constant: `rocauxiliary_larfg_*`, `rocauxiliary_larf_*`, `rocauxiliary_lange*`,
+`rocauxiliary_latrd`, and the LACN2 norm and condition-estimation helpers. Those
+are the Householder generate and apply path under `geqrf`, `gehrd`, and `syevd`
+(QR, SVD, eigendecomposition, `lstsq`, `pinv`, `matrix_rank`) and the norm and
+RCOND paths. `WarpSize` has exactly one definition site, so this one line fixes all
+of them. The other `32`s in the tree are host-side `(n-1)/32+1` block-count
+rounding and are unrelated.
+
+Measured on gfx803 (RX 470, ROCm 10.0) with a standalone replica of that exact
+pattern (`tools/tc-staleness/wavesize_proof.hip`: one 256-thread block, 4096
+elements, hand-counted expectation), where only the constant differs:
+
+    WarpSize=32 (upstream on gfx803): 20288.0, ratio 1.982   /* double-counted */
+    WarpSize=64 (this patch)         : 10144.0, ratio 0.991  /* correct */
+
+The 0.9 percent deficit on the correct line is float accumulation order in the
+replica. The factor of two on the upstream line is the fault.
+
+What this patch changes, and what is proven:
+
+  * Proven and large: building rocSOLVER for gfx803 at all. With the
+    `rocsolver-builder` stage's output on the card, all 13 `torch.linalg` routines
+    run and match a CPU reference, worst relative error 1.0e-5 (`qr`, `svd`,
+    `svdvals`, `cholesky`, `solve`, `inv`, `eigh`, `slogdet`, `matrix_rank`,
+    `pinv`, `lstsq`, `triangular_solve`, `norm('nuc')`). The stock stack SIGSEGVs
+    on all 13.
+  * NOT yet proven to change a result: this constant. An ablation was run with two
+    libraries built from the same tree, one with this patch and one without (they
+    differ, md5 `c8bd09d4...` against `f4c4c5e0...`), over 39 checks: `qr`, `svd`,
+    `svdvals`, `norm('nuc')`, `matrix_rank`, `cond`, `eigh`, `cholesky`, `solve`,
+    `pinv`, `lstsq`, and batched `qr`, at n=128, 256, and 512, plus non-square and
+    rank-deficient inputs. Every line of output is identical between the two
+    libraries.
+
+It is kept anyway, and the reason is stated plainly rather than dressed up as a
+fix: on a wave64 ISA a `WarpSize` of 32 is simply the wrong number, the same
+mistake this repo already corrected in torch's `C10_WARP_SIZE`
+(`patches/pytorch/gfx803-c10-warp-size-wave64.patch`, where it did produce garbage)
+and in Triton's `ISAFamily::GCN3`. The pattern is provably wrong in isolation
+(`tools/tc-staleness/wavesize_proof.hip` double-counts at 1.982). No rocSOLVER
+routine tested here reaches a consumer in a way where that shows, so treat this as
+a latent defect and not as a measured correction, and look for a case that does
+before claiming credit for it. Anyone chasing that should note that
+`torch.linalg.cond` routes through SVD and not through rocSOLVER's LACN2 path, so
+the `lange` and condition-estimation consumers need the rocSOLVER C API
+(`roclange`, `rocgecond`, `rocsyrf2` families) rather than torch to be exercised.
+
+Apply with patches/rocsolver/rocsolver-wavesize-gfx8.sh, which uses `patch -p1`
+because the target is a sparse checkout of a monorepo subdirectory.
+
+--- a/library/src/include/lib_device_helpers.hpp
++++ b/library/src/include/lib_device_helpers.hpp
+@@ -35,7 +35,14 @@
+ #include "lib_macros.hpp"
+ #include "libcommon.hpp"
+ 
+-#if defined(__GFX9__)
++// WAVESIZE_GFX8_WAVE64_PATCH:
++// gfx8xx (CIK/VI) is a wave64 ISA like gfx9xx, and the DPP reductions below are
++// deliberately enabled for __GFX8__ and take the wave64 (CDNA) instruction
++// sequence. Leaving this constant at 32 therefore does not under-reduce: every
++// lane already holds the full 64-lane sum, and the consumers' one-partial-per-wave
++// pattern (guard `tid % WarpSize == 0`, index `tid / WarpSize`) then stores that
++// same sum twice, so the combine loop counts it twice.
++#if defined(__GFX9__) || defined(__GFX8__)
+ __device__ static constexpr int WarpSize = 64;
+ #else
+ __device__ static constexpr int WarpSize = 32;

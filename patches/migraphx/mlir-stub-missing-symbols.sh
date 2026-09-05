@@ -1,6 +1,7 @@
 #!/bin/sh
-# See mlir-stub-missing-symbols.patch for the full WHY/WHAT. Uses `patch`,
-# not `git apply` -- see ../rocblas/small-gemm-assembly-miscompute.sh for why.
+# Apply mlir-stub-missing-symbols.patch. That file gives the reason and the
+# change. This driver uses `patch` and not `git apply`, for the reason stated in
+# ../rocblas/small-gemm-assembly-miscompute.sh.
 set -eu
 SRC="${1:-/migraphx-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

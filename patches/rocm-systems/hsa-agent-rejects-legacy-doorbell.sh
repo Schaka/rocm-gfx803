@@ -1,6 +1,6 @@
 #!/bin/sh
-# Apply hsa-agent-rejects-legacy-doorbell.patch (see that file for the full
-# WHY/WHAT) via `git apply`, then verify the hunks actually landed.
+# Apply hsa-agent-rejects-legacy-doorbell.patch with `git apply`, then make sure
+# that the hunks landed. That patch file gives the reason and the change.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

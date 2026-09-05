@@ -1,205 +1,361 @@
 # rocm-gfx803
 
-AMD Polaris (gfx803: RX 460/470/480/560/570/580/590 and friends) support for
-the MIGraphX + ONNX Runtime + PyTorch stack, split out from
-[`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder) into its own
+This repo keeps AMD Polaris (gfx803: RX 460/470/480/560/570/580/590 and close
+relatives) working on the MIGraphX + ONNX Runtime + PyTorch stack. It was split
+out of [`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder) into its own
 repository.
 
-## Prebuilt images -- don't build this yourself
+## Prebuilt images: do not build this yourself
 
-CI already builds and pushes the final image to GHCR. You do not need to
-build the Dockerfile locally unless you're patching something. Pull it:
+CI builds the final image and pushes it to GHCR. You only need a local build
+when you change a patch. Pull the image you want:
 
 ```bash
-# rocm10 (main line, TheRock 10.0) -- versioned tag
+# rocm10 (main line, TheRock 10.0), versioned tag
 docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm10.0-gfx803
 
-# rocm10 -- always the newest successful rocm10 build
+# rocm10, always the newest successful rocm10 build
 docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:latest-gfx803
 
-# rocm7.14 (older, hardware-verified line) -- versioned tag
+# rocm7.14 (older, hardware-verified line), versioned tag
 docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm7.14-gfx803
 
-# rocm6.4.4 (older, hardware-verified line) -- versioned tag
+# rocm6.4.4 (older, hardware-verified line), versioned tag
 docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm6.4.4-gfx803
 ```
 
-See "Repository layout" and `.github/workflows/gfx803-component.yml` for
-the full tag scheme (per-component images, cache tags, dated tags).
+The section "Repository layout" and `.github/workflows/gfx803-component.yml`
+give the whole tag scheme: per-component images, cache tags, and dated tags.
 
 ## Why a separate repo
 
-gfx803 is unsupported upstream as of ROCm 6.0 -- AMD stopped building for it,
-and ROCm 7+ rejects the card outright at HSA agent creation. Everything that
-makes gfx803 work at all is a local patch: a legacy-doorbell restore just to
-get dispatch working on ROCm 7, plus a growing set of Tensile/MIOpen/MIGraphX
-correctness patches for bugs that only manifest on this old GCN3 hardware.
-That patch set changes independently of, and faster than, the mainline
-nightly/release pipeline `rocm-migraphx-ort-builder` runs for every other
-architecture -- keeping it there meant every gfx803-specific investigation
-was noise in a repo that otherwise doesn't need any of it. This repo is
-where that investigation and patch history actually lives now.
+AMD stopped building gfx803 support after ROCm 6.0. ROCm 7 and newer reject the
+card outright when HSA creates the agent. Every part that makes gfx803 work is a
+local patch here. One patch restores the legacy doorbell, which ROCm 7 needs
+just to start a kernel. A larger set of Tensile, MIOpen, and MIGraphX patches
+correct bugs that only appear on this old GCN3 hardware.
 
-The two repos stay linked in one direction: `rocm-migraphx-ort-builder`'s
-docs point here for gfx803; this repo doesn't try to track or duplicate the
-mainline build's own per-arch matrix. This repo's *versions* do track the
-mainline release track, though: every pinned ref here matches what the
-mainline repo's `release.yml` ships for the same ROCm line (MIGraphX
-`release/rocm-rel-10.0`, ORT `v1.29.0`, PyTorch `2.14.0` / `release/2.14`),
-so gfx803 doesn't silently lag the supported line it's split off from.
+That patch set changes faster than, and separately from, the mainline
+nightly/release pipeline that `rocm-migraphx-ort-builder` runs for every other
+architecture. Keeping it there meant that every gfx803 investigation added
+noise to a repo that needs none of it. This repo now holds that investigation
+and patch history.
+
+The link between the two repos runs one way. The mainline docs point here for
+gfx803. This repo does not track or copy the mainline per-architecture matrix.
+The versions do follow the mainline release track. Every pinned ref here matches
+what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
+`release/rocm-rel-10.0`, ORT `v1.29.0`, and PyTorch `2.14.0` /
+`release/2.14`. So gfx803 does not silently lag the supported line it came from.
 
 ## Repository layout
 
 ```
 rocm-gfx803/
-├── Dockerfile              # ROCm 10.0 (TheRock), the primary/actively-developed line
+├── Dockerfile              # ROCm 10.0 (TheRock), the line under active development
 ├── .dockerignore
-├── patches/                # gfx803 patches against the 10.0 pin (copied from 7.14,
-│                           #   NOT yet re-verified against 10.0 -- see Status)
-├── tools/                  # correctness-suite, host-setup, etc. (shared across lines)
+├── patches/                # gfx803 patches for the 10.0 pin. Most came from 7.14.
+│                           #   Each patch header states its own hardware-verification state.
+├── scripts/                # build helpers: git-pin.sh (commit pinning), gfx803-line.sh (line provenance)
+├── tools/                  # correctness-suite, host-setup, tc-staleness. Shared by all lines.
 ├── verify.py               # on-hardware smoke test
-├── MIGRATION_NOTES.md      # running investigation log for the 10.0 line
-├── vllm/                   # the gfx803 vLLM hard fork (moved to the 10.0 line;
-│                           #   re-targeting from the 7.14 stack in progress)
-├── rocm7.14/               # the hardware-verified TheRock 7.14 line
+├── MIGRATION_NOTES.md      # investigation log for the 10.0 line
+├── vllm/                   # the gfx803 vLLM hard fork, now on the 10.0 line
+├── rocm7.14/               # the hardware-verified TheRock 7.14 line (archived, builds by hand)
 │   ├── Dockerfile
 │   ├── patches/
 │   ├── verify.py
-│   ├── README.md           # incl. the full vLLM-on-gfx803 investigation
+│   ├── README.md           # includes the full vLLM-on-gfx803 investigation
 │   └── MIGRATION_NOTES.md
-├── rocm6.4.4/              # the older, hardware-verified, classic-tag ROCm 6.4.4 line
+├── rocm6.4.4/              # the older hardware-verified line on classic ROCm 6.4.4 tags
 │   ├── Dockerfile
 │   ├── patches/
 │   ├── tools/
 │   ├── verify.py
-│   ├── KERNEL_BUGS.md      # the original gfx803 bug-hunting methodology and record
-│   └── wip_patches/        # rejected/superseded patch designs, kept for the record
-├── llama-cpp-gfx803/       # llama.cpp gfx803 patches (arch-level, shared)
-├── RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md  # hardware-level, shared across lines
-└── .github/workflows/      # CI, same image tags/ghcr.io paths as before the split
+│   ├── KERNEL_BUGS.md      # the original gfx803 bug-hunting method and record
+│   └── wip_patches/        # rejected and superseded patch designs, kept for the record
+├── llama-cpp-gfx803/       # llama.cpp gfx803 patches (arch level, shared)
+├── RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md  # hardware level, shared by all lines
+└── .github/workflows/      # CI builds the 10.0 line only
 ```
 
-**rocm10 (this repo's root) is the actively developed line.** ROCm 10.0 is a
-TheRock meta-release, not a classic per-repo tag -- every component is pinned
-to a release *branch*, not a frozen commit: ROCR-Runtime, rocBLAS and MIOpen
-(now the `rocm-systems`/`rocm-libraries` monorepos) track
-`release/therock-10.0`, MIGraphX tracks `release/rocm-rel-10.0`, same
-`release/rocm-rel-<major.minor>` convention this repo's mainline
-(`rocm-migraphx-ort-builder`) uses for its own manual releases -- no nightly
-scheduling, no prebuilt wheels, just "build from the named release branch's
-current tip when someone runs it." See `MIGRATION_NOTES.md` for how those refs
-were resolved.
+rocm10 is this repo's root and the line under active development. ROCm 10.0 is
+a TheRock meta-release, not a classic per-repo tag. Every component is pinned to
+a release branch instead of a frozen commit. ROCR-Runtime, rocBLAS, and MIOpen
+(now in the `rocm-systems` and `rocm-libraries` monorepos) track
+`release/therock-10.0`. MIGraphX tracks `release/rocm-rel-10.0`. That is the same
+`release/rocm-rel-<major.minor>` convention the mainline repo uses for its own
+manual releases. There is no nightly schedule and no prebuilt wheel. The build
+takes the current tip of the named release branch when a person runs it.
+`MIGRATION_NOTES.md` records how those refs were chosen.
 
-**`rocm7.14/` is the immediately-preceding line** -- the same hand-rolled
-build pattern, hardware-verified, and where the current gfx803 vLLM fork and
-its investigation live. It's kept because it's the most recent line with a
-full correctness-suite pass and extensive real-hardware mileage; rocm10
-inherits its patches and methodology but does not share code with it.
+`rocm7.14/` is the line this one replaced. It uses the same hand-built
+pattern, it is hardware-verified, and the gfx803 vLLM fork and its investigation
+started there. It is kept because it is the most recent line with a full
+correctness-suite pass and long real-hardware use. rocm10 inherited its patches
+and its method, but shares no files with it.
 
-**`rocm6.4.4/` is the older, stable line** -- classic per-repo `rocm-6.4.4`
-tags, hardware-verified over the longest period, actively maintained but not
-where new investigation happens.
+`rocm6.4.4/` is the older stable line. It uses the classic per-repo
+`rocm-6.4.4` tags and the longest period of hardware verification. New
+investigation does not start there.
 
-**The three lines are deliberately independent copies, not a shared asset.**
-All are under active maintenance at different verification levels; a shared
-file would mean a bug found while chasing 10.0 could reach the
-hardware-verified 7.14 or 6.4.4 builds. Once 10.0 is confirmed at least as
-solid as 7.14 across the board, the lines get diffed and consciously merged
-back together -- see "Convergence" below.
+The three lines are separate copies on purpose, not one shared asset. Each
+was maintained at a different verification level. A shared file lets a bug found
+while chasing 10.0 reach the hardware-tested 7.14 or 6.4.4 builds. Once
+10.0 is confirmed at least as solid as 7.14 everywhere, the lines are diffed and
+merged deliberately. See "Convergence" below.
 
 ## Status
-- **rocm10 (this repo's root)**: built, **NOT yet hardware-verified.** The
-  Dockerfile builds the same stages as the 7.14 line against the 10.0 refs
-  with the 7.14 patch set copied over and some new additional patches made for correctness. The 7.14 line's
-  full validation arc (build, `verify.py`, `tools/correctness-suite/`, ORT
-  backend-test series, real-model runs) has been re-run on this line, however a full rebuild with the new correctness patches and retesting on a gfx803 card is still pending. Until then, this line is not hard-ware verified. See `MIGRATION_NOTES.md` for details.
-- **rocm7.14**: hardware-verified. `rocminfo` enumerates the card as a real
-  `KERNEL_DISPATCH` agent; rocBLAS/MIOpen/MIGraphX/PyTorch/ORT all do real
-  GPU work on it. The full `tools/correctness-suite/` (23 MIOpen op/solver
-  sweeps) passes clean. ORT's `onnx_backend_test_series.py` (3828 tests) has
-  one open, non-gfx803-specific regression (`ConvTranspose`, an upstream
-  MIGraphX bug -- reported upstream, not patched here). Real-model validation
-  (faster-whisper/CTranslate2, whisper.cpp, parakeet.cpp) passes with correct
-  transcripts on real audio. The gfx803 vLLM fork is built and verified
-  against this line's stack. See `rocm7.14/README.md` for the full detail.
-- **rocm6.4.4**: hardware-verified, the older and longer-running of the lines.
-  See `rocm6.4.4/README.md` and `rocm6.4.4/KERNEL_BUGS.md`.
+
+- rocm10 (this repo's root): actively developed, and partly hardware-tested.
+  The ROCm 10.0 stack on the test box runs rocBLAS, MIOpen, MIGraphX, PyTorch,
+  ORT, and the vLLM fork on a real card. The torch correctness suite is
+  202/202 PASS with the current patch set (see "Cross-dispatch coherence"). The
+  full image builds end to end, and the two libraries that carry these fixes were
+  taken out of that image and measured on the card: its `libamdhip64` gives 202/202
+  on the torch suite, and its `librocsolver.so.0` gives 13 of 13 `torch.linalg`
+  routines within 1.0e-5 of CPU. What is still missing is a `verify.py` run of the
+  whole image on the card, because the box's root filesystem has 31 GB free against
+  a 40 GB image. `MIGRATION_NOTES.md` has the details, and each patch header states
+  its own verification state.
+- rocm7.14: hardware-verified, and archived. CI no longer builds it.
+  `rocminfo` lists the card as a real `KERNEL_DISPATCH` agent, and rocBLAS,
+  MIOpen, MIGraphX, PyTorch, and ORT all do real GPU work on it. The full
+  `tools/correctness-suite/` (23 MIOpen op and solver sweeps) passes clean. ORT's
+  `onnx_backend_test_series.py` (3828 tests) has one open failure that is not
+  gfx803-specific: `ConvTranspose`, an upstream MIGraphX bug reported upstream
+  and not patched here. Real-model runs (faster-whisper/CTranslate2,
+  whisper.cpp, parakeet.cpp) produce correct transcripts on real audio. The
+  gfx803 vLLM fork is built and verified against this line's stack.
+  `rocm7.14/README.md` has the full detail.
+- rocm6.4.4: hardware-verified, the older and longest-running line, and
+  archived. CI no longer builds it. See `rocm6.4.4/README.md` and
+  `rocm6.4.4/KERNEL_BUGS.md`.
 
 ### Required host setup
 
-- **VBIOS/VRAM clock**: this card's VRAM must run within its rated speed
-  ceiling (1750MHz on the mining-tuned VBIOS this box shipped with,
-  confirmed via core overdrive; a stock/correct-vendor VBIOS needs no
-  overdrive). Running VRAM above spec causes real GPU VM faults under
-  MIOpen (`pool_sweep`) and GPU hangs under vLLM -- both the same
-  hardware-level root cause, not a software bug. See "Host VBIOS setting"
-  below and `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the
-  investigation.
-- `patches/rocm-systems/aql-ring-queue-full-workaround.patch` restores the
-  AQL ring's GFXIP 7/8 double mapping (64 -> 131072 packets, a 2048x
-  increase over the unpatched cap) and is required for
-  `graph-replay-batch-chunk-deadlock.patch` to be unnecessary. Needs a
-  kernel WITHOUT `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and must
-  never be combined with `graph-replay-queue-size-cap.patch`.
+- VBIOS and VRAM clock: this card's VRAM must run at or below its rated
+  speed. The rating is 1750 MHz on the mining-tuned VBIOS that this box shipped
+  with, and that limit was confirmed by core overdrive. A stock VBIOS from the
+  correct vendor needs no overdrive. VRAM above spec causes real GPU VM faults in
+  MIOpen (`pool_sweep`) and GPU hangs in vLLM. Both have the same hardware cause
+  and neither is a software bug. See "Host VBIOS setting" below and
+  `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md`.
+- `patches/rocm-systems/aql-ring-queue-full-workaround.patch` restores the AQL
+  ring's double mapping for GFXIP 7 and 8. It raises the queue from 64 packets to
+  131072, which is 2048 times the unpatched cap. With it,
+  `graph-replay-batch-chunk-deadlock.patch` is not needed. It requires a kernel
+  that does NOT carry `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`. Do not
+  combine it with `graph-replay-queue-size-cap.patch`.
+
+### gfx803 test box (192.168.1.214)
+
+- SSH user and password are both `user`, and the sudo password is `user`. There
+  is no root login, so use `echo user | sudo -S <cmd>`. Put all work under
+  `/data`. The host stack is 10.0: `/opt/rocm` plus `/opt/venv` (torch 2.14). The
+  7.14 line stays at `/data/rocm-7.14` and `/data/venv-7.14`.
+- `/opt/rocm/lib` is a symlink to `/etc/alternatives/rocm-lib`, which points at
+  `/opt/rocm/core-10.0/lib`, so they are one directory. That symlink is broken
+  inside a container, because `/etc/alternatives` is not part of the `/opt/rocm`
+  mount. Pass the real prefix instead, for example
+  `-DROCM_PATH=/opt/rocm/core-10.0`. Otherwise CMake fails to find `hip` and says
+  very little about it.
+- The GPU needs a module reload after every boot. Neither initramfs image
+  contains `amdgpu/polaris10_sdma.bin`, so the boot-time SDMA load fails and KFD
+  starts with no GPU node. You then see `Cannot create KFD process`, and torch
+  reports no GPUs. Run `podman stop rocrfix2; modprobe -r amdgpu; modprobe amdgpu`
+  and make sure that `/sys/class/kfd/kfd/topology/nodes` lists `0 1`. Stop
+  `rocrfix2` and kill every python process first. Unbinding amdgpu while a
+  process holds `/dev/kfd` reboots the box through the watchdog. A `rocm-smi`
+  line for `00:01.0` does not prove that the GPU agent exists.
+- Do not set `amdgpu.noretry=1` on this card. GPUVM page-table retries are
+  needed. With `gpu_recovery=0` a fault under it wedges the box completely, and
+  pstore holds nothing.
+- Kernels: the default is `7.1.12-200.fc44` with `gpu_recovery=1`. The debug
+  build is `7.1.8-dbg3`, which runs as `7.1.8-dirty`. It sets `gpu_recovery=0` so
+  that faults stall instead of resetting, and it adds the debugfs files
+  `gfx803_ctxb`, `gfx803_flush_tlb`, `gfx803_shmem`, `gfx803_ptwalk`, and
+  `gfx803_readphys`. Switch with `grubby --set-default=/boot/vmlinuz-...` and
+  reboot. Its source tree is on the dev machine at `/usr/src/linux-7.1.8-local`,
+  not on the box. Build the `.ko` there and copy it over.
+- Do not extract an archive into `/` or `/lib` on the box. That replaced the
+  `/lib` to `usr/lib` symlink with a real directory, which hid
+  `/usr/lib/modules` and `/usr/lib/firmware` from the boot and crash-looped every
+  kernel. If the box seems to have lost its kernels, look first at whether `/lib`
+  is still a symlink.
+- Saved libraries for A/B tests live in `/data/s6/`:
+  `libamdhip64.TCINV-v3.so` (the deployed build, md5
+  `a79a75631b40e6a731586f7feb03ae5d`),
+  `libamdhip64.TCINV-v1-dispatchonly.so`, and
+  `libamdhip64.PRE-TCINV-CIchain.so` (md5 `195f17d9ad85f94bbda58b3375c17a78`, the
+  genuine pre-patch CI chain). The rocSOLVER work in progress is under
+  `/data/rsbuild*`. Name a library backup after the real directory, not after
+  `$(basename $D)`. Both `/opt/rocm/lib` and `/opt/rocm/core-10.0/lib` have the
+  basename `lib`, so such a name overwrites one backup with the other.
+- Treat the GPU as single-tenant. Two torch jobs at once invalidate timing and
+  fault measurements.
 
 ### vLLM on gfx803
 
-The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line).
-It targets the **ROCm 10.0 stack** and is assumed to work against it: the
-hand-written gfx803 kernels (`vllm/vllm/gfx803_kernels/*.hip`) are
-version-agnostic source, compiled once with the stack's own
-`hipcc --offload-arch=gfx803 -O3 -shared -fPIC` (see each loader's
-docstring for the exact invocation), and `librocblas.so` resolves through
-the stack's `LD_LIBRARY_PATH` (`/opt/rocm/core-10.0/lib` on 10.0). The
-compiled `.so` files are built on the box next to their loaders, never
-committed -- so there is nothing stack-specific pinned in this repo; a
-fresh build on the 10.0 stack just works. Hardware validation of vLLM on
-the 10.0 stack is DONE (2026-09-02): the two crashes that blocked it
-were both in the ROCm 10.0 stack, not vLLM, and are fixed by
+The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line). It targets
+the ROCm 10.0 stack and is assumed to work against it. The hand-written gfx803
+kernels (`vllm/vllm/gfx803_kernels/*.hip`) are version-agnostic source. Each one
+is compiled once with the stack's own
+`hipcc --offload-arch=gfx803 -O3 -shared -fPIC`, and each loader's docstring
+gives the exact call. `librocblas.so` resolves through the stack's
+`LD_LIBRARY_PATH`, which is `/opt/rocm/core-10.0/lib` on 10.0. The compiled `.so`
+files are built on the box next to their loaders and never committed, so this
+repo pins nothing stack-specific and a fresh build on the 10.0 stack works.
+
+Hardware validation of vLLM on the 10.0 stack is done (2026-09-02). Two crashes
+blocked it, and both were in the ROCm 10.0 stack rather than in vLLM.
 `patches/rocm-systems/va-reuse-defer-noremap.patch` and
-`patches/rocm-systems/d2h-null-dsthost.patch` (see `AGENTS.md` for
-the WHY). Verified with `qwen35_2b_bench_v3.py` on the box: EXIT=0,
-prefill 311.0 tok/s, decode 30.2 tok/s (the 7.14 record for the same
-bench: 331.7 / 24.4). The full investigation and tuning notes for the
-7.14-era state are in `rocm7.14/README.md`.
+`patches/rocm-systems/d2h-null-dsthost.patch` fix them, and `AGENTS.md` gives the
+reason for each. Measured on the box with `qwen35_2b_bench_v3.py`: EXIT=0,
+prefill 311.0 tok/s, decode 30.2 tok/s. The 7.14 record for the same bench is
+331.7 and 24.4 tok/s. `rocm7.14/README.md` has the investigation and tuning notes
+from the 7.14 period.
 
-### torch memory: experimental pluggable allocator (env var `GFX803_PLUGGABLE_ALLOCATOR`)
+### Cross-dispatch coherence on gfx803 (knob `CLR_GFX8_TC_INVALIDATE`)
 
-Torch's default caching allocator's block layout can corrupt the next kernel's
-access after a GEMM on gfx803 -- silent scattered NaN in an op that reads
-correctly-written memory (reproduced on every stack, 6.4.4/7.14/10.0;
-raw `hipMalloc` in the same process is always clean). `patches/pytorch/
-gfx803-pluggable-allocator.patch` gives torch an **opt-in** hipMalloc-backed
-pluggable allocator that sidesteps that layout on the stacks where it reproduces
-(measured on the 7.14 host: 7/8 rounds corrupt with the default allocator,
-0/8 with this one). It is **off by default** and does nothing unless the env
-var is set at runtime (pass it however the app is launched -- `docker run -e`,
-a shell export, a systemd unit, ...):
+On gfx803 the CP ignores the AQL `SCACQUIRE` and `SCRELEASE` scope bits, and those
+bits are ROCm's only way to express cache coherence across dispatches. The compute
+shader's TC is also not maintained at a dispatch boundary. Two silent faults
+follow, and one packet fixes both.
 
-```sh
-docker run -e GFX803_PLUGGABLE_ALLOCATOR=1 ...      # container: uses /opt/rocm/lib/libgfx803_pluggable.so
-docker run -e GFX803_PLUGGABLE_ALLOCATOR=/path/to/libfoo.so ...  # or an explicit .so path
-```
+- A kernel that reads a virtual address that an earlier kernel overwrote can get
+  the pre-overwrite bytes from a stale TC line. The correct data is already in
+  VRAM.
+- A copy engine reads DRAM and never looks at the shader TC. So it copies out
+  bytes that a compute kernel overwrote but has not written back. The GPU result
+  is correct and the host copy of it is not.
 
-**Experimental -- use at your own risk.** It changes allocator semantics
-globally (every tensor's memory comes from per-allocation `hipMalloc`;
-allocator stats are reported from simple counters and the graphs/IPC/snapshot
-parts of the allocator API become no-ops). **Do not use it on the 10.0
-line**: re-measured there after the fmm/userptr fix (2026-09-04) with the
-GEMM-adjacent corruption pattern (`bmm_pattern`-style, 5 rounds each) --
-default allocator corrupts 5/5, pluggable corrupts 5/5 as well, and the
-pre-fix libhsa with pluggable corrupts too (3/3). It was never a working
-mitigation on this stack; the older 0/8-clean figure was a 7.14-host
-measurement. Whether pluggable still helps on 7.14 has not been re-checked
-since, and the 10.0 corruption remains an open gfx803 bug -- this escape
-hatch is for the 7.14-era stacks only. The `.so` is built from
-`patches/pytorch/gfx803_pluggable.hip` by the same apply driver and
-installed to `/opt/rocm/lib/`.
+Anything that recycles virtual addresses is exposed. That is why this appears
+under torch's caching allocator and not in a raw `hipMalloc`/`hipFree` program,
+which never re-reads an address that a kernel cached.
+
+`patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.patch` fixes both at the
+source. It publishes one PM4 `ACQUIRE_MEM` (`TC_ACTION_ENA|TC_WB_ACTION_ENA`, full
+address range) in its own AQL ring slot, in two places: ahead of every kernel
+dispatch, and inside `VirtualGPU::releaseGpuMemoryFence()` between that
+function's barrier and a second barrier. The second barrier makes sure that the
+completion signal a copy engine waits on retires only after the writeback. This
+is the same packet ROCr already emits when it loads a code object, moved onto the
+data path. It is on by default for ISA 8 and older. `CLR_GFX8_TC_INVALIDATE=0`
+turns it off for A/B runs.
+
+State on the 10.0 line (2026-09-05): the torch correctness suite
+`tools/correctness-suite/torch_op_suite.py` gives 202/202 PASS, 0 BAD, 0
+NONFINITE. With the knob off, the same library fails 13 of them, 5 with NONFINITE.
+`tools/tc-staleness/` probes: bmm 0/40, soak 0/527 across 5 seeds, and a 60-step
+Adam training run that is bit-identical to the CPU loss trajectory. The same
+training run is not reproducible with the knob off. Cost: D2H +2.7%, H2D +1.5%,
+launch-bound tiny ops +2.4%, and compute unchanged (fp16 2048^3 GEMM +0.04%, conv
+and GPU-to-GPU clone unchanged).
+
+Two paths are still exposed, and the patch header lists them in its KNOWN
+LIMITATION section.
+
+- Cross-stream handoff: a producer on another `torch.cuda.Stream` that feeds a
+  host copy on the default stream still corrupts at 5-11 of 240 checks. The
+  writeback has to run on the producer's own ring, and and the marker path that is the
+  natural place for it rejects extra barrier packets (heap corruption). Single-stream torch,
+  MIGraphX, and ORT are not affected.
+- The HIP graph replay batch path (`dispatchAqlPacketBatchFlat`) issues no
+  `ACQUIRE_MEM`. A torch `CUDAGraph` capture of the poisoned sequence does not
+  reproduce (0/40 with the knob off), so this gap is unproven rather than known
+  broken.
+
+### torch.linalg on gfx803
+
+Every `torch.linalg` entry point that reaches hipSOLVER and rocSOLVER SIGSEGVs.
+That list is `qr`, `svd`, `svdvals`, `eigh`, `eigvalsh`, `cholesky`,
+`cholesky_solve`, `cholesky_inverse`, `solve`, `solve_batched`, `inv`, `lstsq`,
+`pinv`, `matrix_rank`, `det`, `slogdet`, `triangular_solve`, `norm('nuc')`, and
+`cond`. Only `eigvals` runs. The fault lands in `hipLaunchKernel`, called from
+`rocsolver::init_scalars<float>`. This is not a wrong number and it is not the
+coherence bug above: the crash set is the same against the pre-patch
+`libamdhip64`, with `CLR_GFX8_TC_INVALIDATE` on or off, and on the 7.14 stack too.
+Two independent causes are involved.
+
+1. There is no device code. The rocSOLVER in the pinned 10.0 stack has an empty
+   `.hip_fatbin`. `objcopy --only-section=.hip_fatbin` yields 0 bytes (a NOBITS
+   section) against 4.7 MB for our own rocBLAS build and 43 MB for
+   `libtorch_hip`. Its CMake default target list is `gfx900 / gfx906 / gfx908`
+   plus newer, so a gfx803 build of it has never existed in this stack, and the
+   7.14 line carries the identical file (same md5). hipSOLVER needs no rebuild of
+   its own. It has no `.hip_fatbin` at all and is a host-side wrapper over
+   rocSOLVER.
+2. The wave size is wrong once it does build. `lib_device_helpers.hpp` sets
+   `WarpSize = 64` only under `#if defined(__GFX9__)`. That leaves gfx8xx, which
+   is also a wave64 ISA, on the 32-lane branch while its reductions take the
+   wave64 (`is_cdna`) DPP path on purpose. The consumers of the constant (`larfg`,
+   `larf`, `lange`, `latrd`, and the LACN2 norm and condition helpers) then store
+   each wave's full sum in two shared-memory slots, and the combine loop adds it
+   twice. Measured on the card with a replica of that pattern: ratio 1.982 with
+   `WarpSize=32`, and 0.991 with the constant corrected.
+
+Cause 1 is fixed and measured. The `rocsolver-builder` stage builds rocSOLVER with
+`-DAMDGPU_TARGETS=gfx803` and gates on `.hip_fatbin` size, the way the rocBLAS stage
+does, so an empty payload can never ship quietly. With the library that stage
+produces, all 13 tested `torch.linalg` routines run and match a CPU reference, with
+a worst relative error of 1.0e-5, where the stock stack SIGSEGVs on all 13.
+hipSOLVER needs no rebuild, because it resolves into this library by SONAME at load
+time.
+
+Cause 2 is patched but not yet proven to matter. `patches/rocsolver/
+rocsolver-wavesize-gfx8.patch` fixes a constant that is objectively wrong for a
+wave64 ISA, and the pattern it feeds double-counts in isolation, but an ablation
+between patched and unpatched builds of the same tree gave byte-identical output on
+all 39 checks, at n=128, 256 and 512, non-square, rank-deficient and batched. So no
+`torch.linalg` result is known to depend on it, and it is recorded as latent rather
+than as a measured correction. See its header for what to exercise next.
+
+## Component images, pins, and line provenance
+
+A component stage either builds from source or inherits a published
+`ghcr.io/<owner>/rocm-<component>-builder` image, chosen by the `*_IMAGE`
+build-args. That inheritance is not a cache. It is an artifact handoff, and a tag
+name alone did not identify it well enough.
+
+- The intermediate component tags now name the line (`:gfx803-rocm10`, through the
+  workflow input `intermediate-suffix`). The main line used to publish and consume
+  the unsuffixed `:gfx803`, which is also what an earlier line of this repo
+  published under. So a component whose 10.0 job had not run since the switch was
+  consumed into a 10.0 image as if it belonged there. This was seen directly:
+  `rocm-migraphx-builder:gfx803` and `rocm-migraphx-torch-builder:gfx803` held
+  `/opt/rocm/core-7.14` and a torch 2.13 wheel. A mixed-line image assembles,
+  imports, and misbehaves only on real hardware. The final image keeps the names
+  that downstream pulls: `latest-gfx803`, `rocm10.0-gfx803`, and
+  `<date>-gfx803`.
+- Every stage states which line it inherited. A component image carries
+  `/opt/rocm/.gfx803-line` (written by `scripts/gfx803-line.sh`) with the line,
+  the `rocm-gfx803` revision, and the resolved upstream commits, plus the
+  `io.rocm.gfx803.*` image labels. A marker that names a different line stops the
+  build. An inherited tree with no marker (published before this scheme) warns
+  instead of stopping, because that is every image published to date. Set
+  `GFX803_LINE_STRICT=1` to make the missing marker fatal too.
+- Branch pins stay the policy, and CI adds the commit. The `*_REF` args are still
+  release branches (see "Component pins" in `AGENTS.md`). A `git clone` of a
+  branch happens inside a `RUN`, so the layer's cache key is the command text,
+  and that text does not change when upstream pushes. So a stale layer can
+  survive a tip move with nothing to show it. The component workflow resolves
+  every ref to its commit once per run with `git ls-remote`, and it stops the run
+  if a ref cannot be resolved. The commit is passed as `*_SHA`, and
+  `scripts/git-pin.sh` fetches that commit with `--depth 1` instead of cloning
+  full history. The resolved set is recorded in the image marker.
+
+Nobody sets these values by hand, and nothing needs re-cutting when AMD pushes.
+The resolution runs by itself on every run. The `*_SHA` build-args are optional
+inputs to the Dockerfile, not to people. A plain local `docker build` with no
+build-args still works: it follows the branch, and `git-pin.sh` says so on stderr.
+A run that cannot resolve a pin fails after three retries, rather than producing
+an image that cannot say what it holds.
 
 ## Building
 
-All lines build the same way -- multi-stage Dockerfile, patches applied
-per-project before each component compiles from source:
+All lines build the same way: a multi-stage Dockerfile, with patches applied per
+project before that component compiles from source.
 
 ```sh
 # rocm10 (this repo's root)
@@ -212,166 +368,165 @@ docker build -t rocm-gfx803:rocm7.14 -f rocm7.14/Dockerfile rocm7.14/
 docker build -t rocm-gfx803:rocm6.4.4 -f rocm6.4.4/Dockerfile rocm6.4.4/
 ```
 
-Every component (ROCR-Runtime/CLR, rocBLAS, MIOpen, MIGraphX, PyTorch,
-torchvision, torchaudio, ONNX Runtime) is compiled from source, every time --
-there is no prebuilt-wheel shortcut for gfx803 anywhere upstream, unlike the
-mainline repo's newer/more-common architectures, which can sometimes import
-an already-published wheel instead of recompiling. CI reflects that: no
-`ARG *_IMAGE=...`-style "pull instead of build" branch exists for gfx803.
+Every component (ROCR-Runtime and CLR, rocBLAS, MIOpen, rocSOLVER, MIGraphX,
+PyTorch, torchvision, torchaudio, ONNX Runtime) is compiled from source in its own
+stage. There is no prebuilt gfx803 wheel anywhere upstream, unlike the newer and
+more common architectures that the mainline repo builds, where a published wheel
+sometimes replaces a recompile. CI keeps the same rule, and it publishes each
+stage as its own image so a later stage can inherit it through `*_IMAGE` instead
+of rebuilding it. See "Component images, pins, and line provenance".
 
-For on-hardware checks, `verify.py` (and `rocm7.14/verify.py` /
-`rocm6.4.4/verify.py`, identical in spirit) asserts the MIGraphX EP is
-present and does real GPU work -- run it inside a container started with
-`--device=/dev/kfd --device=/dev/dri --group-add video`.
+For the on-hardware checks, run `verify.py` (also
+`rocm7.14/verify.py` and `rocm6.4.4/verify.py`, the same in spirit) inside a
+container started with `--device=/dev/kfd --device=/dev/dri --group-add video`.
+It checks the paths that only real hardware can show, and each one can import
+cleanly and still fail or fall back silently:
+
+- The MIGraphX EP is present and does real GPU work.
+- rocBLAS GEMM and MIOpen convolution match a CPU reference.
+- The rocBLAS library carries no `_WGM8` kernels.
+- rocSOLVER embeds real device code for gfx803.
+- `torch.linalg` results match CPU.
+- A host copy of a fresh GPU result is not stale.
 
 ## Patches: philosophy and conventions
 
-Every patch under `patches/`/`rocm7.14/patches/`/`rocm6.4.4/patches/`
-documents, in its own header, the WHY (what's broken, how it was found,
-hardware measurements where applicable) and the WHAT (the actual fix), plus
-a re-diff note when a patch was carried from one line to another and
-something in the upstream source shifted. Read the patch header before
-touching the code it targets -- the reasoning usually isn't obvious from the
-diff alone.
+Every patch under `patches/`, `rocm7.14/patches/`, and `rocm6.4.4/patches/`
+carries its own header. The header gives the reason (what is broken, how it was
+found, and the hardware measurements where they apply) before the change (the
+diff). When a patch was carried from one line to another and the upstream source
+moved, the header also carries a re-diff note. Read the header before you touch
+the code it targets, because the diff alone rarely shows the reason.
 
-**Two apply dialects, on purpose, not by accident**: `.sh` drivers under
-`patches/rocm-systems/` use `git apply` (their target, `rocm-systems`, is
-cloned as a real git repo root); everything else (`rocblas/`, `miopen/`,
-`migraphx/`, `pytorch/`) uses `patch -p1`, because those targets are
-sparse-checked-out *subdirectories* of a monorepo, and this box's git
-version silently no-ops `git apply --check` there ("Skipped patch", exit 0,
-nothing modified) instead of failing loudly. Every driver script is
-self-verifying: it greps for a marker string after applying and fails the
-build if the marker isn't there, so a patch that silently stopped applying
-can't ship unpatched code.
+Two apply styles exist on purpose. The `.sh` drivers under
+`patches/rocm-systems/` use `git apply`, because their target `rocm-systems` is
+cloned as a real git repository root. Everything else (`rocblas/`, `miopen/`,
+`rocsolver/`, `migraphx/`, `pytorch/`) uses `patch -p1`, because those targets are
+sparse-checked-out subdirectories of a monorepo. On this box's git version,
+`git apply --check` in such a tree reports success and changes nothing ("Skipped
+patch", exit 0) instead of failing loudly. Every driver checks its own result: it
+greps for a marker string after the apply and fails the build when the marker is
+absent. So a patch that quietly stopped applying cannot ship unpatched code.
 
 ## When a patch needs updating
 
-A gfx803 patch stops applying (or starts applying with fuzz) whenever the
-pinned upstream commit moves and the target file changed shape around it --
-that's expected, not a sign something is wrong with the patch itself. Before
-re-diffing:
+A gfx803 patch stops applying, or starts applying with fuzz, when the pinned
+upstream commit moves and the target file changed shape around it. That is
+expected. It is not a sign that the patch is wrong. Before you re-diff:
 
-1. **Check whether the bug is even still there.** Re-pinning to a newer
-   upstream commit sometimes fixes the underlying issue outright (it's
-   happened before -- see `rocm7.14/MIGRATION_NOTES.md`'s MIGraphX section,
-   where two 6.4.4-era ONNX-parser patches turned out to be fully obsolete
-   against 7.14, one because the fix already landed upstream, one because
-   the whole code path it patched was replaced). Grep the new source for the
-   patch's target function/struct before assuming a straight re-diff is
+1. Make sure that the bug is still there. A newer upstream commit sometimes fixes
+   the underlying fault outright. This has happened: see the MIGraphX section of
+   `rocm7.14/MIGRATION_NOTES.md`, where two 6.4.4-era ONNX parser patches were
+   fully obsolete against 7.14. One was obsolete because the fix landed upstream,
+   and one because the whole code path it patched was replaced. Grep the new
+   source for the target function or struct before you assume a re-diff is
    needed.
-2. **Check whether the fix is still gfx803-specific.** Some of these bugs
-   are architecture-general defects that just happen to be *exposed* by
-   gfx803's kernel/solver selection (the WGM Tensile swizzle bug, the
-   small-GEMM assembly miscompute) rather than genuine hardware quirks. If
-   re-investigating turns up a bug that would also misfire on other
-   architectures using the same code path, that's a signal to report it
-   upstream instead of (or in addition to) patching around it here.
-3. **Re-verify on real hardware, not just "applies clean."** A patch that
-   compiles is not a patch that's confirmed fixed -- several patches in this
-   repo's history were re-diffed successfully but flagged "not yet
-   re-verified on real hardware" until someone actually ran the repro
-   against the new binaries. Don't assume a clean apply means the original
-   bug is still handled correctly. This is the standing state of the whole
-   10.0 line's patch set right now.
+2. Make sure that the fix is still gfx803-specific. Some of these bugs are
+   architecture-general faults that gfx803's kernel and solver selection merely
+   exposes, such as the WGM Tensile swizzle bug and the small-GEMM assembly
+   miscompute. Others are real hardware gaps. If a new investigation shows that
+   the same code path misfires on other architectures, report it upstream, and
+   patch here only in addition to that.
+3. Re-test on real hardware, and do not treat a clean apply as a fix. A patch
+   that compiles proves nothing about correctness. Several patches here were
+   re-diffed successfully and then marked NOT YET RE-VERIFIED ON REAL HARDWARE,
+   until someone ran the original repro against the new binaries. Each patch
+   header and the Status section above state the current state.
 
 ## Host BIOS setting: keep PCIe ASPM off
 
-On at least one gfx803 host, PCIe ASPM (link power management) being enabled
-in the BIOS caused rare, extremely hard-to-diagnose stalls/hangs under GPU
-load -- the kind that look like a driver or kernel bug and burn hours of
-debugging before the actual cause turns out to be a power-management setting
-outside the software stack entirely. Keep ASPM disabled in BIOS (and via
-`setpci`/kernel cmdline if the board won't hand OS-level control to Linux)
-on any gfx803 host until proven otherwise on that specific board. See
-`tools/host-setup/` for a working `setpci`-based systemd unit for boards
-where BIOS/firmware won't actually hand ASPM control to Linux.
+On at least one gfx803 host, PCIe ASPM (link power management) enabled in the
+BIOS caused rare stalls and hangs under GPU load that were extremely hard to
+diagnose. They look like a driver or kernel bug, and they can cost hours before
+you find a power-management setting that is outside the software stack entirely.
+Keep ASPM disabled in the BIOS on any gfx803 host until that specific board
+proves otherwise. If the board will not hand OS-level control of ASPM to Linux,
+clear the already-programmed register bits with `setpci` or the kernel cmdline.
+`tools/host-setup/` has a working `setpci`-based systemd unit for such boards.
 
 ## Host VBIOS setting: mining-tuned VRAM clocks cause random GPU faults and hangs
 
-At least one gfx803 card in use with this repo (Sapphire RX 470 8GB Mining
-UEFI, Hynix `H5GQ8H24MJR` VRAM) shipped with a mining-tuned VBIOS running
-VRAM (MCLK) at 2000-2100MHz -- above what a 7Gbps-rated Hynix chip is
-actually spec'd for. Under a correctness-checked compute workload this
-produced two symptoms that both took real investigation to correctly rule
-out as driver/software bugs (ioctl tracing, PM4 dispatch tracing,
-kernel-side TLB-flush review, GPU-side wave-state capture via debugfs --
-see `RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` for the full investigation on both):
+At least one gfx803 card used with this repo (Sapphire RX 470 8GB Mining UEFI,
+Hynix `H5GQ8H24MJR` VRAM) shipped with a mining-tuned VBIOS that runs VRAM (MCLK)
+at 2000-2100 MHz. That is above the rating of a 7 Gbps Hynix chip. Under a
+correctness-checked compute workload this produced two symptoms. Both needed real
+investigation to rule out as software bugs: ioctl tracing, PM4 dispatch tracing,
+a kernel-side TLB-flush review, and GPU-side wave-state capture through debugfs.
+`RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md` holds that investigation.
 
-- `tools/correctness-suite/pool_sweep`: an intermittent (~50% of runs),
-  deterministic-address GPU VM fault.
-- vLLM and other sustained-load workloads: an intermittent, unrecoverable
-  hang -- a wave parked forever in `s_waitcnt vmcnt(0)`, waiting on a
-  vector-memory op that never returns. Killing the stuck process fails a
-  KFD queue eviction and needs a reboot.
+- `tools/correctness-suite/pool_sweep`: an intermittent GPU VM fault at a
+  deterministic address, in about 50% of runs.
+- vLLM and other sustained loads: an intermittent hang that cannot be recovered,
+  where a wave waits forever in `s_waitcnt vmcnt(0)` for a vector-memory op that
+  never returns. Killing the stuck process fails a KFD queue eviction, so a
+  reboot is needed.
 
-Mining workloads tolerate occasional VRAM bit errors that a
-correctness-checked or long-running one won't -- it'll eventually surface
-as a fault, a hang, or (worse) silently wrong results.
+A mining workload tolerates occasional VRAM bit errors that a
+correctness-checked or long-running workload does not. In the latter it surfaces
+as a fault, a hang, or a silently wrong result.
 
-**Fix: flash a VBIOS whose VRAM clock matches the installed memory's real
-rated speed**, via `amdvbflash`'s force-flash mode (`amdvbflash -f -p 0
-<rom>`; always dump/keep the existing ROM first). Confirmed on hardware two
-independent ways:
+Flash a VBIOS whose VRAM clock matches the real rating of the installed memory. Use `amdvbflash`'s force-flash mode (`amdvbflash -f -p 0 <rom>`), and
+always dump and keep the existing ROM first. Two independent hardware tests
+confirm this:
 
-- Keeping the card's own mining VBIOS but capping MCLK to 1750MHz via core
-  overdrive (`amdgpu.ppfeaturemask=0xffffffff` + `pp_od_clk_voltage`):
-  64/64 clean runs, vs. repeated same-boot hangs/crashes at 2000MHz with
-  every other binary held identical.
-- Flashing a real Sapphire RX570 Nitro VBIOS with correct-vendor Hynix
-  straps (`113-2E366AU-X56`, downloaded from
-  https://www.techpowerup.com/vgabios/212597/212597) whose stock MCLK table
-  tops out at 1750MHz, no overdrive needed: 75/75 clean runs at stock
-  settings. This is the recommended fix for anyone with the same
-  Sapphire RX 470 8GB Mining UEFI card and Hynix memory -- no software
-  workaround required at all.
+- The card's own mining VBIOS, with MCLK capped at 1750 MHz through core
+  overdrive (`amdgpu.ppfeaturemask=0xffffffff` plus `pp_od_clk_voltage`): 64 of
+  64 clean runs, against repeated hangs and crashes in the same boot at 2000 MHz
+  with every other binary held identical.
+- A real Sapphire RX570 Nitro VBIOS with correct-vendor Hynix straps
+  (`113-2E366AU-X56`, from
+  https://www.techpowerup.com/vgabios/212597/212597), whose stock MCLK table ends
+  at 1750 MHz: 75 of 75 clean runs at stock settings, no overdrive. This is the
+  recommended fix for the same Sapphire RX 470 8GB Mining UEFI card with Hynix
+  memory, and it needs no software workaround at all.
 
-Two other RX570 VBIOS files with **Samsung** straps (wrong vendor for this
-card's Hynix chips) failed to probe entirely (`SMU load firmware failed`,
-`probe with driver amdgpu failed with error -22`) rather than hang -- a
-different, harder failure mode. Match the VBIOS's memory-vendor strap to
-the physically installed chips, not just the card model/VRAM size.
+Two other RX570 VBIOS files with Samsung straps (the wrong vendor for this
+card's Hynix chips) did not probe at all (`SMU load firmware failed`,
+`probe with driver amdgpu failed with error -22`) instead of hanging. That is a
+different and harder failure mode. Match the VBIOS memory-vendor strap to the
+chips that are physically installed, and not only to the card model and VRAM
+size.
 
-Check VRAM clock (`cat /sys/class/drm/card*/device/pp_dpm_mclk`) against
-the card's actual rated spec before assuming a gfx803 GPU fault or hang
-report is a software bug.
+Read the VRAM clock with `cat /sys/class/drm/card*/device/pp_dpm_mclk` and compare
+it with the card's real rating before you accept a gfx803 GPU fault or hang report
+as a software bug.
 
-## What needs real gfx803 hardware to validate, and what doesn't
+## What needs real gfx803 hardware to validate, and what does not
 
-- **Needs the real card**: anything that dispatches a GPU kernel --
-  `verify.py`, `tools/correctness-suite/`, any real transcription/inference
-  run, MIOpen's own `MIOpenDriver -V 1` verification. Silent miscompute is
-  the recurring bug class here (`rocblas_status_success` returned with wrong
-  numbers) -- CPU/emulation cannot reproduce it, and a patch that only
-  "applies clean" and "compiles" has verified nothing about correctness.
-- **Doesn't need the card**: whether a Dockerfile builds at all, whether a
-  patch applies against a given pin, source-level tracing of *where* a bug
-  lives (MIOpen's own `MIOPEN_ENABLE_LOGGING_CMD`/`MIGRAPHX_TRACE_COMPILE`
-  traces and upstream source diffs found several root causes in this repo's
-  history without ever touching a GPU), and cross-arch differential testing
-  against an image for a *different* card (used repeatedly in
-  `rocm7.14/MIGRATION_NOTES.md` to separate "this line broke it" from
-  "upstream never worked here").
+- The card is needed for anything that dispatches a GPU kernel: `verify.py`,
+  `tools/correctness-suite/`, any real transcription or inference run, and
+  MIOpen's own `MIOpenDriver -V 1` check. Silent miscompute is the common bug
+  class here, where `rocblas_status_success` returns with wrong numbers. A CPU or
+  an emulator cannot reproduce it, and a patch that only "applies clean" and
+  "compiles" has proved nothing about correctness.
+- The card is not needed for these: whether a Dockerfile builds at all, whether a
+  patch applies against a given pin, and where a bug lives, which source-level
+  tracing answers. MIOpen's own `MIOPEN_ENABLE_LOGGING_CMD` traces and
+  `MIGRAPHX_TRACE_COMPILE` plus upstream source diffs located several root causes
+  in this repo's history without touching a GPU. Cross-architecture differential
+  tests against an image for a different card also need no gfx803 card, and
+  `rocm7.14/MIGRATION_NOTES.md` uses them to separate "this line broke it" from
+  "upstream never worked here".
 
 ## Convergence
 
-Once the rocm10 line is confirmed at least as solid as `rocm7.14/` --
-correctness-suite clean, ORT suite parity, comparable real-model results --
-the lines get diffed and deliberately merged: whatever's still
-7.14/6.4.4-only that should generalize moves up, and the independent copies
-collapse back into a shared structure. Not done yet; all lines are still
-under maintenance at different verification levels.
+Once the rocm10 line is confirmed at least as solid as `rocm7.14/` (clean
+correctness suite, ORT suite parity, comparable real-model results), the lines are
+diffed and merged deliberately. What is still only in 7.14 or 6.4.4, and belongs in
+the shared structure, moves up, and the separate copies collapse back into a shared
+structure. This is not done, and each line is still maintained at its own
+verification level.
 
 ## See also
 
-- `MIGRATION_NOTES.md` -- the 10.0 migration log (pins, what's inherited,
-  what's still open).
-- `rocm7.14/MIGRATION_NOTES.md` -- the detailed, as-found 7.14 investigation
-  log. Read this before assuming something is broken or fixed on that line;
-  it's the primary source of truth for what's been checked and how.
-- `rocm7.14/README.md` -- the 7.14 line's full detail, including the vLLM
-  on gfx803 investigation and tuning notes.
-- `rocm6.4.4/KERNEL_BUGS.md` -- the original gfx803 bug-hunting methodology
-  and bug record for the 6.4.4 line.
-- [`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder) -- the
-  mainline (gfx900+) build this repo split off from and tracks version-wise.
+- `MIGRATION_NOTES.md`: the 10.0 migration log, with the pins, what was
+  inherited, and what is still open.
+- `rocm7.14/MIGRATION_NOTES.md`: the detailed as-found 7.14 investigation log.
+  Read it before you assume something on that line is broken or fixed. It is the
+  main record of what was tested and how.
+- `rocm7.14/README.md`: the 7.14 line in full, including the vLLM on gfx803
+  investigation and tuning notes.
+- `rocm6.4.4/KERNEL_BUGS.md`: the original gfx803 bug-hunting method and bug
+  record for the 6.4.4 line.
+- [`rocm-migraphx-ort-builder`](../rocm-migraphx-ort-builder): the mainline
+  (gfx900 and newer) build that this repo split from and follows version-wise.

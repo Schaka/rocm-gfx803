@@ -1,7 +1,7 @@
 #!/bin/sh
-# See gfx-default-rocblas-hipblaslt-off-build-failure.patch for the full
-# WHY/WHAT. Uses `patch`, not `git apply` -- see
-# ../rocblas/small-gemm-assembly-miscompute.sh for why.
+# Apply gfx-default-rocblas-hipblaslt-off-build-failure.patch. That file gives the
+# reason and the change. This driver uses `patch` and not `git apply`, for the
+# reason stated in ../rocblas/small-gemm-assembly-miscompute.sh.
 set -eu
 SRC="${1:-/migraphx-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
