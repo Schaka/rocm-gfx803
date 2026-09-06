@@ -1507,23 +1507,31 @@ RUN set -eu; \
 # kernels are JIT-compiled and served through MIOpen's own kernel database/COMgr
 # path rather than a single embedded HIP offload blob (Composable Kernel, which
 # would add its own precompiled binaries, is off here: -DMIOPEN_USE_COMPOSABLEKERNEL=Off).
-# What's checkable is whether the copy changed anything at all, the same way
-# rocsolver-builder's own build verifies its output: compare the file size before
-# and after. An unchanged size means the copy matched zero files, exactly the bug
-# just found and fixed above -- this base image's stock MIOpen would still be here.
-RUN readlink -f /opt/rocm/lib/libMIOpen.so > /tmp/miopen_resolved \
-    && stat -c%s "$(cat /tmp/miopen_resolved)" > /tmp/miopen_stock_size
-COPY --from=miopen-export /opt/rocm/core-10.0/lib/libMIOpen.so.* /opt/rocm/core-10.0/lib/
+#
+# A before-vs-after-this-COPY size comparison does not work here: an earlier run
+# tried exactly that and failed a build that was actually correct, because
+# migraphx-export already carried the fixed file forward (migraphx-builder gets
+# the same copy, see that stage) -- "before" this COPY was already the patched
+# size, so comparing it to "after" saw no change and called a working build broken.
+# Compare against python-base's own untouched stock content instead: the pristine
+# base image before any component's fix is layered onto it, which stays a valid
+# stock reference no matter what an earlier stage already got right.
+COPY --from=python-base /opt/rocm/core-10.0/lib/libMIOpen.so.* /tmp/miopen-stock-ref/
 RUN set -eu; \
-    resolved="$(cat /tmp/miopen_resolved)"; \
-    stock_size="$(cat /tmp/miopen_stock_size)"; \
-    new_size="$(stat -c%s "$resolved")"; \
-    rm -f /tmp/miopen_resolved /tmp/miopen_stock_size; \
-    if [ "$new_size" = "$stock_size" ]; then \
-        echo "FATAL: $resolved is still ${new_size} bytes after the miopen-export copy -- it did not land. The MIOPEN_IMAGE wired into this build does not carry the gfx803 fix." >&2; \
+    resolved="$(readlink -f /opt/rocm/lib/libMIOpen.so)"; \
+    stock_ref="$(find /tmp/miopen-stock-ref -maxdepth 1 -name 'libMIOpen.so.*' -type f | sort -V | tail -1)"; \
+    if [ -z "$resolved" ] || [ ! -f "$resolved" ] || [ -z "$stock_ref" ]; then \
+        echo "FATAL: could not resolve /opt/rocm/lib/libMIOpen.so (got '$resolved') or the python-base stock reference (got '$stock_ref')." >&2; \
         exit 1; \
     fi; \
-    echo "OK: $resolved changed from ${stock_size} to ${new_size} bytes after the miopen-export copy."
+    new_size="$(stat -c%s "$resolved")"; \
+    stock_size="$(stat -c%s "$stock_ref")"; \
+    rm -rf /tmp/miopen-stock-ref; \
+    if [ "$new_size" = "$stock_size" ]; then \
+        echo "FATAL: $resolved is the same size (${new_size} bytes) as the untouched base image's stock MIOpen -- the miopen-export copy did not land. The MIOPEN_IMAGE wired into this build does not carry the gfx803 fix." >&2; \
+        exit 1; \
+    fi; \
+    echo "OK: $resolved (${new_size} bytes) differs from the stock ${stock_size}-byte MIOpen -- the gfx803 fix is present."
 # Only the library file again: rocsolver-builder chains from rocblas-export, so
 # copying its whole /opt/rocm here would revert MIOpen and the patched runtime.
 # hipSOLVER needs no equivalent copy -- it carries no device code and delegates
