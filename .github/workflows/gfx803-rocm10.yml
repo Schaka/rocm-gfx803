@@ -309,6 +309,8 @@ jobs:
       component: final
       intermediate-suffix: -rocm10
       final: true
+      with-rocr-clr-image: true
+      with-rocblas-image: true
       with-migraphx-image: true
       with-miopen-image: true
       with-rocsolver-image: true
