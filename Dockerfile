@@ -889,10 +889,13 @@ RUN GFX803_SOURCE_REV="${GFX803_SOURCE_REV}" GFX803_PINS="${GFX803_PINS}" GFX803
 # rocblas_gemm_strided_batched_ex takeover that MIGraphX's batched attention dots land in.
 # The enabling ENV lives in the final stage. The sources live in patches/rocblas/sgemm-shim/.
 #
-# It gets its own stage because a build that supplies ROCBLAS_IMAGE skips rocblas-builder
-# entirely. Building the shim there would ship whatever .so the published image happens to
-# carry, however current this tree's sources are.
-FROM rocsolver-builder AS sgemm-shim-builder
+# It builds from rocblas-export, not the local rocblas-builder stage: a build that supplies
+# ROCBLAS_IMAGE skips rocblas-builder entirely, so anything defined inside that stage would
+# not run either. rocblas-export always resolves (to the local build or the pulled image)
+# and already carries a working librocblas.so and headers, which is all this shim links
+# against -- it has no rocSOLVER dependency, so there is no reason to chain through
+# rocsolver-builder and pay for a full rocSOLVER compile just to reach rocBLAS.
+FROM rocblas-export AS sgemm-shim-builder
 COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
 RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
         /opt/rocm-sgemm-shim/sgemm_shim.cpp \
@@ -934,6 +937,16 @@ COPY --from=rocblas-export /opt/rocm /opt/rocm
 # the final stage's own copy of this file, for the same base-image-SOVERSION
 # reason.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
+
+# Same reasoning as the final stage's own copy of this file (see there): the base
+# image's stock rocSOLVER ships an empty .hip_fatbin for every architecture, which
+# SIGSEGVs any hipSOLVER-backed torch.linalg call at first launch. Without this copy,
+# migraphx-builder -- and everything that inherits its /opt/rocm wholesale downstream
+# (pytorch-builder, torchvision-builder, torchaudio-builder, ort-builder) -- would carry
+# that broken rocSOLVER all the way to their own published images, with only the final
+# assembly stage ever getting the fix. rocBLAS and the gfx803 CLR/HSA runtime already
+# propagate this way from the moment they're built; rocSOLVER did not until now.
+COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -1475,6 +1488,24 @@ COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 # hipSOLVER needs no equivalent copy -- it carries no device code and delegates
 # into rocSOLVER, whose symbols resolve to this file at load time.
 COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
+# Unlike the CLR runtime and the SGEMM shim just below, this file was never re-verified
+# after landing in the final image -- only inside rocsolver-builder's own build, on
+# whatever image ROCSOLVER_IMAGE happened to name at the time. A stale or wrong tag
+# there would ship a broken rocSOLVER with no signal until it SIGSEGVs on real hardware.
+RUN set -eu; \
+    resolved="$(find /opt/rocm/lib -maxdepth 1 -name 'librocsolver.so.*' -type f | sort -V | tail -1)"; \
+    if [ -z "$resolved" ]; then \
+        echo "FATAL: no librocsolver.so.* file found in /opt/rocm/lib after the rocsolver-export copy." >&2; \
+        exit 1; \
+    fi; \
+    objcopy -O binary --only-section=.hip_fatbin "$resolved" /tmp/rocsolver_final_fatbin_check.bin \
+    && fatbin_size="$(stat -c%s /tmp/rocsolver_final_fatbin_check.bin)" \
+    && rm -f /tmp/rocsolver_final_fatbin_check.bin \
+    && if [ "$fatbin_size" -lt 100000 ]; then \
+        echo "FATAL: $resolved's .hip_fatbin is only ${fatbin_size} bytes -- too small to contain real gfx803 device code (expect MBs). The ROCSOLVER_IMAGE wired into this build does not carry the gfx803 fix." >&2; \
+        exit 1; \
+    fi \
+    && echo "OK: $resolved resolves to a gfx803 build with a ${fatbin_size}-byte .hip_fatbin."
 # The SGEMM shim is always this build's own, never the base chain's copy.
 COPY --from=sgemm-shim-builder /opt/rocm/lib/libgfx803_sgemm_shim.so /opt/rocm/lib/
 RUN if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "f16-map-nm"; then \
