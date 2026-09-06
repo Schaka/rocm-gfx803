@@ -936,7 +936,16 @@ COPY --from=rocblas-export /opt/rocm /opt/rocm
 # revert the gfx803 rocBLAS build the line above just installed. Same glob as
 # the final stage's own copy of this file, for the same base-image-SOVERSION
 # reason.
-COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
+#
+# The source and destination are /opt/rocm/core-10.0/lib, not /opt/rocm/lib: this
+# base image's /opt/rocm/lib is itself a symlink to /etc/alternatives/rocm-lib, and
+# a COPY --from with a wildcard source does not follow a symlinked directory that
+# appears in the middle of the path -- it silently matches zero files rather than
+# erroring, which a plain `ls`/`readlink -f` inside a running container will not
+# show you, because those DO follow it. /opt/rocm/core-10.0 is the real directory
+# underneath. Confirmed directly: `find /opt/rocm/lib -name 'libMIOpen.so.*'` on
+# this exact image returns nothing, `find /opt/rocm/core-10.0/lib` finds the file.
+COPY --from=miopen-export /opt/rocm/core-10.0/lib/libMIOpen.so.* /opt/rocm/core-10.0/lib/
 
 # Same reasoning as the final stage's own copy of this file (see there): the base
 # image's stock rocSOLVER ships an empty .hip_fatbin for every architecture, which
@@ -946,7 +955,8 @@ COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
 # that broken rocSOLVER all the way to their own published images, with only the final
 # assembly stage ever getting the fix. rocBLAS and the gfx803 CLR/HSA runtime already
 # propagate this way from the moment they're built; rocSOLVER did not until now.
-COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
+# Real path, not /opt/rocm/lib, for the same symlink reason as the MIOpen copy above.
+COPY --from=rocsolver-export /opt/rocm/core-10.0/lib/librocsolver.so.* /opt/rocm/core-10.0/lib/
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -1482,20 +1492,57 @@ RUN set -eu; \
 # independently-controllable, authoritative source (final takes its own
 # MIOPEN_IMAGE/with-miopen-image input), not as the only place this file
 # reaches the final image.
-COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.* /opt/rocm/lib/
+#
+# Real path (/opt/rocm/core-10.0/lib), not /opt/rocm/lib: this base image's
+# /opt/rocm/lib is a symlink to /etc/alternatives/rocm-lib, and a COPY --from
+# with a wildcard source does not follow a symlinked directory in the middle of
+# the path -- it silently matches zero files instead of erroring. This was true
+# of this exact line before today and nothing had ever checked it: confirmed by
+# directly pulling rocm-miopen-builder:gfx803-rocm10 and finding
+# `find /opt/rocm/lib -name 'libMIOpen.so.*'` empty while
+# `find /opt/rocm/core-10.0/lib` finds the real file.
+#
+# This copy was never re-verified either, same gap as rocSOLVER below -- and unlike
+# rocSOLVER/rocBLAS, MIOpen carries no .hip_fatbin ELF section to size-check: its
+# kernels are JIT-compiled and served through MIOpen's own kernel database/COMgr
+# path rather than a single embedded HIP offload blob (Composable Kernel, which
+# would add its own precompiled binaries, is off here: -DMIOPEN_USE_COMPOSABLEKERNEL=Off).
+# What's checkable is whether the copy changed anything at all, the same way
+# rocsolver-builder's own build verifies its output: compare the file size before
+# and after. An unchanged size means the copy matched zero files, exactly the bug
+# just found and fixed above -- this base image's stock MIOpen would still be here.
+RUN readlink -f /opt/rocm/lib/libMIOpen.so > /tmp/miopen_resolved \
+    && stat -c%s "$(cat /tmp/miopen_resolved)" > /tmp/miopen_stock_size
+COPY --from=miopen-export /opt/rocm/core-10.0/lib/libMIOpen.so.* /opt/rocm/core-10.0/lib/
+RUN set -eu; \
+    resolved="$(cat /tmp/miopen_resolved)"; \
+    stock_size="$(cat /tmp/miopen_stock_size)"; \
+    new_size="$(stat -c%s "$resolved")"; \
+    rm -f /tmp/miopen_resolved /tmp/miopen_stock_size; \
+    if [ "$new_size" = "$stock_size" ]; then \
+        echo "FATAL: $resolved is still ${new_size} bytes after the miopen-export copy -- it did not land. The MIOPEN_IMAGE wired into this build does not carry the gfx803 fix." >&2; \
+        exit 1; \
+    fi; \
+    echo "OK: $resolved changed from ${stock_size} to ${new_size} bytes after the miopen-export copy."
 # Only the library file again: rocsolver-builder chains from rocblas-export, so
 # copying its whole /opt/rocm here would revert MIOpen and the patched runtime.
 # hipSOLVER needs no equivalent copy -- it carries no device code and delegates
 # into rocSOLVER, whose symbols resolve to this file at load time.
-COPY --from=rocsolver-export /opt/rocm/lib/librocsolver.so.* /opt/rocm/lib/
+# Real path, not /opt/rocm/lib, for the same symlink reason as the MIOpen copy above.
+COPY --from=rocsolver-export /opt/rocm/core-10.0/lib/librocsolver.so.* /opt/rocm/core-10.0/lib/
 # Unlike the CLR runtime and the SGEMM shim just below, this file was never re-verified
 # after landing in the final image -- only inside rocsolver-builder's own build, on
 # whatever image ROCSOLVER_IMAGE happened to name at the time. A stale or wrong tag
 # there would ship a broken rocSOLVER with no signal until it SIGSEGVs on real hardware.
+#
+# readlink -f, not a hardcoded core-10.0 path: this follows whatever
+# /opt/rocm/lib/librocsolver.so currently resolves to (the same alternatives chain
+# the running system uses at load time), the same way rocsolver-builder's own
+# build-time check does, rather than assuming the version-directory name.
 RUN set -eu; \
-    resolved="$(find /opt/rocm/lib -maxdepth 1 -name 'librocsolver.so.*' -type f | sort -V | tail -1)"; \
-    if [ -z "$resolved" ]; then \
-        echo "FATAL: no librocsolver.so.* file found in /opt/rocm/lib after the rocsolver-export copy." >&2; \
+    resolved="$(readlink -f /opt/rocm/lib/librocsolver.so)"; \
+    if [ -z "$resolved" ] || [ ! -f "$resolved" ]; then \
+        echo "FATAL: /opt/rocm/lib/librocsolver.so does not resolve to a real file after the rocsolver-export copy." >&2; \
         exit 1; \
     fi; \
     objcopy -O binary --only-section=.hip_fatbin "$resolved" /tmp/rocsolver_final_fatbin_check.bin \

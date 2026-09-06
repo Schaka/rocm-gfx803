@@ -196,6 +196,31 @@ jobs:
               final)    echo "${owner}/rocm-migraphx-ort-torch-builder" ;;
             esac
           }
+          # A *_IMAGE build-arg passed as a bare mutable tag (repo:tag) makes every
+          # run's build-arg text byte-identical regardless of what the tag currently
+          # points to, because that republished tag is the same string every time a
+          # component gets rebuilt. BuildKit's cache key for the COPY that follows a
+          # `FROM ${*_IMAGE}` stage is computed from that build-arg text, not from a
+          # fresh registry lookup -- so a `--cache-from` import from an older run can
+          # silently reuse a stale COPY result even though the tag's content changed
+          # since. Resolving to `repo@sha256:...` here, the same way the branch pins
+          # below are resolved to an explicit commit SHA before they reach a build-arg,
+          # makes the cache key depend on what the image actually is. Found the hard
+          # way: a `final` build with a correctly-wired ROCSOLVER_IMAGE still shipped
+          # an empty rocSOLVER because the COPY step it fed was served from cache.
+          image_digest() { # ref (repo:tag)
+              local ref="$1" digest attempt
+              for attempt in 1 2 3; do
+                  digest="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"
+                  [ -n "$digest" ] && break
+                  sleep $((attempt * 5))
+              done
+              if [ -z "$digest" ]; then
+                  echo "FATAL: could not resolve a digest for $ref" >&2
+                  exit 1
+              fi
+              echo "${ref%:*}@${digest}"
+          }
           component="${{ inputs.component }}"
           self="$(pkg "${component}")"
           # Every tag this workflow reads or writes carries the suffix, so the
@@ -214,34 +239,34 @@ jobs:
             echo "build-args<<ARGS_EOF"
             echo "ROCM_ARCH=gfx803"
             if [ "${{ inputs.with-rocr-clr-image }}" = "true" ]; then
-              echo "ROCR_CLR_IMAGE=$(pkg rocr-clr):${arch}"
+              echo "ROCR_CLR_IMAGE=$(image_digest "$(pkg rocr-clr):${arch}")"
             fi
             if [ "${{ inputs.with-rocr-image }}" = "true" ]; then
-              echo "ROCR_IMAGE=$(pkg rocr):${arch}"
+              echo "ROCR_IMAGE=$(image_digest "$(pkg rocr):${arch}")"
             fi
             if [ "${{ inputs.with-rocblas-image }}" = "true" ]; then
-              echo "ROCBLAS_IMAGE=$(pkg rocblas):${arch}"
+              echo "ROCBLAS_IMAGE=$(image_digest "$(pkg rocblas):${arch}")"
             fi
             if [ "${{ inputs.with-miopen-image }}" = "true" ]; then
-              echo "MIOPEN_IMAGE=$(pkg miopen):${arch}"
+              echo "MIOPEN_IMAGE=$(image_digest "$(pkg miopen):${arch}")"
             fi
             if [ "${{ inputs.with-rocsolver-image }}" = "true" ]; then
-              echo "ROCSOLVER_IMAGE=$(pkg rocsolver):${arch}"
+              echo "ROCSOLVER_IMAGE=$(image_digest "$(pkg rocsolver):${arch}")"
             fi
             if [ "${{ inputs.with-migraphx-image }}" = "true" ]; then
-              echo "MIGRAPHX_IMAGE=$(pkg migraphx):${arch}"
+              echo "MIGRAPHX_IMAGE=$(image_digest "$(pkg migraphx):${arch}")"
             fi
             if [ "${{ inputs.with-pytorch-image }}" = "true" ]; then
-              echo "PYTORCH_IMAGE=$(pkg pytorch):${arch}"
+              echo "PYTORCH_IMAGE=$(image_digest "$(pkg pytorch):${arch}")"
             fi
             if [ "${{ inputs.with-torchvision-image }}" = "true" ]; then
-              echo "TORCHVISION_IMAGE=$(pkg torchvision):${arch}"
+              echo "TORCHVISION_IMAGE=$(image_digest "$(pkg torchvision):${arch}")"
             fi
             if [ "${{ inputs.with-torchaudio-image }}" = "true" ]; then
-              echo "TORCHAUDIO_IMAGE=$(pkg torchaudio):${arch}"
+              echo "TORCHAUDIO_IMAGE=$(image_digest "$(pkg torchaudio):${arch}")"
             fi
             if [ "${{ inputs.with-ort-image }}" = "true" ]; then
-              echo "ORT_IMAGE=$(pkg ort):${arch}"
+              echo "ORT_IMAGE=$(image_digest "$(pkg ort):${arch}")"
             fi
             # Empty means "leave the Dockerfile's pin alone" -- passing an
             # empty build-arg would override the ARG default with "" and break
