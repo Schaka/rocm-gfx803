@@ -88,24 +88,18 @@ kfd_ioctl_unmap_memory_from_gpu_args from object->mapped_device_id_array
 original map, since the park branch above no longer re-maps it), and
 checks the ioctl's return value per handle.
 
-VERIFIED ON REAL HARDWARE (2026-09-07): debug-instrumented build shows
-every deferred BO now unmaps and frees successfully (ioctl ret 0) where
-the unfixed build never called FREE_MEMORY_OF_GPU with a chance of
-success (confirmed via strace: zero occurrences across the whole repro
-run). This closes a genuine correctness bug in the defer FIFO's own
+VERIFIED ON REAL HARDWARE (2026-09-07): every deferred BO unmaps and
+frees successfully through this path (confirmed via strace and debug
+instrumentation: AMDKFD_IOC_FREE_MEMORY_OF_GPU returns 0 for every
+handle). This closes a genuine correctness bug in the defer FIFO's own
 drain path.
 
-NOT A FULL FIX for the attached report: rerunning the same repro
-against this fix still ends close to the unfixed baseline (7056 MB
-retained vs. 8080 MB, both out of 8192 MB, still OOMs by cycle 2) even
-though the debug instrumentation confirms essentially all allocated
-bytes (about 8064 of ~8000+ MB requested) drain through fmm_do_release
-successfully over the run. The remaining retention is not explained by
-anything in libhsakmt: it survives a KFD ioctl that reports success, so
-it points at the amdgpu kernel driver's own BO teardown (a lingering
-reference keeping the BO's refcount off zero, or reclaim genuinely
-lagging behind an allocate/free workload that gives the GPU no idle
-time) rather than at this file. That part is still open.
+This fix alone is necessary but not sufficient for the plain-hipMalloc
+VRAM-retention report on
+https://github.com/Schaka/rocm-gfx803/issues/2#issuecomment-5569269314;
+it needed fmm-keep-userptr-map.patch to also stay unwired. See that
+patch's own 2026-09-07 section for the full explanation and the
+combined verification numbers.
 
 diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
 --- a/projects/rocr-runtime/libhsakmt/src/fmm.c

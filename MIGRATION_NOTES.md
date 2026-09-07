@@ -422,3 +422,17 @@ This is a 10.0-only patch. Its own FIX section says the VA range it touches "rem
 Before removing it, the team re-verified the original crash was absent on the current stack using three methods. First: a 200-iteration raw torch churn loop (the patch's own claim was "100% of runs" within 25s). Second: 5x ComfyUI checkpoint load/unload cycles. Third: a full sd1.5 txt2img generation. All three came back clean, zero faults in dmesg.
 
 This does not prove the original race is gone for good. It only proves the crash was not reproduced against the current pinned source. The VRAM-retention cost reproduced immediately. `scripts/build/rocr-clr.sh` no longer applies this patch. The patch file carries the full writeup, the re-verification steps, and a proposed narrower fix. Bind the deferred release the same way `va-reuse-defer.patch` already binds its own FIFO. Do this instead of never releasing the VA. If the crash resurfaces, apply this narrower fix.
+
+## 2026-09-07 (later): plain hipMalloc/hipFree VRAM retention fixed
+
+Freed VRAM from a plain `hipMalloc`/`hipFree` loop, with no PyTorch and no ComfyUI,
+now returns correctly. Two patches cover this. `va-reuse-defer-noremap.patch` unmaps
+a parked buffer through the existing `_fmm_unmap_from_gpu()` helper instead of a
+hand-rolled ioctl call. `fmm-keep-userptr-map.patch` stays unwired from the build,
+because plain `hipMalloc` on this box's full-Resizable-BAR GPU uses the same
+CPU-mapped release path as the ComfyUI staging buffers above.
+
+A 20-cycle steady-state test allocates and frees about 2988 MB per cycle. Free VRAM
+stays flat across all 20 cycles, with zero out-of-memory errors. `mem_info_vram_used`
+settles near 1 GB between cycles. That number matches the deferred-release queue's
+own cap. Both patch files carry the full writeup.

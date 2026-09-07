@@ -45,6 +45,45 @@ does mean the patch's crash could not be reproduced against the current
 pinned source, while its cost (unbounded VRAM retention) reproduced
 immediately and consistently.
 
+THIS PATCH IS ALSO THE CAUSE OF THE PLAIN hipMalloc/hipFree REPORT
+--------------------------------------------------------------------
+A second report on the same GitHub issue attached a standalone C++/HIP
+repro (no PyTorch, no ComfyUI): a plain hipMalloc()/hipFree() loop never
+returns memory to hipMemGetInfo() or mem_info_vram_used, and a workload
+that allocates and frees varied buffer sizes across 5 cycles OOMs by
+cycle 2-3.
+
+reserved_aperture_release() is not only the release path for
+CPU-visible userptr staging buffers (hipHostMalloc, torch H2D). On this
+box's dGPU, full Resizable BAR init assigns svm.dgpu_aperture ==
+svm.apertures[SVM_DEFAULT] (init_dgpu_apertures in this same file),
+which is the aperture plain hipMalloc's local-VRAM allocations use, with
+is_cpu_accessible=true and ops=reserved_aperture_ops. With this patch
+applied, hipFree() on such a buffer never drops the CPU-side mmap (the
+whole point of the patch), so drm_gem_object_put() inside the kernel's
+amdgpu_amdkfd_gpuvm_free_memory_of_gpu() -- confirmed by reading that
+function -- never sees the buffer's last reference, so the BO is
+orphaned until process exit, exactly matching the report's five
+symptoms.
+
+VERIFIED ON REAL HARDWARE (2026-09-07): rebuilt with both this patch
+correctly absent and va-reuse-defer-noremap.patch's ioctl-struct fix
+applied. The report's own repro still shows a transient dip during its
+own escalating-cycle Test 2 (that test's cycle N concurrently allocates
+N * ~2988 MB before freeing any of it -- by cycle 3 that is ~8964 MB
+against 8192 MB total, a genuine capacity limit of its own making, not a
+leak). A steady-state check removes that confound: 20 cycles of a
+constant-size alloc/free pattern (~2988 MB peak per cycle, freed at each
+cycle's end) held hipMemGetInfo free flat at 7186 MB for all 20 cycles
+with zero growth and zero OOM, and mem_info_vram_used settled to a
+stable ~1.0 GB (matching the intentional va-reuse-defer FIFO cap) during
+a 10-second quiescent hold after the last cycle, confirmed against the
+kernel's own TTM VRAM manager (/sys/kernel/debug/dri/.../amdgpu_vram_mm)
+independent of any HSA/KFD-level accounting. No further libhsakmt change
+was needed for this report: the fix is this patch staying unwired
+(already true since 2026-09-07 above) plus the ioctl-struct fix in
+va-reuse-defer-noremap.patch.
+
 HOW TO RE-VERIFY OR REWRITE THIS
 ---------------------------------
 To check whether the original crash is back: run the raw torch churn loop
