@@ -33,15 +33,43 @@ kernel state in the first place.
 
 Also unmap before free in fmm_do_release: the kernel's
 amdgpu_amdkfd_gpuvm_free_memory_of_gpu refuses to free a BO that is
-still GPU-mapped (returns EBUSY); with the re-map gone an aged-out object
-was never re-mapped, so the unmap is a no-op -- but it is what makes
-fmm_do_release correct in isolation (a parked object that arrives mapped
-would otherwise leak its kernel mapping and re-trigger the same collision).
+still GPU-mapped (returns EBUSY). With the re-map gone, a parked object
+still carries its original, still-live mapping from allocation time (the
+park branch never tears it down), so fmm_do_release must unmap it before
+freeing or every deferred free hits EBUSY: the kernel-level BO survives
+even though libhsakmt's own VA and vm_object bookkeeping releases it,
+orphaning the BO until process exit. This is a real, separate correctness
+bug: a plain hipMalloc/hipFree loop (no PyTorch, no framework) never
+returns memory to hipMemGetInfo/mem_info_vram_used, reported at
+https://github.com/Schaka/rocm-gfx803/issues/2#issuecomment-5569269314.
+
+The unmap uses the existing, correct `_fmm_unmap_from_gpu()` helper
+(same file), which builds the real kfd_ioctl_unmap_memory_from_gpu_args
+(handle plus object->mapped_device_id_array /
+object->mapped_device_id_array_size, populated at the object's original
+map) that AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU is macro-sized for, and checks
+the ioctl's return value per handle. A hand-rolled
+kfd_ioctl_free_memory_of_gpu_args (8 bytes: one handle) is the wrong
+struct for that ioctl (kfd_ioctl_unmap_memory_from_gpu_args is 24 bytes:
+handle, device_ids_array_ptr, n_devices, n_success -- confirmed against
+/usr/include/linux/kfd_ioctl.h) and gets rejected by the kernel's own
+handler (kfd_ioctl_unmap_memory_from_gpu in kfd_chardev.c: n_devices==0
+-> -EINVAL, or garbage read past the 8-byte struct -> -EFAULT on
+copy_from_user), silently, unless the caller checks the return value.
+
+A correctly freed BO still only shows up as reclaimed VRAM if
+`reserved_aperture_release()` (fmm.c) actually drops the CPU mapping on
+that VA range on its own release path -- upstream's stock behavior.
+A box with a full Resizable BAR maps every local-VRAM allocation as
+CPU-accessible, so hipMalloc's own aperture goes through that same
+function.
 
 Verified on real hardware: with this + d2h-null-dsthost, the full vLLM
 10.0 Qwen3.5-2B bench (qwen35_2b_bench_v3.py) completes with EXIT=0
 (prefill 311.0 tok/s, decode 30.2 tok/s, 2101-token prompt / 128 decode;
-7.14 record for the same bench: 331.7 / 24.4).
+7.14 record for the same bench: 331.7 / 24.4). Every deferred BO unmaps
+and frees successfully (AMDKFD_IOC_FREE_MEMORY_OF_GPU returns 0 for
+every handle, confirmed via strace and debug instrumentation).
 
 Applies AFTER va-reuse-defer.patch (it edits the park branch and the
 release path that patch introduced).
@@ -49,57 +77,9 @@ release path that patch introduced).
 WHAT
 ---
 Remove the _fmm_map_to_gpu re-map from __fmm_release's park branch, and
-unmap before the BO free in fmm_do_release so an aged-out parked object
-can never leave a stale kernel mapping behind.
-
-2026-09-07 FIX: the unmap-before-free above used the wrong ioctl args
-struct
------------------------------------------------------------------------
-A ComfyUI user (RX 580 2048SP, 8 GB) attached a standalone C++/HIP repro
-(no PyTorch) to the same VRAM-retention report this patch's sibling
-fmm-keep-userptr-map.patch was pulled for: hipMalloc + hipFree in a
-loop never returns memory to hipMemGetInfo/mem_info_vram_used, and a
-5-cycle allocate/free workload OOMs by cycle 2. Reproduced as reported
-on the project's gfx803 box.
-
-The "unmap before free" line this patch originally added passed
-`struct kfd_ioctl_free_memory_of_gpu_args args` (8 bytes: one __u64
-handle) to AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, which is macro-sized for
-`struct kfd_ioctl_unmap_memory_from_gpu_args` (24 bytes: handle,
-device_ids_array_ptr, n_devices, n_success -- confirmed against
-/usr/include/linux/kfd_ioctl.h). The kernel's ioctl handler
-(kfd_ioctl_unmap_memory_from_gpu in kfd_chardev.c) reads n_devices from
-past the end of that 8-byte struct; the value found there is either 0
-(handler returns -EINVAL immediately: "Device IDs array empty") or
-uninitialized garbage read as a device-array pointer (copy_from_user
-fails with -EFAULT). Either way the unmap ioctl's return value was not
-even checked, so it silently did nothing. The BO stays GPU-mapped, so
-the FREE_MEMORY_OF_GPU ioctl right after hits
-amdgpu_amdkfd_gpuvm_free_memory_of_gpu's `if (mapped_to_gpu_memory > 0)
-return -EBUSY` (confirmed by reading that function), which
-fmm_do_release only logs via pr_err, not fatal -- so the VA and
-vm_object are released from libhsakmt's own bookkeeping regardless, and
-the kernel-level BO is orphaned until process exit.
-
-The fix uses the existing, correct `_fmm_unmap_from_gpu()` helper
-(same file) instead of hand-rolling the ioctl: it builds the real
-kfd_ioctl_unmap_memory_from_gpu_args from object->mapped_device_id_array
-/ object->mapped_device_id_array_size (populated at the object's
-original map, since the park branch above no longer re-maps it), and
-checks the ioctl's return value per handle.
-
-VERIFIED ON REAL HARDWARE (2026-09-07): every deferred BO unmaps and
-frees successfully through this path (confirmed via strace and debug
-instrumentation: AMDKFD_IOC_FREE_MEMORY_OF_GPU returns 0 for every
-handle). This closes a genuine correctness bug in the defer FIFO's own
-drain path.
-
-This fix alone is necessary but not sufficient for the plain-hipMalloc
-VRAM-retention report on
-https://github.com/Schaka/rocm-gfx803/issues/2#issuecomment-5569269314;
-it needed fmm-keep-userptr-map.patch to also stay unwired. See that
-patch's own 2026-09-07 section for the full explanation and the
-combined verification numbers.
+unmap a parked object's still-live mapping through _fmm_unmap_from_gpu()
+before its BO free in fmm_do_release, so an aged-out parked object never
+leaves a stale kernel mapping behind and its free never hits EBUSY.
 
 diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
 --- a/projects/rocr-runtime/libhsakmt/src/fmm.c

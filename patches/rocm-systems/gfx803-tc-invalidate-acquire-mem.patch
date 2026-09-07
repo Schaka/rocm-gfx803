@@ -211,7 +211,7 @@ and nothing at all to a copy path's choice of engine, so D2H and H2D keep SDMA. 
 H2D +1.5%, one-element sync 3.6 to 4.2 us, and compute unchanged (fp16 2048^3 GEMM
 +0.04%, conv and GPU-to-GPU clone unchanged).
 
-Applies on top of the chain up to fmm-keep-userptr-map. It touches the same file as
+Applies on top of the chain up to aql-ring-queue-full-workaround. It touches the same file as
 d2h-staged-copy, d2h-null-dsthost, and pinned-release-system-scope, but different
 functions. Apply with
 patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.sh.
