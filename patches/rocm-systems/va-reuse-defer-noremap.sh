@@ -23,7 +23,7 @@ fi
 
 git -C "$SRC" apply --verbose "$PATCH"
 
-grep -q 'AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &args);' "$FILE" || {
+grep -q '_fmm_unmap_from_gpu(ctx, e->aperture, e->object->start, NULL, 0, e->object);' "$FILE" || {
     echo "FATAL: unmap-before-free marker not found in $FILE after git apply reported success" >&2
     exit 1
 }

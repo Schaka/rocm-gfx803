@@ -51,23 +51,94 @@ WHAT
 Remove the _fmm_map_to_gpu re-map from __fmm_release's park branch, and
 unmap before the BO free in fmm_do_release so an aged-out parked object
 can never leave a stale kernel mapping behind.
+
+2026-09-07 FIX: the unmap-before-free above used the wrong ioctl args
+struct
+-----------------------------------------------------------------------
+A ComfyUI user (RX 580 2048SP, 8 GB) attached a standalone C++/HIP repro
+(no PyTorch) to the same VRAM-retention report this patch's sibling
+fmm-keep-userptr-map.patch was pulled for: hipMalloc + hipFree in a
+loop never returns memory to hipMemGetInfo/mem_info_vram_used, and a
+5-cycle allocate/free workload OOMs by cycle 2. Reproduced as reported
+on the project's gfx803 box.
+
+The "unmap before free" line this patch originally added passed
+`struct kfd_ioctl_free_memory_of_gpu_args args` (8 bytes: one __u64
+handle) to AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, which is macro-sized for
+`struct kfd_ioctl_unmap_memory_from_gpu_args` (24 bytes: handle,
+device_ids_array_ptr, n_devices, n_success -- confirmed against
+/usr/include/linux/kfd_ioctl.h). The kernel's ioctl handler
+(kfd_ioctl_unmap_memory_from_gpu in kfd_chardev.c) reads n_devices from
+past the end of that 8-byte struct; the value found there is either 0
+(handler returns -EINVAL immediately: "Device IDs array empty") or
+uninitialized garbage read as a device-array pointer (copy_from_user
+fails with -EFAULT). Either way the unmap ioctl's return value was not
+even checked, so it silently did nothing. The BO stays GPU-mapped, so
+the FREE_MEMORY_OF_GPU ioctl right after hits
+amdgpu_amdkfd_gpuvm_free_memory_of_gpu's `if (mapped_to_gpu_memory > 0)
+return -EBUSY` (confirmed by reading that function), which
+fmm_do_release only logs via pr_err, not fatal -- so the VA and
+vm_object are released from libhsakmt's own bookkeeping regardless, and
+the kernel-level BO is orphaned until process exit.
+
+The fix uses the existing, correct `_fmm_unmap_from_gpu()` helper
+(same file) instead of hand-rolling the ioctl: it builds the real
+kfd_ioctl_unmap_memory_from_gpu_args from object->mapped_device_id_array
+/ object->mapped_device_id_array_size (populated at the object's
+original map, since the park branch above no longer re-maps it), and
+checks the ioctl's return value per handle.
+
+VERIFIED ON REAL HARDWARE (2026-09-07): debug-instrumented build shows
+every deferred BO now unmaps and frees successfully (ioctl ret 0) where
+the unfixed build never called FREE_MEMORY_OF_GPU with a chance of
+success (confirmed via strace: zero occurrences across the whole repro
+run). This closes a genuine correctness bug in the defer FIFO's own
+drain path.
+
+NOT A FULL FIX for the attached report: rerunning the same repro
+against this fix still ends close to the unfixed baseline (7056 MB
+retained vs. 8080 MB, both out of 8192 MB, still OOMs by cycle 2) even
+though the debug instrumentation confirms essentially all allocated
+bytes (about 8064 of ~8000+ MB requested) drain through fmm_do_release
+successfully over the run. The remaining retention is not explained by
+anything in libhsakmt: it survives a KFD ioctl that reports success, so
+it points at the amdgpu kernel driver's own BO teardown (a lingering
+reference keeping the BO's refcount off zero, or reclaim genuinely
+lagging behind an allocate/free workload that gives the GPU no idle
+time) rather than at this file. That part is still open.
+
 diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
 --- a/projects/rocr-runtime/libhsakmt/src/fmm.c
 +++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
-@@ -1021,6 +1021,12 @@
+@@ -209,6 +209,10 @@ static const manageable_aperture_ops_t mmap_aperture_ops = {
+ };
+
+ static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object);
++static int _fmm_unmap_from_gpu(HsaKFDContext *ctx,
++		manageable_aperture_t *aperture, void *address,
++		uint32_t *device_ids_array, uint32_t device_ids_array_size,
++		vm_object_t *obj);
+ static HSAKMT_STATUS _fmm_map_to_gpu(HsaKFDContext *ctx,
+ 			manageable_aperture_t *aperture,
+ 			void *address, uint64_t size, vm_object_t *obj,
+@@ -1009,6 +1013,16 @@ static void fmm_do_release(HsaKFDContext *ctx, struct deferred_release *e)
+ 	struct kfd_ioctl_free_memory_of_gpu_args args = {0};
+ 	uint32_t i;
+
++	/* The defer window keeps the object mapped from allocation time (the
++	 * park branch below no longer re-maps it, so this is its original,
++	 * still-live mapping). free_memory_of_gpu refuses a mapped BO with
++	 * EBUSY, so unmap first -- through the existing _fmm_unmap_from_gpu
++	 * helper, which builds the real kfd_ioctl_unmap_memory_from_gpu_args
++	 * (handle plus object->mapped_device_id_array) that
++	 * AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU is macro-sized for.
++	 */
++	_fmm_unmap_from_gpu(ctx, e->aperture, e->object->start, NULL, 0, e->object);
++
+ 	for (i = 0; i < e->object->handle_num; i++) {
  		args.handle = e->object->handles[i];
  		if (!args.handle)
- 			continue;
-+		/* The defer window re-maps the object, so the kernel still
-+		 * considers it mapped; free_memory_of_gpu refuses a mapped BO
-+		 * with EBUSY, which would leak the mapping and make the next
-+		 * allocation at this VA collide. Unmap first, then free.
-+		 */
-+		hsakmt_ioctl(ctx->fd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &args);
- 		if (hsakmt_ioctl(ctx->fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU,
- 				 &args))
- 			pr_err("fmm: deferred BO free failed (%d) for obj at %p\n",
-@@ -2441,9 +2447,6 @@
+@@ -2433,9 +2447,6 @@ static int __fmm_release(HsaKFDContext *ctx,
  		 * fault. fmm_do_release() tears the mapping down for real when
  		 * the object ages out of the window.
  		 */
@@ -76,4 +147,4 @@ diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/l
 -					object->size, object, NULL, 0);
  		fmm_defer_release(ctx, aperture, object);
  	}
- 
+
