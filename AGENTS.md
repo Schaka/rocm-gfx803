@@ -80,29 +80,27 @@ about how the pipeline works, that is a docs change, not a comment.
 
 ### Docs and patch headers describe the bug and the fix, never the debugging session.
 
-A patch header, a `README.md` section, or any other doc exists to answer two
-questions for a reader with zero memory of how you got there: why does this
-code exist (what breaks without it, stated plainly, e.g. "without this patch,
-VRAM is never freed until the process exits"), and what does the fix actually
-do. Include how to reproduce the bug when that is what makes the fix
-verifiable. That is the whole job.
+A patch header, a `README.md` section, or any other doc does one job. It
+tells a reader with no memory of the work why the code exists and what the
+fix does. State plainly what breaks without the patch. For example, without
+this patch the driver never frees VRAM until the process exits. When
+reproducing the bug helps verify the fix, include the steps to reproduce it.
 
-It is never a log of the investigation. Do not write "initially this looked
-like X", "CORRECTION: testing this against Y showed Z", or a dated "later
-that day we found...". Do not frame the explanation around a specific person's
-bug report ("a ComfyUI user reported...", "issue #2's second comment
-attached...") as the thing being fixed; a report is what triggered the work,
-not what the fix is for. Describe the bug and the fix on their own terms, the
-same way you would if you had found the bug yourself with no report at all. A
-report's URL is fine as a citation, not as the spine of the explanation.
+A doc never logs the investigation. Do not write "initially this looked
+like X" or "CORRECTION: testing this against Y showed Z" or a dated "later
+that day we found...". Do not frame the explanation around one person's bug
+report, such as "a ComfyUI user reported" or "issue #2's second comment
+attached this repro". A report only triggered the work, not what the fix
+targets. Describe the bug and the fix on their own terms, as if you found
+the bug yourself with no report at all. A report's URL can appear as a
+citation, never as the spine of the explanation.
 
-Rewrite a doc in place instead of appending a dated correction to it. If a
-doc says one thing today and testing shows that was wrong or incomplete
-tomorrow, tomorrow's edit replaces the wrong text so the doc always reads as
-one coherent, current explanation. Never leave both the old and the new
-account standing so a reader has to reconcile them. `git log` and `git
-blame` already hold every version that ever existed; that is what makes a
-history log there and not in the doc itself safe to overwrite.
+When a doc turns out wrong or incomplete, rewrite it in place instead of
+appending a correction. Replace the wrong text so the doc reads as one
+coherent, current explanation. Never leave the old account standing next to
+the new one for a reader to reconcile. `git log` and `git blame` already
+hold every past version. That history is what makes overwriting the doc's
+own text safe.
 
 ## Why this repo exists, and what that means for your work
 
