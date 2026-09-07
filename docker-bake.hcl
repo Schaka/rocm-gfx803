@@ -43,6 +43,7 @@ variable "PACKAGES" {
     torchvision = "rocm-torchvision-builder"
     torchaudio  = "rocm-torchaudio-builder"
     ort         = "rocm-migraphx-ort-builder"
+    triton      = "rocm-triton-builder"
     final       = "rocm-migraphx-ort-torch-builder"
   }
 }
@@ -124,6 +125,16 @@ variable "TORCHAUDIO_SHA"  { default = "" }
 variable "ORT_VERSION" { default = "v1.29.0" }
 variable "ORT_SHA"     { default = "" }
 
+# Pinned to an exact commit, not a branch: triton has no release branch that
+# tracks a given PyTorch version, and PyTorch itself pins triton to one exact
+# commit per release for the same reason rocBLAS and MIOpen were pinned to a
+# commit before the rocm-libraries monorepo restructure -- inductor's compiled
+# extension API has to match exactly, not "close enough". This value is
+# ROCm/pytorch release/2.14's own triton pin
+# (.ci/docker/ci_commit_pins/triton.txt); bump it only together with
+# PYTORCH_REF, to whatever that file names for the new ref.
+variable "TRITON_REF" { default = "675c59878aa2280b31f722aaf42b825fcee21de8" }
+
 # "auto" sizes the compile job count from MemAvailable. See
 # scripts/lib/build-jobs.sh.
 variable "BUILD_PARALLEL_LEVEL" { default = "auto" }
@@ -156,6 +167,7 @@ variable "WITH_PYTORCH_IMAGE"     { default = "false" }
 variable "WITH_TORCHVISION_IMAGE" { default = "false" }
 variable "WITH_TORCHAUDIO_IMAGE"  { default = "false" }
 variable "WITH_ORT_IMAGE"         { default = "false" }
+variable "WITH_TRITON_IMAGE"      { default = "false" }
 
 # ---------------------------------------------------------------------------
 # Derived values
@@ -228,6 +240,7 @@ target "pins" {
     TORCHVISION_REF    = TORCHVISION_REF
     TORCHAUDIO_REF     = TORCHAUDIO_REF
     ORT_VERSION        = ORT_VERSION
+    TRITON_REF         = TRITON_REF
   }
 }
 
@@ -433,6 +446,30 @@ target "ort" {
   cache-to   = cache_to("ort")
 }
 
+# Independent of every other target: it links no ROCm library at build time, so
+# it takes only python-base, not rocblas/miopen/migraphx. The wheel it produces
+# resolves libamdhip64 and libhsa-runtime64 by dlopen at runtime, against
+# whatever the final image provides.
+#
+# Inherits _common, not _stamped: it carries no /opt/rocm tree forward (see
+# docker/triton.Dockerfile), so it declares none of _stamped's three ARGs, and
+# passing them anyway would be exactly the unconsumed-build-arg noise the
+# _common comment above warns about. labels() still applies directly, since
+# image labels are a bake-level annotation, not a Dockerfile ARG.
+target "triton" {
+  inherits   = ["_common"]
+  dockerfile = "docker/triton.Dockerfile"
+  contexts   = { python-base = "target:python-base" }
+  args = {
+    TRITON_REF           = TRITON_REF
+    BUILD_PARALLEL_LEVEL = BUILD_PARALLEL_LEVEL
+  }
+  labels     = labels("triton")
+  tags       = [image("triton")]
+  cache-from = cache_from("triton")
+  cache-to   = cache_to("triton")
+}
+
 # No cache in either direction. Nothing builds from the final image, so its cache
 # has no consumer, and every expensive component arrives prebuilt. Exporting
 # anyway costs a second compressed copy of every layer, written to the same
@@ -451,6 +488,7 @@ target "final" {
     torchvision = ctx("torchvision", WITH_TORCHVISION_IMAGE)
     torchaudio  = ctx("torchaudio", WITH_TORCHAUDIO_IMAGE)
     ort         = ctx("ort", WITH_ORT_IMAGE)
+    triton      = ctx("triton", WITH_TRITON_IMAGE)
   }
   labels = labels("final")
   tags = concat(

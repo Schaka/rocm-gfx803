@@ -18,6 +18,10 @@ diff or the local build. Then they decide. This rule also covers
 `gh workflow run`. Starting a remote run without being asked is the same
 violation as a push.
 
+On the one commit the user does ask for, write it as a human alone wrote it.
+Never add a `Co-Authored-By: Claude ...` trailer or any other AI-attribution
+line, in this repo or any other.
+
 ### Fix at the source. Do not use workarounds.
 
 Fix a gfx803 bug where the bug lives. That can be the broken Tensile logic, the

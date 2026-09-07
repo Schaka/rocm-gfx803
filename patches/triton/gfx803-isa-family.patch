@@ -1,40 +1,77 @@
-diff --git a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
-index a689fe438..f30b62643 100644
---- a/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
-+++ b/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h
-@@ -8,6 +8,7 @@ namespace mlir::triton::AMD {
- // A list of ISA families we care about.
+gfx803 (Polaris, GCN3): wire the ISA family up so triton's AMD backend does
+not hard-reject the target.
+
+WHY
+---
+Triton's AMD backend rejects any arch whose ISA family is Unknown
+(TritonGPUToLLVM.cpp, ConvertWarpPipeline.cpp). gfx803 is pre-RDNA/pre-CDNA
+GCN, so `TargetFeatures::getISAFamily()` fell through every branch and
+returned Unknown. Verified on real RX 470 hardware (2026-08-21): with this
+patch, an add kernel and tl.dot GEMMs (3 shapes) compile, load and run with
+exact results (maxerr=0.0000). See patches/triton/README.md for the full
+verification record.
+
+RE-DIFF (2026-09-07)
+---------------------
+Re-diffed against triton-lang/triton @ 675c59878 (the exact commit
+ROCm/pytorch release/2.14 pins triton to). The original 2026-08-21 patch
+targeted third_party/amd/{include,lib}/TritonAMDGPUToLLVM/TargetUtils.{h,cpp},
+a free-function `deduceISAFamily()` plus a bare `ISAFamily` enum. Upstream
+since folded both into a `TargetFeatures` class at
+third_party/amd/{include,lib}/Dialect/TritonAMDGPU/IR/TargetFeatures.{h,cpp}:
+`getISAFamily()` is now a method that parses the gfx number directly (no
+LLVM target-parser dependency), and `getWarpSize()` is a method on the same
+class rather than a call site in TargetInfo.cpp. The fix is unchanged in
+substance: gfx8xx has no branch in the family switch, so it falls through to
+Unknown, and gfx8xx is wave64 the same way every CDNA family here is.
+
+WHAT
+----
+1. TargetFeatures.h: adds `GCN3` to the `ISAFamily` enum.
+2. TargetFeatures.cpp: `getISAFamily()` maps every `gfx8xx` arch (major == 8)
+   to `GCN3` -- Polaris and its siblings share one feature set, the same way
+   the CDNA and RDNA blocks below group their own generations.
+3. TargetFeatures.cpp: `getWarpSize()` returns 64 for `GCN3` (wave64).
+   Without this the default 32 is used and kernels run half-dead.
+
+`isCDNA()`/`isRDNA()` already default to false for any family their own
+switches do not name, so GCN3 needs no entry there, and `supportDppBroadcast()`
+is handled by the sibling gfx803-dpp-broadcast-warpreduce.patch, applied after
+this one (its context assumes `ISAFamily::GCN3` already exists).
+
+--- a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h
++++ b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h
+@@ -11,6 +11,7 @@ namespace mlir::triton::amdgpu {
+
  enum class ISAFamily {
    Unknown,
 +  GCN3,
+   GCN5_1,
    CDNA1,
    CDNA2,
-   CDNA3,
-diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
-index 61bba58f1..2c20dd182 100644
---- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
-+++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp
-@@ -71,6 +71,7 @@ llvm::AMDGPU::GPUKind TargetInfo::getGPUKind() const {
- 
- int TargetInfo::getWarpSize() const {
-   switch (getISAFamily()) {
-+  case ISAFamily::GCN3:
-   case ISAFamily::CDNA1:
-   case ISAFamily::CDNA2:
-   case ISAFamily::CDNA3:
-diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
-index b79841ab5..e63f6ac67 100644
---- a/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
-+++ b/third_party/amd/lib/TritonAMDGPUToLLVM/TargetUtils.cpp
-@@ -12,6 +12,11 @@ ISAFamily deduceISAFamily(llvm::StringRef arch) {
-   if (kind == llvm::AMDGPU::GK_GFX1250)
+diff --git a/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp b/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
+index 87ce862..b5b43df 100644
+--- a/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
++++ b/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
+@@ -71,6 +71,13 @@ ISAFamily TargetFeatures::getISAFamily() const {
+   if (major == 12 && minor == 5)
      return ISAFamily::GFX1250;
- 
-+  // GCN ISA cases (pre-CDNA, pre-RDNA): GCN3 (gfx801-803) and GCN4 (gfx804/805)
-+  // are all wave64, no v_dot, no MFMA. Group them as GCN3 for feature purposes.
-+  if (kind >= llvm::AMDGPU::GK_GFX801 && kind <= llvm::AMDGPU::GK_GFX810)
+
++  // GCN3/GCN4 ISA case: pre-CDNA/pre-RDNA GCN (e.g. gfx803 Polaris). Grouped as
++  // one family the way the RDNA and CDNA blocks below group their own
++  // generations, since every gfx8xx target shares the same wave64, no-MFMA,
++  // no-v_dot feature set that the rest of this file gates on.
++  if (major == 8)
 +    return ISAFamily::GCN3;
 +
-   // CDNA ISA cases
-   switch (kind) {
-   case llvm::AMDGPU::GK_GFX950:
+   // CDNA ISA cases.
+   if (major == 9) {
+     if (minor == 5 && patch == 0)
+@@ -120,6 +127,7 @@ bool TargetFeatures::isGFX1250() const {
+
+ int TargetFeatures::getWarpSize() const {
+   switch (getISAFamily()) {
++  case ISAFamily::GCN3:
+   case ISAFamily::GCN5_1:
+   case ISAFamily::CDNA1:
+   case ISAFamily::CDNA2:

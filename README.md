@@ -49,7 +49,12 @@ hardware-tested. The ROCm 10.0 stack on the test box runs rocBLAS, MIOpen,
 MIGraphX, PyTorch, ORT, and the vLLM fork on a real card. The torch correctness
 suite gives 202/202 PASS with the current patch set on the box stack. Inside the
 image the same suite reports 118 PASS, 0 BAD, 0 NONFINITE and 84 ERRORs that are
-all `/ INDUCTOR`, because the image ships no Triton. The full image builds end to
+all `/ INDUCTOR`. That run predates Triton in the image. The image now ships
+Triton. Its own JIT-compile and GEMM checks passed on the real card
+(`patches/triton/README.md`). A fresh run of the torch suite against the
+current image is the next step. It will show how many of those 84 errors
+clear.
+The full image builds end to
 end, and `tools/imgvalidate.sh` runs that whole gate against the image itself on
 the card: its `libamdhip64` and its `librocsolver.so.0` (13 of 13 `torch.linalg`
 routines within 1.0e-5 of CPU) are the shipped binaries, not a hand-built pair

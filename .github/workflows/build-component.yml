@@ -55,6 +55,10 @@ on:
         required: false
         type: boolean
         default: false
+      with-triton-image:
+        required: false
+        type: boolean
+        default: false
       pytorch-ref:
         description: 'Override PYTORCH_REF. Empty keeps the docker-bake.hcl default.'
         required: false
@@ -124,6 +128,7 @@ jobs:
           WITH_TORCHVISION_IMAGE: ${{ inputs.with-torchvision-image }}
           WITH_TORCHAUDIO_IMAGE: ${{ inputs.with-torchaudio-image }}
           WITH_ORT_IMAGE: ${{ inputs.with-ort-image }}
+          WITH_TRITON_IMAGE: ${{ inputs.with-triton-image }}
           PYTORCH_REF_IN: ${{ inputs.pytorch-ref }}
           TORCHVISION_REF_IN: ${{ inputs.torchvision-ref }}
           TORCHAUDIO_REF_IN: ${{ inputs.torchaudio-ref }}

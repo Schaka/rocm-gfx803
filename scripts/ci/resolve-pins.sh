@@ -82,5 +82,15 @@ TORCHAUDIO_REF     TORCHAUDIO_SHA     https://github.com/ROCm/audio.git
 ORT_VERSION        ORT_SHA            https://github.com/microsoft/onnxruntime.git
 PINS
 
+# TRITON_REF takes no _SHA counterpart: docker-bake.hcl already pins it to an
+# exact commit (triton has no release branch to resolve), so triton.Dockerfile
+# never declares a TRITON_SHA ARG. Record it in the same summary anyway, so a
+# final image's marker names every source it was built from.
+_triton_ref="$(_bake_arg TRITON_REF)"
+if [ -n "$_triton_ref" ]; then
+    GFX803_PINS="$GFX803_PINS TRITON_REF=$_triton_ref"
+    echo "pin: TRITON_REF=$_triton_ref (already an exact commit)"
+fi
+
 export GFX803_PINS="${GFX803_PINS# }"
 rm -f "$_pins_graph"

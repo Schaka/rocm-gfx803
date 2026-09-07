@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # The published gfx803 runtime image: a ROCm 10.0 tree with every gfx803 fix in
-# it, plus a Python 3.12 venv holding torch, torchvision, torchaudio and ORT.
+# it, plus a Python 3.12 venv holding torch, torchvision, torchaudio, ORT and
+# triton.
 #
 # This target compiles nothing. Every component arrives as a prebuilt image, so
 # the only failure mode left is a wrongly wired input, and scripts/build/
@@ -66,6 +67,7 @@ COPY --from=ort /onnxruntime/dist/*.whl /tmp/ort/
 COPY --from=pytorch /wheels/*.whl /tmp/torch/
 COPY --from=torchvision /wheels/*.whl /tmp/torch/
 COPY --from=torchaudio /wheels/*.whl /tmp/torch/
+COPY --from=triton /wheels/*.whl /tmp/triton/
 
 RUN --mount=type=bind,source=scripts/build/final-wheels.sh,target=/scripts/build/final-wheels.sh \
     /scripts/build/final-wheels.sh

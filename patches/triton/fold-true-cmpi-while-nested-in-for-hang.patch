@@ -92,9 +92,19 @@ VERIFICATION (real gfx803 hardware, RX 470, 2026-08-23)
   (no pytorch-fallback stopgap): coherent output, clean shutdown, GPU
   idle afterward.
 
+RE-DIFF (2026-09-07)
+---------------------
+Re-diffed against triton-lang/triton @ 675c59878. `FoldTrueCmpIOp::
+matchAndRewrite` no longer calls `cmpIIsStaticallyTrue` and
+`maybeReplaceWithConstant` directly; both were folded into one
+`evaluateCmpI(*solver, cmpOp)` helper returning `std::optional<bool>`. The
+fix's substance and placement (an early `return failure()` guard ahead of
+the existing fold logic) are unchanged; only the call it guards changed
+name.
+
 --- a/third_party/amd/lib/Analysis/RangeAnalysis.cpp
 +++ b/third_party/amd/lib/Analysis/RangeAnalysis.cpp
-@@ -799,8 +799,35 @@ struct FoldTrueCmpIOp : OpRewritePattern<arith::CmpIOp> {
+@@ -814,8 +814,35 @@ struct FoldTrueCmpIOp : OpRewritePattern<arith::CmpIOp> {
    FoldTrueCmpIOp(MLIRContext *context, DataFlowSolver *solver)
        : OpRewritePattern(context), solver(solver) {};
 
@@ -127,6 +137,6 @@ VERIFICATION (real gfx803 hardware, RX 470, 2026-08-23)
                                  PatternRewriter &rewriter) const override {
 +    if (isOwnWhileConditionOperand(cmpOp))
 +      return failure();
-     if (llvm::isa<IntegerType, IndexType>(cmpOp.getType()) &&
-         cmpIIsStaticallyTrue(*solver, cmpOp)) {
-       if (failed(mlir::dataflow::maybeReplaceWithConstant(*solver, rewriter,
+     auto result = evaluateCmpI(*solver, cmpOp);
+     if (!result)
+       return failure();
