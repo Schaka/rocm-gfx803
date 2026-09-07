@@ -410,3 +410,15 @@ winograd bug in the first place (C=64, K=24) records **zero** takeovers into the
 GEMM route on either shim build. So the Winograd solvers keep their results inside their
 own transform kernels and share no path with the SGEMM shim; `winograd-fused-conv-
 miscompute.patch` needed no change, and the measurements quoted in its header stand.
+
+## 2026-09-07: fmm-keep-userptr-map.patch pulled from the 10.0 build
+
+A ComfyUI bug report came from gfx803 hardware (8 GB RX 580 2048SP). PyTorch released VRAM did not return to the driver's free pool until process exit. The project reproduced this on its own box.
+
+The test was: load one large checkpoint, then load a different one, then POST /free to ComfyUI. PyTorch's own tracked pool dropped to near zero. The `mem_info_vram_used` counter stayed at 8.02 GB out of 8 GB. A bisect found `patches/rocm-systems/fmm-keep-userptr-map.patch` as the cause.
+
+This is a 10.0-only patch. Its own FIX section says the VA range it touches "remains mapped until process exit" by design. The purpose is to avoid a `VM_CONTEXT1_PROTECTION_FAULT` GPU wedge. When reversed, the identical load/load/free sequence ended at 2.94 GB.
+
+Before removing it, the team re-verified the original crash was absent on the current stack using three methods. First: a 200-iteration raw torch churn loop (the patch's own claim was "100% of runs" within 25s). Second: 5x ComfyUI checkpoint load/unload cycles. Third: a full sd1.5 txt2img generation. All three came back clean, zero faults in dmesg.
+
+This does not prove the original race is gone for good. It only proves the crash was not reproduced against the current pinned source. The VRAM-retention cost reproduced immediately. `scripts/build/rocr-clr.sh` no longer applies this patch. The patch file carries the full writeup, the re-verification steps, and a proposed narrower fix. Bind the deferred release the same way `va-reuse-defer.patch` already binds its own FIFO. Do this instead of never releasing the VA. If the crash resurfaces, apply this narrower fix.

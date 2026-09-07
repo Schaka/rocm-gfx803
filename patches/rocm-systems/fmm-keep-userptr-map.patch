@@ -1,6 +1,87 @@
 libhsakmt (fmm): never drop the CPU mapping of a released host-VA range
 (gfx803, ROCm 10.0)
 
+NOT APPLIED as of 2026-09-07. scripts/build/rocr-clr.sh no longer includes
+this patch in its apply list. Kept in the tree, unwired, for the reasons
+below.
+
+WHY THIS WAS PULLED
+--------------------
+A ComfyUI user (RX 580 2048SP, 8 GB) reported VRAM that PyTorch's own
+allocator had released was not returned to the driver's free pool until
+the whole process exited: loading one large checkpoint, then a second
+different checkpoint, then explicitly asking ComfyUI to free everything
+(POST /free with unload_models and free_memory) left the amdgpu driver's
+own counter (mem_info_vram_used) unmoved even though PyTorch's tracked
+pool (torch_vram_total) dropped to near zero. That is exactly what this
+patch's FIX section promises: "The VA range remains mapped ... until
+process exit." Reproduced on the project's own gfx803 box (2026-09-07):
+loading Anima (a Cosmos-Predict2 video model) then a stock SD1.5
+checkpoint through ComfyUI, then POSTing /free, left mem_info_vram_used
+at 8.02 GB out of 8 GB total. With this one patch reversed and nothing
+else changed, the identical sequence ended at 2.94 GB. The gap is not
+explained by va-reuse-defer's FIFO (FMM_REUSE_QUEUE_MAX=256 entries /
+FMM_REUSE_BYTES_MAX=1GiB, present on both the 7.14 and 10.0 lines
+identically) -- this patch is the one line, 10.0-only, that removes a
+release path entirely rather than bounding it.
+
+Before pulling the patch, its own original crash was re-verified absent
+on the current stack, using the same three methods its own VERIFIED
+section names: a raw torch churn loop (safetensors.get_tensor() + .to
+("cuda", non_blocking=True) with no sync between transfers, run 200
+iterations over all 1145 tensors of v1-5-pruned-emaonly.safetensors --
+the original claim was "~2 faults per 25s pass, 100% of runs", so 200
+clean iterations is roughly 8x that threshold with zero
+VM_CONTEXT1_PROTECTION_FAULT hits in dmesg); 5x ComfyUI checkpoint
+load/unload cycles (POST /prompt loading the SD1.5 checkpoint, POST /free,
+repeated 5 times); and one full sd1.5 txt2img generation (6 steps,
+KSampler -> VAEDecode -> SaveImage) that completed successfully end to
+end. All three passed clean on 2026-09-07, kernel 7.1.8, with every other
+gfx803 patch on the 10.0 line still applied. This does not prove the
+original race is gone for good -- kernel and amdgpu driver updates since
+the patch was written could have closed the specific window it worked
+around, or the repro could need a condition this session didn't hit. It
+does mean the patch's crash could not be reproduced against the current
+pinned source, while its cost (unbounded VRAM retention) reproduced
+immediately and consistently.
+
+HOW TO RE-VERIFY OR REWRITE THIS
+---------------------------------
+To check whether the original crash is back: run the raw torch churn loop
+above (a minimal script is not committed; rebuild it from the WHY section's
+description -- open any sd1.5-class safetensors checkpoint, get_tensor()
+every key to CPU once, then loop calling .to("cuda", non_blocking=True) on
+each tensor with no synchronize() between transfers, for at least 200
+iterations) against a build with this patch NOT applied, and watch dmesg
+for VM_CONTEXT1_PROTECTION_FAULT / "Failed to quiesce KFD" / GPU resets.
+To check the VRAM-release regression this patch causes if reapplied: load
+two different large checkpoints back to back through ComfyUI, POST /free,
+and compare /sys/class/drm/card*/device/mem_info_vram_used before and
+after -- with the patch applied it will not drop; without it, it should.
+
+If the crash reproduces again on some future kernel/driver/GPU
+combination, the fix is not to reapply this patch as-is. The correct
+shape is narrower: track, per released host-VA range, whether a KFD
+userptr registration (hsaKmtRegisterMemory* / hsa_amd_memory_lock) is
+still outstanding at release time. When it is not, do the original
+munmap()+mmap(PROT_NONE) immediately, exactly as upstream and exactly as
+this patch currently forbids unconditionally -- that is the common case
+and it is what returns VRAM promptly. When a registration is still
+outstanding, defer the real munmap()+reprotect through the same bounded
+FIFO va-reuse-defer.patch already added to this same file
+(FMM_REUSE_QUEUE_MAX / FMM_REUSE_BYTES_MAX, drained at the same GPU-busy
+flush points), with the real teardown firing either when
+hsaKmtDeregisterMemoryCtx explicitly clears the lock for that VA or when
+the entry ages out of the FIFO, whichever comes first. That keeps the
+crash fixed with the same bounded worst case (about 1 GB held past its
+natural free point) the codebase already relies on elsewhere, instead of
+an unbounded hold for the life of the process. Any rewrite along these
+lines must re-pass both verification methods above -- the crash repro AND
+the VRAM-release check -- before it ships.
+
+ORIGINAL PATCH BELOW
+---------------------
+
 WHY
 ---
 `reserved_aperture_release()` in projects/rocr-runtime/libhsakmt/src/fmm.c
