@@ -182,6 +182,56 @@ These steps worked many times in this repo's history.
   level tooling (host-setup, correctness-suite) rather than version-specific
   code, so it lives once at the root and every line uses it from there.
 
+## Runner disk budget for the final stage
+
+The `final` bake target has failed on the hosted runner's disk more than once.
+Each time, this happened right after a new from-source component was wired
+into it: first rocsolver, then triton. The failure looks like a caching bug at
+first. `docker buildx bake --push` dies partway through `final-wheels.sh` with
+`No space left on device`. `scripts/lib/bake-retry.sh`'s 429 retry loop used to
+retry this failure five times anyway. That burned up to forty minutes to fail
+the same way each time. `bake_push_with_retry` now recognizes this error and
+stops after the first attempt.
+
+Read the actual CI log's byte counts before you assume a cache problem. Run
+`gh run view --job=<id> --log` on a `final` job. It shows every layer pull with
+its size. Check `df -h / /mnt` right after the "Free disk space" step. It
+shows what the runner actually had to work with.
+
+The real cause each time was the same: `final.Dockerfile` pulls more than it
+reads. A `COPY --from=<component> ...` instruction needs that component's
+entire published image on disk before it can copy even one file out of it. A
+component image that carries its whole build environment costs the runner
+that component's full size. Examples of such an environment: a compiled ROCm
+SDK copy, a git checkout with submodules, a build tree, or (for triton) a
+from-source LLVM/MLIR build. This cost applies even when `final` reads only
+one small directory from that image.
+
+`docker-bake.hcl`'s `wheels_image()` and `wheels_ctx()` functions fix this for
+the five components it hit: pytorch, torchvision, torchaudio, ort, and triton.
+Each of these publishes a second, trimmed image. That image comes from a
+`FROM scratch AS wheels` stage in the component's own Dockerfile. The stage
+copies out only what `final` reads: `/wheels`, or `/onnxruntime/dist` for ort.
+Bake tags this image `<image>-wheels`. It builds in the same `docker buildx
+bake --push` invocation as the full image, so the shared `builder` stage does
+not compile twice. See `scripts/build/...` for where each component writes
+its wheel. See the `targets=` case in
+`.github/workflows/build-component.yml` for which components get the extra
+tag. `final`'s own contexts pull the `-wheels` tag for all five. migraphx,
+rocr-clr, miopen, and rocsolver still publish only their normal image. `final`
+reads a large fraction of migraphx's `/opt/rocm`. The other three already
+publish an image close in size to what `final` copies out of it.
+
+Apply the same rule when you wire a sixth from-source component into `final`
+the way triton was wired in. Before you add a `COPY --from=<new-component>` in
+final.Dockerfile, check the new component's Dockerfile for a build
+environment beyond what `final` actually reads: a git checkout, a compiled
+toolchain, an LLVM build, or apt build tools. If you find one, give that
+component the same `FROM scratch AS wheels` split and a matching
+`wheels_image()`/`wheels_ctx()` pair. Do this before you wire the component
+into `final`. Do not wire in the full image first and find out on a hosted
+runner that it does not fit.
+
 ## Component pins: branches, not commit SHAs, and no nightlies
 
 Every upstream component that this repo builds from source is pinned to a named

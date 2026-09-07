@@ -14,7 +14,13 @@
 # only ROCm C headers it vendors itself, and it resolves libamdhip64 and
 # libhsa-runtime64 by dlopen at runtime, against whatever the final image
 # provides.
-FROM python-base
+#
+# Named "builder": final only ever takes /wheels/*.whl from it (see the "wheels"
+# stage below). Everything else here -- apt build tools and, above all, the
+# self-built LLVM/MLIR tree triton.sh compiles from source -- exists only to
+# produce that one wheel and is easily this component's largest published
+# content otherwise.
+FROM python-base AS builder
 
 ARG TRITON_REF
 ARG BUILD_PARALLEL_LEVEL
@@ -45,3 +51,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-triton-llvm \
     --mount=type=bind,source=scripts/build/triton.sh,target=/scripts/build/triton.sh \
     --mount=type=bind,source=patches/triton,target=/patches/triton \
     /scripts/build/triton.sh
+
+# See pytorch.Dockerfile's own "wheels" stage for why this split exists.
+FROM scratch AS wheels
+COPY --from=builder /wheels /wheels

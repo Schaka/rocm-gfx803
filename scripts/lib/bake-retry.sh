@@ -6,15 +6,34 @@
 # on its own, and pulling from a shared repository credential under load is a
 # short burst against ghcr.io's rate limiter rather than a quota. The 429 body's
 # retry-after is under a second, so a few backoff retries clear it.
+#
+# A runner that is out of disk space will still be out of disk space five
+# retries and forty minutes later -- nothing here frees any, and BuildKit was
+# seen re-running (not serving from cache) the same multi-minute COPY on every
+# attempt, so a retry loop on this failure only burns CI time to fail the same
+# way each time. Recognized once and failed fast instead. If the runner is
+# genuinely this tight on space, the fix belongs in docker-bake.hcl or
+# AGENTS.md's "Runner disk budget for the final stage", not in a longer retry
+# loop here.
 bake_push_with_retry() {
     _attempt=1
     _max_attempts=5
     _delay=5
+    _log="$(mktemp)"
     while true; do
-        if docker buildx bake --push "$@"; then
+        docker buildx bake --push "$@" 2>&1 | tee "$_log"
+        _status="${PIPESTATUS[0]}"
+        if [ "$_status" -eq 0 ]; then
+            rm -f "$_log"
             return 0
         fi
+        if grep -qi "no space left on device" "$_log"; then
+            echo "::error::bake --push $* failed on disk space, not retrying -- see AGENTS.md's \"Runner disk budget for the final stage\"" >&2
+            rm -f "$_log"
+            return 1
+        fi
         if [ "$_attempt" -ge "$_max_attempts" ]; then
+            rm -f "$_log"
             return 1
         fi
         echo "::warning::bake --push $* failed (attempt $_attempt/$_max_attempts), retrying in ${_delay}s" >&2

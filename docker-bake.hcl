@@ -188,6 +188,21 @@ function "cache_ref" {
   result = "${pkg(component)}:cache-${ROCM_ARCH}-${LINE}"
 }
 
+# pytorch, torchvision, torchaudio, ort and triton each carry a full build
+# environment (a compiled ROCm SDK copy, a git checkout, a build tree, an LLVM
+# build for triton) that final never reads -- it takes only the wheel(s) each one
+# produces. Publishing that wheel alone under its own tag, from a `FROM scratch`
+# stage named "wheels" in that component's own Dockerfile, is what final actually
+# pulls; the plain image(component) tag above still publishes the full stage,
+# because torchvision and torchaudio build against pytorch's full one. This is
+# the fix for final running the runner disk out of space every time a new
+# from-source component (most recently triton) is wired into it: see the
+# "Runner disk budget for the final stage" section in AGENTS.md.
+function "wheels_image" {
+  params = [component]
+  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}-wheels"
+}
+
 function "cache_from" {
   params = [component]
   result = REGISTRY_CACHE == "true" && NO_CACHE != "true" ? ["type=registry,ref=${cache_ref(component)}"] : []
@@ -206,6 +221,14 @@ function "cache_to" {
 function "ctx" {
   params = [component, use_image]
   result = use_image == "true" ? "docker-image://${image(component)}" : "target:${component}"
+}
+
+# Same as ctx(), but resolves to the trimmed "<component>-wheels" bake target /
+# wheels_image() tag instead of the full one. Used only by final's own contexts
+# for the five components that have a "wheels" stage.
+function "wheels_ctx" {
+  params = [component, use_image]
+  result = use_image == "true" ? "docker-image://${wheels_image(component)}" : "target:${component}-wheels"
 }
 
 function "labels" {
@@ -381,6 +404,7 @@ target "migraphx" {
 target "pytorch" {
   inherits   = ["_stamped"]
   dockerfile = "docker/pytorch.Dockerfile"
+  target     = "builder"
   contexts = {
     python-base = "target:python-base"
     migraphx    = ctx("migraphx", WITH_MIGRAPHX_IMAGE)
@@ -398,9 +422,19 @@ target "pytorch" {
   cache-to   = cache_to("pytorch")
 }
 
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "pytorch-wheels" {
+  inherits   = ["pytorch"]
+  target     = "wheels"
+  tags       = [wheels_image("pytorch")]
+  cache-from = []
+  cache-to   = []
+}
+
 target "torchvision" {
   inherits   = ["_stamped"]
   dockerfile = "docker/torchvision.Dockerfile"
+  target     = "builder"
   contexts   = { pytorch = ctx("pytorch", WITH_PYTORCH_IMAGE) }
   args = {
     ROCM_ARCH       = ROCM_ARCH
@@ -413,9 +447,19 @@ target "torchvision" {
   cache-to   = cache_to("torchvision")
 }
 
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "torchvision-wheels" {
+  inherits   = ["torchvision"]
+  target     = "wheels"
+  tags       = [wheels_image("torchvision")]
+  cache-from = []
+  cache-to   = []
+}
+
 target "torchaudio" {
   inherits   = ["_stamped"]
   dockerfile = "docker/torchaudio.Dockerfile"
+  target     = "builder"
   contexts   = { pytorch = ctx("pytorch", WITH_PYTORCH_IMAGE) }
   args = {
     ROCM_ARCH      = ROCM_ARCH
@@ -428,9 +472,19 @@ target "torchaudio" {
   cache-to   = cache_to("torchaudio")
 }
 
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "torchaudio-wheels" {
+  inherits   = ["torchaudio"]
+  target     = "wheels"
+  tags       = [wheels_image("torchaudio")]
+  cache-from = []
+  cache-to   = []
+}
+
 target "ort" {
   inherits   = ["_stamped"]
   dockerfile = "docker/ort.Dockerfile"
+  target     = "builder"
   contexts = {
     python-base = "target:python-base"
     migraphx    = ctx("migraphx", WITH_MIGRAPHX_IMAGE)
@@ -446,6 +500,15 @@ target "ort" {
   cache-to   = cache_to("ort")
 }
 
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "ort-wheels" {
+  inherits   = ["ort"]
+  target     = "wheels"
+  tags       = [wheels_image("ort")]
+  cache-from = []
+  cache-to   = []
+}
+
 # Independent of every other target: it links no ROCm library at build time, so
 # it takes only python-base, not rocblas/miopen/migraphx. The wheel it produces
 # resolves libamdhip64 and libhsa-runtime64 by dlopen at runtime, against
@@ -459,6 +522,7 @@ target "ort" {
 target "triton" {
   inherits   = ["_common"]
   dockerfile = "docker/triton.Dockerfile"
+  target     = "builder"
   contexts   = { python-base = "target:python-base" }
   args = {
     TRITON_REF           = TRITON_REF
@@ -468,6 +532,15 @@ target "triton" {
   tags       = [image("triton")]
   cache-from = cache_from("triton")
   cache-to   = cache_to("triton")
+}
+
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "triton-wheels" {
+  inherits   = ["triton"]
+  target     = "wheels"
+  tags       = [wheels_image("triton")]
+  cache-from = []
+  cache-to   = []
 }
 
 # No cache in either direction. Nothing builds from the final image, so its cache
@@ -484,11 +557,16 @@ target "final" {
     rocsolver   = ctx("rocsolver", WITH_ROCSOLVER_IMAGE)
     sgemm-shim  = "target:sgemm-shim"
     migraphx    = ctx("migraphx", WITH_MIGRAPHX_IMAGE)
-    pytorch     = ctx("pytorch", WITH_PYTORCH_IMAGE)
-    torchvision = ctx("torchvision", WITH_TORCHVISION_IMAGE)
-    torchaudio  = ctx("torchaudio", WITH_TORCHAUDIO_IMAGE)
-    ort         = ctx("ort", WITH_ORT_IMAGE)
-    triton      = ctx("triton", WITH_TRITON_IMAGE)
+    # These five take the trimmed "-wheels" companion, not the full build image:
+    # final reads only /wheels (/onnxruntime/dist for ort) from each of them, and
+    # the full images carry a compiled ROCm SDK copy, a git checkout, a build
+    # tree, or (triton) a from-source LLVM/MLIR build that final has no use for.
+    # See the wheels_image() comment in this file's derived-values section.
+    pytorch     = wheels_ctx("pytorch", WITH_PYTORCH_IMAGE)
+    torchvision = wheels_ctx("torchvision", WITH_TORCHVISION_IMAGE)
+    torchaudio  = wheels_ctx("torchaudio", WITH_TORCHAUDIO_IMAGE)
+    ort         = wheels_ctx("ort", WITH_ORT_IMAGE)
+    triton      = wheels_ctx("triton", WITH_TRITON_IMAGE)
   }
   labels = labels("final")
   tags = concat(

@@ -4,7 +4,11 @@
 #
 # ROCm/audio, not upstream pytorch/audio: only audio has a ROCm specific fork.
 # Its own target and its own image for the same reason as torchvision.
-FROM pytorch
+#
+# Named "builder" for the same reason as pytorch.Dockerfile's own stage of that
+# name: final takes only /wheels/*.whl (see the "wheels" stage below), everything
+# built to reach it does not need to leave this stage's own published image.
+FROM pytorch AS builder
 
 ARG ROCM_ARCH
 ARG TORCHAUDIO_REF
@@ -31,3 +35,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-torchaudio \
 ARG GFX803_SOURCE_REV GFX803_PINS
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
     /gfx803-line stamp /opt/rocm "${GFX803_LINE}" torchaudio "${GFX803_SOURCE_REV}" "${GFX803_PINS}"
+
+# See pytorch.Dockerfile's own "wheels" stage for why this split exists.
+FROM scratch AS wheels
+COPY --from=builder /wheels /wheels

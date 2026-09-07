@@ -4,7 +4,11 @@
 #
 # Its own target and its own image, rather than a step inside pytorch, so that it
 # gets its own runner and its own time budget in CI.
-FROM pytorch
+#
+# Named "builder" for the same reason as pytorch.Dockerfile's own stage of that
+# name: final takes only /wheels/*.whl (see the "wheels" stage below), everything
+# built to reach it does not need to leave this stage's own published image.
+FROM pytorch AS builder
 
 ARG ROCM_ARCH
 ARG TORCHVISION_REF
@@ -30,3 +34,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-torchvision \
 ARG GFX803_SOURCE_REV GFX803_PINS
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
     /gfx803-line stamp /opt/rocm "${GFX803_LINE}" torchvision "${GFX803_SOURCE_REV}" "${GFX803_PINS}"
+
+# See pytorch.Dockerfile's own "wheels" stage for why this split exists.
+FROM scratch AS wheels
+COPY --from=builder /wheels /wheels

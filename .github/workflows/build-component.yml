@@ -152,8 +152,22 @@ jobs:
 
           source scripts/ci/resolve-pins.sh
 
+          # pytorch, torchvision, torchaudio, ort and triton each publish a second,
+          # trimmed "-wheels" tag alongside their normal one (see the
+          # wheels_image() comment in docker-bake.hcl). It has to be built in the
+          # same invocation as its full counterpart: bake then shares the "builder"
+          # stage between the two targets instead of rebuilding it, so the
+          # trimmed tag costs one cheap extra COPY, not a second full build. Only
+          # final consumes it, so it is skipped for every other component.
+          targets=("$COMPONENT")
+          case "$COMPONENT" in
+            pytorch|torchvision|torchaudio|ort|triton)
+              targets+=("$COMPONENT-wheels")
+              ;;
+          esac
+
           # Printed first so that a failed build has the fully resolved graph,
           # with its tags, contexts, args and cache refs, right above it.
-          docker buildx bake --print "$COMPONENT"
+          docker buildx bake --print "${targets[@]}"
           source scripts/lib/bake-retry.sh
-          bake_push_with_retry "$COMPONENT"
+          bake_push_with_retry "${targets[@]}"

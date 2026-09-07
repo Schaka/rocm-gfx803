@@ -6,7 +6,14 @@
 # --use_rocm is gone from its build flags as of 1.28, so MIGraphX is the only
 # provider available on any current version. Accepted cost: gfx803 has no
 # Composable Kernel or MLIR fusion behind that provider.
-FROM python-base
+#
+# Named "builder": nothing chains off this stage the way torchvision/torchaudio
+# chain off pytorch, but final only ever takes the wheel from
+# /onnxruntime/dist (see the "wheels" stage below), never this stage's own
+# /opt/rocm -- the comment on that COPY above says so directly. Everything else
+# here (the full copied ROCm tree, apt build tools, the /onnxruntime checkout and
+# its build directory) exists only to produce that one wheel.
+FROM python-base AS builder
 
 ARG ROCM_ARCH
 ARG ORT_VERSION
@@ -53,3 +60,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-ort \
 ARG GFX803_SOURCE_REV GFX803_PINS
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
     /gfx803-line stamp /opt/rocm "${GFX803_LINE}" ort "${GFX803_SOURCE_REV}" "${GFX803_PINS}"
+
+# See pytorch.Dockerfile's own "wheels" stage for why this split exists.
+FROM scratch AS wheels
+COPY --from=builder /onnxruntime/dist /onnxruntime/dist
