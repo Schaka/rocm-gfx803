@@ -1,0 +1,271 @@
+name: Build gfx803 (ROCm 10.0)
+
+# Manual only. Every pin in docker-bake.hcl is a named release branch, so a
+# scheduled run would mostly rebuild the same inputs. Run this when a pin
+# changes, or when something needs re-verifying on hardware.
+#
+# Chain:
+#
+#   rocr-clr ─┬─ rocblas ─── rocsolver ─┐
+#             │                         ├─ migraphx ─┬─ pytorch ─┬─ torchvision ─┐
+#             └─ miopen ────────────────┘            │           └─ torchaudio ──┤
+#                                                    └─ ort ──────────────────────┴─ final
+#
+# rocr-clr carries the patched ROCR-Runtime and CLR that make Polaris enumerate
+# and dispatch at all, so rocblas and miopen both build on top of it. migraphx
+# links rocBLAS and MIOpen for real, not through a runtime dlopen, so it needs
+# both images at build time, and it carries rocSOLVER forward for everything
+# downstream. pytorch and ort are independent of each other. final compiles
+# nothing: it pulls every component image and assembles them.
+#
+# Each component is individually skippable, because these builds are long and the
+# inputs rarely all change at once. A skipped component's downstream jobs reuse
+# whatever it last published.
+#
+# Every `if` below is written `success || (skipped && !inputs.build-X)`. GitHub
+# reports result == 'skipped' both when the user unchecked a job's own input and
+# when an upstream dependency failed, and `result` alone cannot tell those apart.
+# The `!inputs.build-X` guard is what keeps a real upstream failure from being
+# waved through as a deliberate opt-out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-rocr-clr:
+        description: 'Build patched ROCR-Runtime and CLR (uncheck to reuse the last published image)'
+        type: boolean
+        required: false
+        default: true
+      build-rocblas:
+        description: 'Build rocBLAS'
+        type: boolean
+        required: false
+        default: true
+      build-miopen:
+        description: 'Build MIOpen'
+        type: boolean
+        required: false
+        default: true
+      build-rocsolver:
+        description: 'Build rocSOLVER'
+        type: boolean
+        required: false
+        default: true
+      build-migraphx:
+        description: 'Build MIGraphX'
+        type: boolean
+        required: false
+        default: true
+      build-pytorch:
+        description: 'Build PyTorch'
+        type: boolean
+        required: false
+        default: true
+      build-torchvision:
+        description: 'Build torchvision'
+        type: boolean
+        required: false
+        default: true
+      build-torchaudio:
+        description: 'Build torchaudio'
+        type: boolean
+        required: false
+        default: true
+      build-ort:
+        description: 'Build ONNX Runtime'
+        type: boolean
+        required: false
+        default: true
+      pytorch-ref:
+        description: 'Override PYTORCH_REF. Leave empty for the docker-bake.hcl default.'
+        required: false
+        default: ''
+      torchvision-ref:
+        description: 'Override TORCHVISION_REF. Leave empty for the docker-bake.hcl default.'
+        required: false
+        default: ''
+      torchaudio-ref:
+        description: 'Override TORCHAUDIO_REF. Leave empty for the docker-bake.hcl default.'
+        required: false
+        default: ''
+      no-cache:
+        description: 'Force a fully fresh build, ignoring the registry build cache'
+        type: boolean
+        required: false
+        default: false
+      debug:
+        description: 'Open an SSH debug session (tmate) into the runner for the duration of the build'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  rocr-clr:
+    if: ${{ inputs.build-rocr-clr }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: rocr-clr
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  rocblas:
+    needs: rocr-clr
+    if: ${{ !cancelled() && inputs.build-rocblas && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: rocblas
+      with-rocr-clr-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  miopen:
+    needs: rocr-clr
+    if: ${{ !cancelled() && inputs.build-miopen && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: miopen
+      with-rocr-clr-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  rocsolver:
+    needs: rocblas
+    if: ${{ !cancelled() && inputs.build-rocsolver && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: rocsolver
+      with-rocblas-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  migraphx:
+    needs: [rocblas, miopen, rocsolver]
+    if: ${{ !cancelled() && inputs.build-migraphx
+      && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.rocsolver.result == 'success' || (needs.rocsolver.result == 'skipped' && !inputs.build-rocsolver)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: migraphx
+      with-rocblas-image: true
+      with-miopen-image: true
+      with-rocsolver-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  pytorch:
+    needs: migraphx
+    if: ${{ !cancelled() && inputs.build-pytorch && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: pytorch
+      with-migraphx-image: true
+      pytorch-ref: ${{ inputs.pytorch-ref }}
+      # TensorTopK.hip at -O3 pushes clang's AMDGPU backend to about 20GB of RSS
+      # and several hours on any hardware. -O1 for that one file clears it in
+      # under a minute.
+      tensor-topk-opt-level: '-O1'
+      swap-size-gb: '24'
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  torchvision:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchvision && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: torchvision
+      with-pytorch-image: true
+      torchvision-ref: ${{ inputs.torchvision-ref }}
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  torchaudio:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-torchaudio && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: torchaudio
+      with-pytorch-image: true
+      torchaudio-ref: ${{ inputs.torchaudio-ref }}
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  ort:
+    needs: migraphx
+    if: ${{ !cancelled() && inputs.build-ort && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: ort
+      with-migraphx-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
+  # Every input arrives as a published image, so this job pulls images and
+  # installs wheels and compiles nothing beyond the one-file SGEMM shim.
+  final:
+    needs: [rocr-clr, rocblas, miopen, rocsolver, migraphx, pytorch, torchvision, torchaudio, ort]
+    if: ${{ !cancelled()
+      && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr))
+      && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas))
+      && (needs.miopen.result == 'success' || (needs.miopen.result == 'skipped' && !inputs.build-miopen))
+      && (needs.rocsolver.result == 'success' || (needs.rocsolver.result == 'skipped' && !inputs.build-rocsolver))
+      && (needs.migraphx.result == 'success' || (needs.migraphx.result == 'skipped' && !inputs.build-migraphx))
+      && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch))
+      && (needs.torchvision.result == 'success' || (needs.torchvision.result == 'skipped' && !inputs.build-torchvision))
+      && (needs.torchaudio.result == 'success' || (needs.torchaudio.result == 'skipped' && !inputs.build-torchaudio))
+      && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: final
+      with-rocr-clr-image: true
+      with-rocblas-image: true
+      with-miopen-image: true
+      with-rocsolver-image: true
+      with-migraphx-image: true
+      with-pytorch-image: true
+      with-torchvision-image: true
+      with-torchaudio-image: true
+      with-ort-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}

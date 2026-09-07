@@ -158,8 +158,9 @@ These steps worked many times in this repo's history.
 ## Component pins: branches, not commit SHAs, and no nightlies
 
 Every upstream component that this repo builds from source is pinned to a named
-release branch. The Dockerfile args are `ROCM_SYSTEMS_REF`,
-`ROCM_LIBRARIES_REF`, `MIGRAPHX_REF`, and `PYTORCH_REF`, and the values are
+release branch. On the 10.0 line the pins are variables in `docker-bake.hcl`:
+`ROCM_SYSTEMS_REF`, `ROCM_LIBRARIES_REF`, `MIGRAPHX_REF` and `PYTORCH_REF`.
+`docker buildx bake --print pins` lists all of them. The values are
 `release/therock-10.0`, `release/rocm-rel-10.0`, and similar. Do not pin a
 frozen commit SHA, and do not resolve `develop` or `main` per run. The mainline
 repo (`rocm-migraphx-ort-builder`) uses the same convention in its
@@ -179,10 +180,10 @@ Two additions to that rule matter for how the build finds the tip. CI resolves
 each branch to its commit once per run and passes it as a `*_SHA` build-arg, so
 a moved tip changes the layer cache key instead of being reused invisibly. See
 "Component images, pins and line provenance" in `README.md`. Nobody sets these
-values by hand, and the Dockerfile keeps the branch names as the readable pin.
+values by hand. `docker-bake.hcl` keeps the branch names as the readable pin.
 
-If you add a component that has no release branch, pin that one to an exact
-commit SHA and say why in the Dockerfile comment. This happens for a component
+If you add a component that has no release branch, pin it to an exact commit
+SHA. Say why in a comment next to it. This happens for a component
 whose upstream only tags releases, or for rocBLAS and MIOpen before the
 `rocm-libraries` monorepo restructure. Do not answer the question by defaulting
 to `develop` or `main`.

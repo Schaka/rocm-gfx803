@@ -1,0 +1,154 @@
+name: Build component
+
+# Reusable single-component build. Called once per component by
+# build-pipeline.yml, so each one runs on its own fresh runner with its own
+# 360-minute budget instead of racing a single ceiling in one monolithic build.
+# Each component publishes an image that the jobs downstream of it consume as a
+# build context, so no component recompiles another's work.
+#
+# This workflow contains no build logic. Which Dockerfile a component uses, what
+# it is tagged, where its cache lives and which sibling images it pulls from are
+# all decided in docker-bake.hcl. Everything here is either a runner concern or a
+# variable handed to bake, which also means `docker buildx bake <component>`
+# locally reproduces what CI does.
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: 'Bake target to build'
+        required: true
+        type: string
+      with-rocr-clr-image:
+        required: false
+        type: boolean
+        default: false
+      with-rocblas-image:
+        required: false
+        type: boolean
+        default: false
+      with-miopen-image:
+        required: false
+        type: boolean
+        default: false
+      with-rocsolver-image:
+        required: false
+        type: boolean
+        default: false
+      with-migraphx-image:
+        required: false
+        type: boolean
+        default: false
+      with-pytorch-image:
+        required: false
+        type: boolean
+        default: false
+      with-torchvision-image:
+        required: false
+        type: boolean
+        default: false
+      with-torchaudio-image:
+        required: false
+        type: boolean
+        default: false
+      with-ort-image:
+        required: false
+        type: boolean
+        default: false
+      pytorch-ref:
+        description: 'Override PYTORCH_REF. Empty keeps the docker-bake.hcl default.'
+        required: false
+        type: string
+        default: ''
+      torchvision-ref:
+        required: false
+        type: string
+        default: ''
+      torchaudio-ref:
+        required: false
+        type: string
+        default: ''
+      tensor-topk-opt-level:
+        description: 'Override TENSOR_TOPK_OPT_LEVEL. Empty keeps the docker-bake.hcl default.'
+        required: false
+        type: string
+        default: ''
+      swap-size-gb:
+        description: 'Swapfile size in GB. Raise it when a single compile step spikes past the default.'
+        required: false
+        type: string
+        default: '16'
+      no-cache:
+        description: 'Ignore the registry build cache and build fully fresh'
+        required: false
+        type: boolean
+        default: false
+      debug:
+        description: 'Open an SSH debug session (tmate) into the runner for the duration of the build'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare runner
+        uses: ./.github/actions/prepare-runner
+        with:
+          debug: ${{ inputs.debug }}
+          swap-size-gb: ${{ inputs.swap-size-gb }}
+          registry-username: ${{ secrets.GHCR_PAT != '' && github.repository_owner || github.actor }}
+          registry-password: ${{ secrets.GHCR_PAT != '' && secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ inputs.component }}
+        env:
+          COMPONENT: ${{ inputs.component }}
+          OWNER: ${{ github.repository_owner }}
+          REGISTRY_CACHE: 'true'
+          CACHE_TARGET: ${{ inputs.component }}
+          NO_CACHE: ${{ inputs.no-cache }}
+          WITH_ROCR_CLR_IMAGE: ${{ inputs.with-rocr-clr-image }}
+          WITH_ROCBLAS_IMAGE: ${{ inputs.with-rocblas-image }}
+          WITH_MIOPEN_IMAGE: ${{ inputs.with-miopen-image }}
+          WITH_ROCSOLVER_IMAGE: ${{ inputs.with-rocsolver-image }}
+          WITH_MIGRAPHX_IMAGE: ${{ inputs.with-migraphx-image }}
+          WITH_PYTORCH_IMAGE: ${{ inputs.with-pytorch-image }}
+          WITH_TORCHVISION_IMAGE: ${{ inputs.with-torchvision-image }}
+          WITH_TORCHAUDIO_IMAGE: ${{ inputs.with-torchaudio-image }}
+          WITH_ORT_IMAGE: ${{ inputs.with-ort-image }}
+          PYTORCH_REF_IN: ${{ inputs.pytorch-ref }}
+          TORCHVISION_REF_IN: ${{ inputs.torchvision-ref }}
+          TORCHAUDIO_REF_IN: ${{ inputs.torchaudio-ref }}
+          TENSOR_TOPK_OPT_LEVEL_IN: ${{ inputs.tensor-topk-opt-level }}
+        run: |
+          set -euo pipefail
+          # ghcr package paths are case sensitive and always lower.
+          export OWNER="${OWNER,,}"
+          export DATE
+          DATE="$(date -u +%Y%m%d)"
+          export GFX803_SOURCE_REV="$GITHUB_SHA"
+
+          # An empty input must not override the bake default, so each override
+          # is exported only when it is actually set.
+          for name in PYTORCH_REF TORCHVISION_REF TORCHAUDIO_REF TENSOR_TOPK_OPT_LEVEL; do
+            value="${name}_IN"
+            if [ -n "${!value}" ]; then
+              export "$name=${!value}"
+            fi
+          done
+
+          source scripts/ci/resolve-pins.sh
+
+          # Printed first so that a failed build has the fully resolved graph,
+          # with its tags, contexts, args and cache refs, right above it.
+          docker buildx bake --print "$COMPONENT"
+          source scripts/lib/bake-retry.sh
+          bake_push_with_retry "$COMPONENT"
