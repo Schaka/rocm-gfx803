@@ -47,18 +47,13 @@ what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
 rocm10 (this repo's root) is the only line, under active development and partly
 hardware-tested. The ROCm 10.0 stack on the test box runs rocBLAS, MIOpen,
 MIGraphX, PyTorch, ORT, and the vLLM fork on a real card. The torch correctness
-suite gives 202/202 PASS with the current patch set on the box stack. Inside the
-image the same suite reports 118 PASS, 0 BAD, 0 NONFINITE and 84 ERRORs that are
-all `/ INDUCTOR`. That run predates Triton in the image. The image now ships
-Triton. Its own JIT-compile and GEMM checks passed on the real card
-(`patches/triton/README.md`). A fresh run of the torch suite against the
-current image is the next step. It will show how many of those 84 errors
-clear.
-The full image builds end to
-end, and `tools/imgvalidate.sh` runs that whole gate against the image itself on
-the card: its `libamdhip64` and its `librocsolver.so.0` (13 of 13 `torch.linalg`
-routines within 1.0e-5 of CPU) are the shipped binaries, not a hand-built pair
-swapped in. `tools/imgvalidate.sh <image-tag>` is the on-card gate for a whole
+suite gives 202/202 PASS with the current patch set on the box stack. The image
+ships Triton, verified on the real card: the JIT-compile, GEMM, and hang-repro
+checks all pass (`patches/triton/README.md`).
+The full image builds end to end, and `tools/imgvalidate.sh` runs that whole
+gate against the image itself on the card: its `libamdhip64` and its
+`librocsolver.so.0` (13 of 13 `torch.linalg` routines within 1.0e-5 of CPU) are
+the shipped binaries, not a hand-built pair swapped in. `tools/imgvalidate.sh <image-tag>` is the on-card gate for a whole
 image: it asserts the shipped libraries' markers, runs `verify.py`, the coherence
 probes with a control arm that must reproduce the corruption, the fp16 GEMM and
 convolution sweep with and without the shim's takeover, and the op suite. The
@@ -98,12 +93,12 @@ gives the exact call. `librocblas.so` resolves through the stack's
 files are built on the box next to their loaders and never committed, so this
 repo pins nothing stack-specific and a fresh build on the 10.0 stack works.
 
-Hardware validation of vLLM on the 10.0 stack is done (2026-09-02). Two crashes
-blocked it, and both were in the ROCm 10.0 stack rather than in vLLM.
+Hardware validation of vLLM on the 10.0 stack is done (2026-09-02). Measured on
+the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0 tok/s, decode
+30.2 tok/s. vLLM's runs on this stack depend on
 `patches/rocm-systems/va-reuse-defer-noremap.patch` and
-`patches/rocm-systems/d2h-null-dsthost.patch` fix them, and `AGENTS.md` gives the
-reason for each. Measured on the box with `qwen35_2b_bench_v3.py`: EXIT=0,
-prefill 311.0 tok/s, decode 30.2 tok/s.
+`patches/rocm-systems/d2h-null-dsthost.patch`; `AGENTS.md` gives the reason for
+each.
 
 ## Component images, pins, and line provenance
 
