@@ -19,12 +19,9 @@ erratum (gfx7/8 EOP-completion-interrupt loss — see "The blocking issue"
 below) intermittently and unrecoverably wedges HIP kernel-module upload,
 independent of everything documented here. All the performance work
 below is real and hardware-verified in isolation; it was never able to
-run for long, uninterrupted stretches because of that separate bug. See
-`LAST_REMAINING_PROBLEMS.md` problem 1 and `MIGRATION_NOTES.md` for the
-authoritative, most current status of that erratum — this file only
-covers the parts of the investigation unique to reaching it (the
-process-cascade behavior, and the relaunch-supervisor workaround), not
-the full up-to-date story.
+run for long, uninterrupted stretches because of that separate bug. "The
+blocking issue" section below is the current, complete record of that
+erratum on this line.
 
 ## What ships and works
 
@@ -183,6 +180,78 @@ log) — both had been measured against a *spilling* baseline; against a
 non-spilling one, double buffering was a real additional 10-25% win on
 top.
 
+Compile (from the directory holding the Python loader, which is where the
+.so must land for its `__file__`-relative ctypes path to find it):
+`hipcc --offload-arch=gfx803 -O3 -shared -fPIC -o libgfx803gemv_m.so
+../../gfx803_kernels/gfx803_gemv_m.hip`
+
+**Decode at a batch of tokens (`2 <= n <= 16`)** — `gfx803_gemv_m.py` +
+`gfx803_gemv_m.hip`, wired into the same dispatch in `utils.py`. Small-batch
+decode had no gfx803 path before it: the tiled GEMM tiles 64 activation rows,
+so at `n=8` it computes eight times the output rows it needs and moves 12-48
+GB/s of the card's measured ~168 GB/s copy bandwidth, and decode spends that
+on 113 of the 114 weight reads a step makes. This kernel is the generalised
+LLMM1: a wave owns its output rows, the wave's lanes split into per-row
+groups that walk K in 8-half chunks, and every lane keeps one fp32
+accumulator per token, so a weight read is amortised over the whole batch.
+`LLMM1` itself asserts `N == 1` for the opposite reason: its grid is the
+output-feature axis, so a second token would need a second set of blocks
+re-reading the same weights, and its lanes hold one row each with no room to
+split further.
+
+Measured per-decode-step GEMM time over this model's shapes (28 layers plus
+lm_head) at M = 2/4/8/16: **10.8 / 11.0 / 14.9 / 31.4 ms**, against ~33 ms
+for the tiled-GEMM path at M=8. The floor is a memory roofline — 1134 MB of
+weights at 169 GB/s is 6.7 ms per step — and what remains between the kernel
+and that floor is not arithmetic. Adding a token costs registers
+(MTOK = 2/4/8/16 compile to 30/46/62/102 VGPRs), registers cost waves per
+CU, and waves per CU are what let a latency-bound kernel keep weight loads
+in flight. A variant that moved the tokens into the *lanes* instead held 28
+VGPRs flat across every batch and measured slower at every size, because a
+weight chunk then fed one token per lane and the batch's reuse had to come
+from cache rather than from registers. `tools/vllm-bench/vgpr_count.py`
+reads those counts back out of a compiled `.so`; `gemv_m_tune.py` compiles
+and compares variants; `probe_gemv_m.py` reports per-shape correctness and
+bandwidth against the roofline.
+
+Two properties are worth preserving. Weights are read in vLLM's native
+`[N, K]` layout, which is what the earlier native-layout prefill attempt
+could not make pay (see above): here the lanes are adjacent along K, so the
+native row-major read is already coalesced, and no transposed cache or VRAM
+cap is needed — which is what puts lm_head, a quarter of this model's
+weights and past the prefill cache's 64 MB per-weight cap, on a fast path at
+`n > 1`. And within a chunk iteration the batch's activation is staged
+before the weight is loaded: both orderings compile to the same register
+count, but staging first measured 8% faster at M=8 and 28% faster at M=2,
+because the batch's loads stay independent instead of chaining through one
+buffer at a time.
+
+Correctness at these sizes was checked two ways after a masking bug (next
+section) was found: `probe_gemv_m.py` compares every batch size in `[2, 16]`
+against a float32 reference, not only the powers of two, and
+`verify_gemv_m.py` generates greedily with and without the path at several
+concurrencies and requires identical tokens.
+
+End-to-end, measured by `bench_queries.py` over several distinct prompts
+after warm-up, decode is the difference between a `decode=1` run and a full
+one so prefill and engine overhead cancel. The two configurations were
+alternated rather than run one after the other (see "How to reproduce"), two
+runs each, and each figure is itself a median of two repeats:
+
+| concurrency | tiled GEMM path | multi-token GEMV | change |
+| ---: | ---: | ---: | ---: |
+| 1 | 111.1 | 111.4 | +0.3% (M=1, other path) |
+| 2 | 43.3 | 141.3 | +226% |
+| 8 | 155.6 | 351.4 | +126% |
+| 16 | 271.8 | 342.9 | +26% |
+
+Prefill throughput is unchanged (1686 vs 1695 tok/s at concurrency 8, 1792
+vs 1790 at 16), which is the check that the new branch is not leaking into
+the `n > 16` path. The win shrinks as the batch grows because the tiled
+GEMM's 64-row tile gets fuller: at concurrency 2 it computes 32x the rows it
+needs, at 8 it computes 8x, and by 16 it is close to break-even — which is
+where the dispatcher stops using this kernel.
+
 ### Final numbers (Qwen2.5-1.5B-Instruct, fp16, RX 470)
 
 | | llama.cpp-Vulkan (ceiling) | vLLM, final state |
@@ -222,9 +291,9 @@ already (`patches/kernel/REFERENCE-amdkfd-gfx7-8-missed-interrupt-
 wakeup.patch`) — **but this was found chasing a *different*, now-fixed
 symptom** (a multi-hour engine-startup hang during compiled-kernel
 loading); it reduced but did not eliminate the deeper, still-open EOP-
-interrupt-loss erratum documented in `LAST_REMAINING_PROBLEMS.md`
-problem 1 and below. Don't confuse the two — this fix is real and
-should stay, but it is not the fix for "the blocking issue" below.
+interrupt-loss erratum documented below, in "The blocking issue." Don't
+confuse the two — this fix is real and should stay, but it is not the
+fix for that section.
 
 **`gfx803_triton_gemv` producing wrong values only under live dispatch**
 (not synthetic data): root-caused via careful bisection with a live
@@ -274,6 +343,41 @@ two kernel launches (a host `cuda.synchronize()` works too but is
 illegal during CUDA-graph capture — confirmed directly,
 `hipErrorStreamCaptureUnsupported`). 0/16 corrupted after, vs.
 consistently 7-16/16 before.
+
+**Out-of-bounds write in the multi-token GEMV's batch masking.** This is the
+silent-wrong-answer failure class the repo keeps hitting, and it was in our
+own kernel rather than in ROCm. The kernel is instantiated for MTOK = 2/4/8/16
+and the dispatcher picks the next power of two at or above the real batch, so
+a batch of 3 runs the MTOK=4 kernel. The first version processed all MTOK
+tokens unconditionally, reading `X[m*K]` and writing `C[m*N + row]` for `m`
+up to `MTOK-1`: every batch that was not itself a power of two read past the
+end of the activation and wrote past the end of the output.
+
+What makes this one worth writing down is how it presented. It is not a wrong
+answer at one shape. Decode at concurrency 8 is exactly M=8, which is a power
+of two, so the measured configuration was correct and matched the reference
+token for token. The damage came from a warm-up batch of some other size,
+which wrote into whatever the caching allocator had placed after the output
+buffer; that placement varies run to run, so the visible symptom was
+*nondeterministic* greedy output at a concurrency the kernel was not even
+being used at, while the reference path was stable across repeats. A
+single-shape or powers-of-two check cannot see any of that, and the earlier
+per-shape probe tested exactly M=2/4/8/16.
+
+Two checks catch it, and both are in `tools/vllm-bench/`: `probe_gemv_m.py`
+and `gemv_m_tune.py` gate on every M in `[2, 16]` against a float32 reference,
+with the output pre-filled with NaN so that a slot the kernel never wrote
+reports as unwritten rather than as a small numerical error (the unmasked
+build aborts the gate outright); `verify_gemv_m.py` generates greedily with
+and without the path at concurrencies 1/3/5/8 and requires identical tokens,
+which is what makes a corruption outside the path under test visible.
+
+The fix masks both the load and the store on `m < M`, with a compile-time
+`EXACT` flag and a second instantiation for the exact-width case: the mask
+alone cost about a tenth of the throughput at M=8 when it was always true.
+Masked sizes (5-7, 9-15) pay a little more than exact ones — at MTOK=8 the
+masked instantiation compiles to 68 VGPRs against 62 — and that is the price
+of not writing into someone else's buffer.
 
 ## Dead ends — don't re-attempt these
 
@@ -331,16 +435,17 @@ consistently 7-16/16 before.
 
 ## The blocking issue: gfx7/8 EOP-interrupt loss (open, unresolved)
 
-This is the same erratum documented in `LAST_REMAINING_PROBLEMS.md`
-problem 1 and `MIGRATION_NOTES.md` — **read those for the current,
-authoritative status**, including a much sharper live PM4-trace/fence-
-state localization done in a later session, and confirmation that
-enabling the existing mitigation (`ROCR_GFX8_EOP_MITIGATION=1`, or the
-untracked `ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US` variant) can cause
-outcomes *worse* than the hang itself (a full unrecoverable GPU bus
-death, and separately a full system hard lockup with no network
-response). This section only adds the parts of the investigation unique
-to reaching that bug from the vLLM side, not already in those files:
+This is the same erratum documented in `rocm7.14/MIGRATION_NOTES.md`
+("gfx7/8 EOP-completion-notification-loss" section), from the archived
+7.14 line, which has a sharper live PM4-trace/fence-state localization
+and confirms that enabling the existing mitigation
+(`ROCR_GFX8_EOP_MITIGATION=1`, or the untracked
+`ROCR_GFX8_EOP_MITIGATION_HIP_TIMEOUT_US` variant) can cause outcomes
+*worse* than the hang itself (a full unrecoverable GPU bus death, and
+separately a full system hard lockup with no network response). Nobody
+has re-checked that finding against the 10.0 line this vLLM port
+targets. This section only adds the parts of the investigation unique
+to reaching that bug from the vLLM side, not already in that file:
 
 **Deep kernel-level tracing (five independent layers, all confirmed
 clean) ruled out every software-side explanation for the interrupt
@@ -396,9 +501,9 @@ memory" failure), and relaunches up to 8 times. Validated against a
 real Qwen3.5-2B `bench latency` workload: **6/6 clean** end-to-end
 (individual launches only clear ~30-35% on their own; the supervisor's
 relaunch compounds that to the target reliability). This script exists
-and works; whether it's still the right approach given later sessions'
-findings (documented in `LAST_REMAINING_PROBLEMS.md`) is a decision for
-whoever picks this back up.
+and works; whether it's still the right approach given the archived
+7.14 line's later EOP findings (`rocm7.14/MIGRATION_NOTES.md`) is a
+decision for whoever picks this back up.
 
 ## How to reproduce
 
@@ -432,6 +537,34 @@ single short prompt, forced decode length, wall-clock timed):
 # decode tokens via SamplingParams(min_tokens=N, max_tokens=N), time
 # the generate() call, divide by N).
 ```
+
+**Multi-token decode GEMV** (`2 <= n <= 16`): build the kernel next to its
+loader, then check it before timing it. The probe gates on every batch size
+in `[2, 16]` and reports each shape's bandwidth against the roofline; the
+tuning tool compiles flag variants and reports the per-step cost; the
+verify script is the end-to-end cross-check and needs both configurations in
+separate processes because the path is selected at import.
+```
+cd /data/vllm-mobydick/vllm/model_executor/layers
+hipcc --offload-arch=gfx803 -O3 -shared -fPIC \
+  -o libgfx803gemv_m.so ../../gfx803_kernels/gfx803_gemv_m.hip
+source /data/bench/env.sh && cd /data/bench
+python probe_gemv_m.py                       # correctness at every M + GB/s
+python gemv_m_tune.py --build --outdir /data/bench/tune
+for f in /data/bench/tune/*.so; do python gemv_m_tune.py --so $f; done
+VLLM_GFX803_GEMV_M=0 python verify_gemv_m.py --concurrency 1,3,5,8 --decode 24
+VLLM_GFX803_GEMV_M=1 python verify_gemv_m.py --concurrency 1,3,5,8 --decode 24
+diff <(...) <(...)   # the two token id lines must be identical
+```
+
+**Measuring a throughput change** (`bench_queries.py`): alternate the two
+configurations across repeats rather than running one to completion and then
+the other. A single pass per configuration measured a 23% "regression" at
+concurrency 1 that three interleaved repeats of the same pair put at +0.3%,
+with the repeats agreeing to within 0.3% — the difference was order, not
+code. The script reports decode throughput as the difference between a
+`decode=1` run and a full run, so prefill and engine overhead cancel, and
+every number below is post-warm-up over several distinct prompts.
 
 **Real end-to-end latency** (the number quoted throughout this doc):
 ```
@@ -479,9 +612,9 @@ minBlocksPerMultiprocessor)` before anything else.
 
 ## Open items (as of the last session that touched this work)
 
-1. **The EOP-interrupt-loss hang is the actual blocker** — see
-   `LAST_REMAINING_PROBLEMS.md` problem 1 for the current state; nothing
-   in this document changes that status.
+1. **The EOP-interrupt-loss hang is the actual blocker** — see "The
+   blocking issue" above for the current state; nothing in this
+   document changes that status.
 2. `qkv_proj` bias support for the prefill GEMM kernel — currently
    excluded entirely (`bias is None` gate), meaning one of the four
    linear layers gets none of the prefill speedup.
@@ -492,21 +625,56 @@ minBlocksPerMultiprocessor)` before anything else.
 4. Root-cause (not just gate around) `ops.LLMM1`'s large-K correctness
    bug, and `gfx803_triton_gemv`'s live-vs-synthetic discrepancy — both
    currently worked around, neither understood.
-5. Real concurrent-request throughput (`vllm bench throughput`) never
-   measured — everything in this document is single-request (batch=1)
-   latency. At batch=1, decode is fundamentally memory-bandwidth-bound
-   (confirmed: `lm_head` alone sits close to the card's ~211GB/s
-   bandwidth floor) — batching is the standard, not-yet-measured lever
-   for pushing past this ceiling in aggregate serving capacity.
-6. Whether `Qwen3_5ForConditionalGeneration`'s hybrid mamba/linear-
+5. Concurrent-request throughput is now measured (the multi-token GEMV
+   section above, and `tools/vllm-bench/bench_queries.py`, which reports
+   post-warm-up decode throughput across several queries at
+   concurrency 1-16). What is open is the distance left to the roofline
+   in that regime: per decode step the GEMM path is 14.9 ms at M=8
+   against a 6.7 ms memory floor, and 31.4 ms at M=16 against the same
+   floor. Attention is the next target — measured at ~0.233 ms per layer
+   at M=8, about 6.5 ms per step, which is comparable to the whole GEMM
+   path's remaining headroom. Neither has been attacked yet.
+6. Non-power-of-two batch sizes run the masked kernel instantiation,
+   which compiles to a worse register count than the exact one (68
+   against 62 VGPRs at MTOK=8, and 122 against 102 at MTOK=16) and so
+   costs occupancy on the sizes between the instantiations. Splitting
+   the token loop into a masked prologue and an unmasked remainder would
+   recover it; not attempted.
+7. Whether `Qwen3_5ForConditionalGeneration`'s hybrid mamba/linear-
    attention/vision architecture fully works on this stack is still not
    completely confirmed — a first successful end-to-end run happened,
    but was interrupted by the EOP hang before extensive validation, and
-   an output-quality question on that model was open at the time (see
-   `LAST_REMAINING_PROBLEMS.md`/`MIGRATION_NOTES.md` for whether this
-   was later resolved).
-7. The user's longer-term goal (4-6x RX 470/580 8GB cards, multi-GPU,
+   an output-quality question on that model was open at the time. This
+   was never re-checked.
+8. The user's longer-term goal (4-6x RX 470/580 8GB cards, multi-GPU,
    larger models) is entirely unstarted — every number in this document
    is single-GPU.
-8. Wiring the vendored `vllm/` tree into this repo's actual Dockerfile
-   build (currently a manual box-only editable install).
+9. Wiring the vendored `vllm/` tree into this repo's actual Dockerfile
+   build (currently a manual box-only editable install) — see
+   `BUILD.md` for the current, box-only build steps.
+10. **Move the port to vLLM 0.28.0 — the agreed next task, not started.**
+    This fork is based on `ai-infos/vllm-gfx906-mobydick @ ff063e4` and
+    installs as `0.20.1+gfx803`; upstream is at 0.28.0. The gfx803 delta
+    between those two lines is probably not significant, so starting a
+    fresh fork at 0.28.0 and re-applying the port on top is a legitimate
+    option alongside rebasing the existing tree, and either way the surface
+    to re-apply is small and enumerable: `CMakeLists.txt`'s
+    `HIP_SUPPORTED_ARCHS`, the 3 `csrc/` arch gates, `platforms/rocm.py`,
+    the GEMM/GEMV dispatch in `model_executor/layers/utils.py`, the three
+    hand-written kernel pairs under `gfx803_kernels/` with their `ctypes`
+    loaders, and the attention files listed under "What ships and works"
+    (14 files under `vllm/vllm` mention gfx803 today).
+
+    Do not carry the "probably not significant" assumption into the
+    validation. The 0.20 line needed two ROCm-10.0 stack fixes before vLLM
+    ran at all on this box, and this repo's history holds both an outcome
+    where a patch had become obsolete upstream and one where the code a
+    patch targeted had been replaced by something whose behavior on the
+    same bug class was unverified. Validate on the card, using the gates
+    already in "How to reproduce": the sanity generation first, then
+    `probe_gemv_m.py` and `verify_gemv_m.py` for the decode paths, with the
+    `bench_queries.py` table above as the before/after baseline. The
+    precondition for starting is that the current performance work has
+    settled — the GEMM path is at 14.9 ms per step at M=8 against a 6.7 ms
+    memory floor, so "roughly where expected" rather than "at the floor"
+    is the likely stopping point.

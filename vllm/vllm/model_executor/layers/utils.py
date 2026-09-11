@@ -339,6 +339,30 @@ def rocm_unquantized_gemm_impl(
         out = gfx803_skinny_linear(x.reshape(-1), weight, bias).to(x.dtype)
         return out.reshape(*x.shape[:-1], m)
 
+    # gfx803, decode at a batch of tokens (2 <= n <= 16): the tiled GEMM below
+    # tiles 64 activation rows, so at n=8 it computes 8x the output rows it
+    # needs and lands in the compute-bound regime -- it measured 12-48 GB/s of
+    # the card's ~168 GB/s copy bandwidth at these sizes, and decode spends
+    # that cost on 113 of the 114 weight reads a step makes. This kernel
+    # amortises one weight read over the whole batch instead (see
+    # gfx803_kernels/gfx803_gemv_m.hip), which is worth 2.2x on the per-step
+    # GEMM time at n=8; at n=16 the two paths measure about equal, and beyond
+    # that the tiled GEMM's tile is over half full and pulls ahead again.
+    if (
+        on_gfx803()
+        and 2 <= n <= 16
+        and bias is None
+        and x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and weight.is_contiguous()
+        and x.is_contiguous()
+    ):
+        from vllm.model_executor.layers.gfx803_gemv_m import gfx803_gemv_m
+
+        out = gfx803_gemv_m(x.reshape(n, k), weight)
+        if out is not None:
+            return out.reshape(*x.shape[:-1], m)
+
     # gfx803, prefill/chunked-prefill (n>1): re-measured head-to-head
     # against the Tensile kernel actually dispatched at these shapes --
     # confirmed via rocprofv3 to be Tensile's UNTUNED fallback library
