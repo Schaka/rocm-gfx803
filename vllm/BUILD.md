@@ -111,37 +111,57 @@ If you changed a kernel, also run the correctness probes under
 trust any speed number. `NOTES.md` explains what each one checks and
 why a speed-only test can miss a wrong answer.
 
-## Using the build inside the final CI image
+## Building vLLM in CI
 
-The steps above build vLLM against the box's own ROCm and PyTorch
-install. `native-rocm-vllm-setup.sh` copied that install from an older
-container line, 7.14. This repo's `docker/final.Dockerfile`
-builds a separate, newer image (the 10.0 line) that does not contain
-vLLM at all yet. Wiring vLLM into that Dockerfile is still open work
-(see `NOTES.md`, open items). Until that happens, use the box build
-inside a container from the final image like this:
+CI builds vLLM the same way it builds PyTorch and ONNX Runtime. It runs
+as its own bake target, on its own runner, from the vendored source in
+this folder. `docker-bake.hcl` defines the `vllm` target and its
+trimmed `vllm-wheels` companion. `.github/workflows/build-pipeline.yml`
+runs it as a job named `vllm`. That job needs only the `pytorch` job.
+It starts as soon as PyTorch publishes. It then runs in parallel with
+torchvision, torchaudio, and ONNX Runtime, instead of waiting behind
+them.
 
-1. Start a container from the final image, with the GPU passed through
-   and the box's vLLM folder mounted in:
+The CI build compiles the same three kernels as Step 4 above, with the
+same `hipcc` commands. It builds them against the same 10.0-line ROCm
+and PyTorch that `docker/final.Dockerfile` assembles.
+`docker/final.Dockerfile` then installs the resulting wheel. It also
+copies the three compiled kernels into place on its own. A manual run
+of the "Build gfx803 (ROCm 10.0)" workflow builds and wires in vLLM by
+default. Uncheck "Build the vendored gfx803 vLLM fork" to skip it and
+reuse the last published `vllm` image instead.
 
-   ```
-   docker run -it --device=/dev/kfd --device=/dev/dri --group-add video \
-       -v /data/vllm-mobydick:/data/vllm-mobydick \
-       <final-image-tag> bash
-   ```
+Nobody ran the resulting final image on real hardware yet. The image
+builds and `import vllm` succeeds in CI, and that is a build check
+only. Someone must run the checks below on the box and record the
+result here before this counts as verified.
 
-2. Inside the container, repeat Step 3 and Step 4 above, using the
-   container's own `/opt/venv` and ROCm install. Do not skip this and
-   try to import the box's already-built copy directly. The compiled
-   C++/HIP extension and the three kernel `.so` files are linked
-   against one specific PyTorch and ROCm build. The final image's
-   10.0 line is a different build than the box's current 7.14-based
-   install. A `.so` built on the box is not guaranteed to load inside
-   the final image's container.
+## Using vLLM in the final image
 
-3. Before you trust the result, run Step 5's sanity check inside the
-   container.
+The final image now installs vLLM and its three compiled kernels by
+default. `LD_PRELOAD` and `PYTHONPATH` are already set inside the image,
+to the same values `tools/vllm-bench/env.sh` sets on the box. A
+container started from the final image needs no extra environment
+setup to import vLLM. Start it like this, with the GPU passed through:
 
-Nobody ran this container path on real hardware yet. Treat it as the
-best known method, not a checked one. Someone must run it on the box
-from start to end and record the result here.
+```
+docker run -it --device=/dev/kfd --device=/dev/dri --group-add video \
+    <final-image-tag> bash
+```
+
+Then run Step 5's sanity check inside the container, unchanged.
+
+Are you iterating on a kernel change and want to test it before it
+lands in CI? Keep using the box-native build in Steps 1 through 5. You
+can also mount your working copy of this folder over the image's
+installed package, for a quick check:
+
+```
+docker run -it --device=/dev/kfd --device=/dev/dri --group-add video \
+    -v /data/vllm-mobydick/vllm/model_executor:/opt/venv/lib/python3.12/site-packages/vllm/model_executor \
+    <final-image-tag> bash
+```
+
+Use this mount only to preview a change. Commit the real fix to the
+files under `vllm/vllm/` in this repo, so the next CI build picks it
+up.

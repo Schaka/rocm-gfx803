@@ -58,8 +58,12 @@ ENV ROC_ENABLE_PRE_VEGA=1
 ENV TORCH_BLAS_PREFER_HIPBLASLT=0
 ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim.so
 
+# The vLLM ROCm platform plugin is gated on `import amdsmi`, and without it
+# vLLM resolves to UnspecifiedPlatform and fails with an error that names
+# nothing related to the cause. See tools/vllm-bench/env.sh for the same
+# requirement on the box-native build.
 ENV UV_NO_CACHE=1
-ENV PYTHONPATH=/opt/rocm/lib
+ENV PYTHONPATH=/opt/rocm/lib:/opt/rocm/share/amd_smi
 ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV --python 3.12 --seed
 
@@ -74,6 +78,15 @@ RUN --mount=type=bind,source=scripts/build/final-wheels.sh,target=/scripts/build
 ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
 ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
+
+# PIP_CONSTRAINT is already active, so any of vllm's runtime requirements that
+# name torch, torchvision or triton resolve to the version already installed
+# above instead of pulling a generic PyPI wheel.
+COPY --from=vllm /wheels/*.whl /tmp/vllm/
+COPY --from=vllm /kernels /tmp/vllm-kernels
+COPY vllm/requirements/common.txt /tmp/vllm-requirements-common.txt
+RUN --mount=type=bind,source=scripts/build/final-vllm.sh,target=/scripts/build/final-vllm.sh \
+    /scripts/build/final-vllm.sh
 
 ARG GFX803_SOURCE_REV GFX803_PINS
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \

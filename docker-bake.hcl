@@ -5,7 +5,9 @@
 #                           │           ├─ sgemm-shim ┤
 #                           │           └─────────────┼─ migraphx ─┬─ pytorch ─┬─ torchvision ─┐
 #                           └─ miopen ────────────────┘            │           └─ torchaudio ──┤
-#                                                                  └─ ort ──────────────────────┴─ final
+#                                                                  ├─ ort ──────────────────────┤
+#                                                                  └─ vllm ─────────────────────┴─ final
+#                                                        triton ───────────────────────────────────┘
 #
 # This file is the single source of truth for image naming, tags, cache refs and
 # every version knob. The Dockerfiles declare bare ARGs and get their values from
@@ -44,6 +46,7 @@ variable "PACKAGES" {
     torchaudio  = "rocm-torchaudio-builder"
     ort         = "rocm-migraphx-ort-builder"
     triton      = "rocm-triton-builder"
+    vllm        = "rocm-vllm-builder"
     final       = "rocm-migraphx-ort-torch-builder"
   }
 }
@@ -168,6 +171,7 @@ variable "WITH_TORCHVISION_IMAGE" { default = "false" }
 variable "WITH_TORCHAUDIO_IMAGE"  { default = "false" }
 variable "WITH_ORT_IMAGE"         { default = "false" }
 variable "WITH_TRITON_IMAGE"      { default = "false" }
+variable "WITH_VLLM_IMAGE"        { default = "false" }
 
 # ---------------------------------------------------------------------------
 # Derived values
@@ -188,7 +192,7 @@ function "cache_ref" {
   result = "${pkg(component)}:cache-${ROCM_ARCH}-${LINE}"
 }
 
-# pytorch, torchvision, torchaudio, ort and triton each carry a full build
+# pytorch, torchvision, torchaudio, ort, triton and vllm each carry a full build
 # environment (a compiled ROCm SDK copy, a git checkout, a build tree, an LLVM
 # build for triton) that final never reads -- it takes only the wheel(s) each one
 # produces. Publishing that wheel alone under its own tag, from a `FROM scratch`
@@ -225,7 +229,7 @@ function "ctx" {
 
 # Same as ctx(), but resolves to the trimmed "<component>-wheels" bake target /
 # wheels_image() tag instead of the full one. Used only by final's own contexts
-# for the five components that have a "wheels" stage.
+# for the six components that have a "wheels" stage.
 function "wheels_ctx" {
   params = [component, use_image]
   result = use_image == "true" ? "docker-image://${wheels_image(component)}" : "target:${component}-wheels"
@@ -543,6 +547,43 @@ target "triton-wheels" {
   cache-to   = []
 }
 
+# The gfx803 vLLM fork lives in-tree at vllm/ (see AGENTS.md, "vLLM lives in
+# vllm/ as a hard fork"), so this target takes no *_REF pin and clones nothing:
+# the build context already is the pinned source.
+#
+# Independent of the rocBLAS/MIOpen/rocSOLVER/MIGraphX chain, the same way
+# triton is: vllm/CMakeLists.txt links only libamdhip64 at build time (see the
+# comment on that COPY in docker/vllm.Dockerfile), so this target needs
+# python-base's own stock ROCm for hipcc and the HIP headers, not migraphx's
+# patched tree. It does need pytorch's wheel, because vllm/setup.py imports
+# torch and compiles its extension against it.
+target "vllm" {
+  inherits   = ["_common"]
+  dockerfile = "docker/vllm.Dockerfile"
+  target     = "builder"
+  contexts = {
+    python-base = "target:python-base"
+    pytorch     = wheels_ctx("pytorch", WITH_PYTORCH_IMAGE)
+  }
+  args = {
+    ROCM_ARCH            = ROCM_ARCH
+    BUILD_PARALLEL_LEVEL = BUILD_PARALLEL_LEVEL
+  }
+  labels     = labels("vllm")
+  tags       = [image("vllm")]
+  cache-from = cache_from("vllm")
+  cache-to   = cache_to("vllm")
+}
+
+# The trimmed wheel-only companion. See the wheels_image() comment above.
+target "vllm-wheels" {
+  inherits   = ["vllm"]
+  target     = "wheels"
+  tags       = [wheels_image("vllm")]
+  cache-from = []
+  cache-to   = []
+}
+
 # No cache in either direction. Nothing builds from the final image, so its cache
 # has no consumer, and every expensive component arrives prebuilt. Exporting
 # anyway costs a second compressed copy of every layer, written to the same
@@ -557,7 +598,7 @@ target "final" {
     rocsolver   = ctx("rocsolver", WITH_ROCSOLVER_IMAGE)
     sgemm-shim  = "target:sgemm-shim"
     migraphx    = ctx("migraphx", WITH_MIGRAPHX_IMAGE)
-    # These five take the trimmed "-wheels" companion, not the full build image:
+    # These six take the trimmed "-wheels" companion, not the full build image:
     # final reads only /wheels (/onnxruntime/dist for ort) from each of them, and
     # the full images carry a compiled ROCm SDK copy, a git checkout, a build
     # tree, or (triton) a from-source LLVM/MLIR build that final has no use for.
@@ -567,6 +608,7 @@ target "final" {
     torchaudio  = wheels_ctx("torchaudio", WITH_TORCHAUDIO_IMAGE)
     ort         = wheels_ctx("ort", WITH_ORT_IMAGE)
     triton      = wheels_ctx("triton", WITH_TRITON_IMAGE)
+    vllm        = wheels_ctx("vllm", WITH_VLLM_IMAGE)
   }
   labels = labels("final")
   tags = concat(

@@ -50,11 +50,14 @@ instead (that fork itself is just upstream Triton + ~2 commits, so a
 patch against it is the right convention there — unlike vLLM's much
 larger fork distance from upstream).
 
-**Not yet done**: wiring the vendored `vllm/` tree into this repo's
-actual Dockerfile build. It currently only exists as a manual editable
-install on the box (`/data/vllm-mobydick`, `pip3 install --no-build-
-isolation --no-deps -e .`) — the vendored tree captures the *source*,
-not yet the build pipeline.
+The vendored `vllm/` tree is wired into this repo's Dockerfile build:
+`docker-bake.hcl`'s `vllm` target builds the wheel and the three
+kernels, and `docker/final.Dockerfile` installs both into the published
+final image. This is a build-only check. Nobody ran the resulting final
+image on real hardware yet — see `BUILD.md`. Iterating on the box with
+`/data/vllm-mobydick` and `pip3 install --no-build-isolation --no-deps
+-e .` still works, and stays the right way to test a kernel change
+before it lands in CI.
 
 ### Triton on gfx803: works, 6-line ISA wiring
 
@@ -649,9 +652,9 @@ minBlocksPerMultiprocessor)` before anything else.
 8. The user's longer-term goal (4-6x RX 470/580 8GB cards, multi-GPU,
    larger models) is entirely unstarted — every number in this document
    is single-GPU.
-9. Wiring the vendored `vllm/` tree into this repo's actual Dockerfile
-   build (currently a manual box-only editable install) — see
-   `BUILD.md` for the current, box-only build steps.
+9. The vendored `vllm/` tree is wired into the CI Dockerfile build now,
+   but nobody ran the resulting final image on the box — see `BUILD.md`
+   for the build steps and what still needs checking.
 10. **Move the port to vLLM 0.28.0 — the agreed next task, not started.**
     This fork is based on `ai-infos/vllm-gfx906-mobydick @ ff063e4` and
     installs as `0.20.1+gfx803`; upstream is at 0.28.0. The gfx803 delta

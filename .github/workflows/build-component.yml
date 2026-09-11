@@ -59,6 +59,10 @@ on:
         required: false
         type: boolean
         default: false
+      with-vllm-image:
+        required: false
+        type: boolean
+        default: false
       pytorch-ref:
         description: 'Override PYTORCH_REF. Empty keeps the docker-bake.hcl default.'
         required: false
@@ -129,6 +133,7 @@ jobs:
           WITH_TORCHAUDIO_IMAGE: ${{ inputs.with-torchaudio-image }}
           WITH_ORT_IMAGE: ${{ inputs.with-ort-image }}
           WITH_TRITON_IMAGE: ${{ inputs.with-triton-image }}
+          WITH_VLLM_IMAGE: ${{ inputs.with-vllm-image }}
           PYTORCH_REF_IN: ${{ inputs.pytorch-ref }}
           TORCHVISION_REF_IN: ${{ inputs.torchvision-ref }}
           TORCHAUDIO_REF_IN: ${{ inputs.torchaudio-ref }}
@@ -152,7 +157,7 @@ jobs:
 
           source scripts/ci/resolve-pins.sh
 
-          # pytorch, torchvision, torchaudio, ort and triton each publish a second,
+          # pytorch, torchvision, torchaudio, ort, triton and vllm each publish a second,
           # trimmed "-wheels" tag alongside their normal one (see the
           # wheels_image() comment in docker-bake.hcl). It has to be built in the
           # same invocation as its full counterpart: bake then shares the "builder"
@@ -161,7 +166,7 @@ jobs:
           # final consumes it, so it is skipped for every other component.
           targets=("$COMPONENT")
           case "$COMPONENT" in
-            pytorch|torchvision|torchaudio|ort|triton)
+            pytorch|torchvision|torchaudio|ort|triton|vllm)
               targets+=("$COMPONENT-wheels")
               ;;
           esac

@@ -8,18 +8,21 @@ name: Build gfx803 (ROCm 10.0)
 #
 #   rocr-clr ─┬─ rocblas ─── rocsolver ─┐
 #             │                         ├─ migraphx ─┬─ pytorch ─┬─ torchvision ─┐
-#             └─ miopen ────────────────┘            │           └─ torchaudio ──┤
-#                                                    └─ ort ──────────────────────┼─ final
-#                                             triton ─────────────────────────────┘
+#             └─ miopen ────────────────┘            │           ├─ torchaudio ──┤
+#                                                    └─ ort ──────┼── vllm ───────┤
+#                                                     triton ─────────────────────┴─ final
 #
 # rocr-clr carries the patched ROCR-Runtime and CLR that make Polaris enumerate
 # and dispatch at all, so rocblas and miopen both build on top of it. migraphx
 # links rocBLAS and MIOpen for real, not through a runtime dlopen, so it needs
 # both images at build time, and it carries rocSOLVER forward for everything
-# downstream. pytorch and ort are independent of each other. triton links no
-# ROCm library at build time and needs nothing from this chain, so it runs
-# on its own from the start. final compiles nothing: it pulls every component
-# image and assembles them.
+# downstream. pytorch and ort are independent of each other. vllm needs only
+# pytorch's wheel and python-base's own stock ROCm, so it starts as soon as
+# pytorch finishes, in parallel with torchvision, torchaudio and ort, rather
+# than waiting on the rest of the torch chain. triton links no ROCm library at
+# build time and needs nothing from this chain, so it runs on its own from the
+# start. final compiles nothing: it pulls every component image and assembles
+# them.
 #
 # Each component is individually skippable, because these builds are long and the
 # inputs rarely all change at once. A skipped component's downstream jobs reuse
@@ -81,6 +84,11 @@ on:
         default: true
       build-triton:
         description: 'Build Triton (uncheck to reuse the last published image)'
+        type: boolean
+        required: false
+        default: true
+      build-vllm:
+        description: 'Build the vendored gfx803 vLLM fork'
         type: boolean
         required: false
         default: true
@@ -245,6 +253,24 @@ jobs:
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
 
+  # Starts as soon as pytorch publishes, not after torchvision/torchaudio/ort:
+  # it needs only pytorch's wheel and python-base's own stock ROCm (see the
+  # comment on this file's chain diagram above), so it runs in parallel with
+  # those three rather than behind them.
+  vllm:
+    needs: pytorch
+    if: ${{ !cancelled() && inputs.build-vllm && (needs.pytorch.result == 'success' || (needs.pytorch.result == 'skipped' && !inputs.build-pytorch)) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-component.yml
+    secrets: inherit
+    with:
+      component: vllm
+      with-pytorch-image: true
+      no-cache: ${{ inputs.no-cache }}
+      debug: ${{ inputs.debug }}
+
   # No `needs`: it links no ROCm library at build time, so it has no dependency
   # anywhere in this chain and starts immediately.
   triton:
@@ -262,7 +288,7 @@ jobs:
   # Every input arrives as a published image, so this job pulls images and
   # installs wheels and compiles nothing beyond the one-file SGEMM shim.
   final:
-    needs: [rocr-clr, rocblas, miopen, rocsolver, migraphx, pytorch, torchvision, torchaudio, ort, triton]
+    needs: [rocr-clr, rocblas, miopen, rocsolver, migraphx, pytorch, torchvision, torchaudio, ort, triton, vllm]
     if: ${{ !cancelled()
       && (needs.rocr-clr.result == 'success' || (needs.rocr-clr.result == 'skipped' && !inputs.build-rocr-clr))
       && (needs.rocblas.result == 'success' || (needs.rocblas.result == 'skipped' && !inputs.build-rocblas))
@@ -273,7 +299,8 @@ jobs:
       && (needs.torchvision.result == 'success' || (needs.torchvision.result == 'skipped' && !inputs.build-torchvision))
       && (needs.torchaudio.result == 'success' || (needs.torchaudio.result == 'skipped' && !inputs.build-torchaudio))
       && (needs.ort.result == 'success' || (needs.ort.result == 'skipped' && !inputs.build-ort))
-      && (needs.triton.result == 'success' || (needs.triton.result == 'skipped' && !inputs.build-triton)) }}
+      && (needs.triton.result == 'success' || (needs.triton.result == 'skipped' && !inputs.build-triton))
+      && (needs.vllm.result == 'success' || (needs.vllm.result == 'skipped' && !inputs.build-vllm)) }}
     permissions:
       contents: read
       packages: write
@@ -287,6 +314,7 @@ jobs:
       with-rocsolver-image: true
       with-migraphx-image: true
       with-triton-image: true
+      with-vllm-image: true
       with-pytorch-image: true
       with-torchvision-image: true
       with-torchaudio-image: true
