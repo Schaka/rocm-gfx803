@@ -1,0 +1,272 @@
+gfx803 (Polaris, GCN3): emit the packed v_dot intrinsics only where the
+instruction exists.
+
+WHY
+---
+Triton lowers an fp16 dot with f32 accumulation to `llvm.amdgcn.fdot2`, and an
+i8 dot with i32 accumulation to `llvm.amdgcn.sdot4`, whenever a dot takes the
+FMA path. gfx803 has only the FMA path: no MFMA, no WMMA. Neither instruction
+exists before CDNA1/RDNA2, so on GCN3 LLVM has no instruction to select, and
+that is a hard abort rather than a fallback to something slower:
+
+    LLVM ERROR: Cannot select: t1002: f32 = AMDGPUISD::FDOT2
+    In function: _fwd_kernel
+
+A 16x16 fp16 `tl.dot` reproduces it on its own -- no vLLM, no MIGraphX and no
+ROCm stack patch is involved:
+
+    @triton.jit
+    def dot_kernel(a, b, c, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        rm, rn, rk = tl.arange(0, BM), tl.arange(0, BN), tl.arange(0, BK)
+        A = tl.load(a + rm[:, None] * BK + rk[None, :])
+        B = tl.load(b + rk[:, None] * BN + rn[None, :])
+        tl.store(c + rm[:, None] * BN + rn[None, :], tl.dot(A, B))
+
+fp32 dots are unaffected, because they use the `fmuladd` cells, and so are bf16
+dots, which are legalized to fp32 before this lowering runs. The fp16 case is
+the one that decides whether anything runs at all: every attention and prefill
+kernel of the ROCm attention backend is an fp16 dot, so a triton that cannot
+compile one cannot start a vLLM engine. Its engine core dies during init with
+"Engine core initialization failed", and the LLVM abort above is the only
+explanation printed.
+
+Triton 3.6 emitted these cells only when `AMD::supportsVDot(arch)` reported the
+instruction, which is false for GCN3. Commit 2defcb725 ("[AMD] Create
+TargetFeatures for architectural checks", triton-lang/triton#10142) moved the
+arch predicates into the `TargetFeatures` class and dropped that call, and
+`TargetFeatures` carries no v_dot predicate to put back in its place. The same
+commit dropped the two other call sites of the same predicate, which together
+are what made the fp16 case work on a target without v_dot:
+
+  - `isLegalFMAForm` no longer asks, so it reports the fp16 -> fp32 and
+    i8 -> i32 forms legal on every target. The dot therefore stays fp16 all the
+    way into the FMA lowering instead of being legalized to a uniform type,
+    which is what `tryLegalizeFMA` does for bf16 today.
+  - `tryAccelerateF16WithVDot` lost its guard as well. It is unreachable today
+    (the caller tests it under `if (false && ...)`), but it is the same
+    assumption and would break the same way if that TODO is ever enabled.
+
+WHAT
+----
+1. `TargetFeatures.h`/`TargetFeatures.cpp`: add `supportsVDot()` -- true for the
+   families that have the instruction (CDNA1-4, RDNA2-4, GFX1250), false for
+   every other family, GCN3 included.
+2. `DotOpToLLVM/FMA.cpp`: build the fdot2/sdot4 cells only when `supportsVDot()`
+   is true.
+3. `AccelerateAMDMatmul.cpp`: restore the guard in `isLegalFMAForm`, so a target
+   without v_dot falls through to the uniform-type test at the end of that
+   function and the dot is legalized to a common type the plain FMA cells can
+   lower, and restore it in `tryAccelerateF16WithVDot`.
+
+Nothing is given up on a target without v_dot: there is no instruction for the
+packed path to have used. Upcast operands cost some of the bandwidth the packed
+path would have saved, and that is the same trade this hardware already makes
+for bf16 dots.
+
+VERIFICATION (real hardware, 2026-09-12)
+----------------------------------------
+Built at the pinned triton commit with this patch applied on top of the three
+patches above, then run on the RX 570 (gfx803). A 16x16 `tl.dot` per dtype,
+compiled and executed, GPU result against a float64 CPU reference:
+
+| dtype | before            | after                          |
+| ----- | ----------------- | ------------------------------ |
+| fp16  | LLVM abort (FDOT2)| OK, max_err 1.19e-06, LLIR has 0 fdot2 refs, asm is `v_mul_f32`/`v_add_f32` |
+| i8    | LLVM abort (sdot4)| OK, max_err 0.0, LLIR has 0 sdot4 refs |
+| fp32  | OK                | OK, max_err 1.69e-06           |
+| bf16  | OK                | OK, max_err 4.77e-07           |
+
+End to end in the `final` image, with only triton replaced by that build:
+`vllm 0.20.1+gfx803` starts an engine on the Qwen3-0.6B model in
+`/data/models/` and generates coherent text (greedy, 64 tokens, 46.6 tok/s),
+against "Engine core initialization failed" before the patch.
+
+NOT yet re-verified through CI's own triton build (its self-built LLVM and
+clang). The wheel above was built against triton's prebuilt LLVM for the same
+`cmake/llvm-info.json` pin, with gcc. Rebuild the triton and final images before
+treating a published `latest-gfx803` as carrying this fix.
+
+--- a/third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h
++++ b/third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h
+@@ -86,6 +86,11 @@ public:
+   bool supportsCvtPkScalePk8() const;
+   bool supportsHwScaledUpcast() const;
+ 
++  // Packed dot products: v_dot2 (f16/bf16 -> f32) and v_dot4 (i8 -> i32).
++  // Present from CDNA1 and RDNA2 onward. Every earlier family, gfx8xx
++  // included, has no v_dot instruction at all.
++  bool supportsVDot() const;
++
+   bool supportBitwidth16Elementwise() const;
+   bool supportBitwidth32Elementwise() const;
+ 
+diff --git a/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp b/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
+index 954e4ff..1e050fb 100644
+--- a/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
++++ b/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp
+@@ -125,6 +125,22 @@ bool TargetFeatures::isGFX1250() const {
+   return getISAFamily() == ISAFamily::GFX1250;
+ }
+ 
++bool TargetFeatures::supportsVDot() const {
++  switch (getISAFamily()) {
++  case ISAFamily::CDNA1:
++  case ISAFamily::CDNA2:
++  case ISAFamily::CDNA3:
++  case ISAFamily::CDNA4:
++  case ISAFamily::RDNA2:
++  case ISAFamily::RDNA3:
++  case ISAFamily::RDNA4:
++  case ISAFamily::GFX1250:
++    return true;
++  default:
++    return false;
++  }
++}
++
+ int TargetFeatures::getWarpSize() const {
+   switch (getISAFamily()) {
+   case ISAFamily::GCN3:
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/DotOpToLLVM/FMA.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/DotOpToLLVM/FMA.cpp
+index 03e2b16..d6a3e2a 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/DotOpToLLVM/FMA.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/DotOpToLLVM/FMA.cpp
+@@ -1,3 +1,4 @@
++#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
+ #include "triton/Conversion/TritonGPUToLLVM/FMADotUtility.h"
+ #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+@@ -5,6 +6,7 @@
+ using namespace mlir;
+ using namespace mlir::triton;
+ using namespace ::mlir::triton::gpu;
++using mlir::triton::amdgpu::TargetFeatures;
+ 
+ namespace {
+ 
+@@ -30,20 +32,28 @@ class AMDFMAVectorMultiplier : public FMAVectorMultiplier {
+     DotIntrinsic chosenOp;
+ 
+     auto b = TritonLLVMOpBuilder(loc, rewriter);
+-    if ((aElemTy.isF16() || aElemTy.isBF16()) && dElemTy.isF32()) {
+-      chosenOp.vectorSize = 2;
+-      chosenOp.outElemTy = f32_ty;
+-      chosenOp.intrinsicName =
+-          aElemTy.isF16() ? "llvm.amdgcn.fdot2" : "llvm.amdgcn.fdot2.f32.bf16";
+-      chosenOp.additionalArgs = {b.false_val()};
+-      return chosenOp;
+-    }
+-    if (aElemTy.isInteger(8) && dElemTy.isInteger(32)) {
+-      chosenOp.vectorSize = 4;
+-      chosenOp.outElemTy = i32_ty;
+-      chosenOp.intrinsicName = "llvm.amdgcn.sdot4";
+-      chosenOp.additionalArgs = {b.false_val()};
+-      return chosenOp;
++    // v_dot2/v_dot4 exist from CDNA1/RDNA2 onward only. Emitting the intrinsic
++    // on a family that has no such instruction is not a slow path but a fatal
++    // one: LLVM finds no instruction to select and aborts codegen, so decide it
++    // from the target rather than emitting it unconditionally.
++    if (TargetFeatures::fromModuleOp(op->getParentOfType<ModuleOp>())
++            .supportsVDot()) {
++      if ((aElemTy.isF16() || aElemTy.isBF16()) && dElemTy.isF32()) {
++        chosenOp.vectorSize = 2;
++        chosenOp.outElemTy = f32_ty;
++        chosenOp.intrinsicName =
++            aElemTy.isF16() ? "llvm.amdgcn.fdot2"
++                            : "llvm.amdgcn.fdot2.f32.bf16";
++        chosenOp.additionalArgs = {b.false_val()};
++        return chosenOp;
++      }
++      if (aElemTy.isInteger(8) && dElemTy.isInteger(32)) {
++        chosenOp.vectorSize = 4;
++        chosenOp.outElemTy = i32_ty;
++        chosenOp.intrinsicName = "llvm.amdgcn.sdot4";
++        chosenOp.additionalArgs = {b.false_val()};
++        return chosenOp;
++      }
+     }
+     // choose one of FMA intrinsics
+     assert(aElemTy.isIntOrFloat() && !aElemTy.isIntOrIndex());
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
+index f9e674f..0c1df3a 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
+@@ -1611,34 +1611,42 @@ public:
+     auto aOpType = dotOp.getA().getType();
+     int rank = aOpType.getRank();
+     int k = aOpType.getShape()[rank - 1];
+-    // Try Fp16 x Fp16 -> Fp32 v_dot
+-    // if k % 2 != 0: can not use fp V_DOT instruction
+-    if (dotTypes.a.isF16() && dotTypes.b.isF16() && dotTypes.c.isF32() &&
+-        dotTypes.d.isF32() && k % 2 == 0) {
+-      return true;
+-    }
++    // The three forms below are the v_dot forms, so they are legal only where
++    // the instruction exists. Everywhere else this must fall through to the
++    // uniform-type test at the end of the function: that rejects the mixed
++    // f16 -> f32 and i8 -> i32 shapes, and the caller then legalizes them to a
++    // common type that the plain FMA cells can lower.
++    if (targetFeatures.supportsVDot()) {
++      // Try Fp16 x Fp16 -> Fp32 v_dot
++      // if k % 2 != 0: can not use fp V_DOT instruction
++      if (dotTypes.a.isF16() && dotTypes.b.isF16() && dotTypes.c.isF32() &&
++          dotTypes.d.isF32() && k % 2 == 0) {
++        return true;
++      }
+ 
+-    // CDNA4 has Bf16 v_dot2
+-    if (targetFeatures.isCDNA4() && dotTypes.a.isBF16() &&
+-        dotTypes.b.isBF16() && dotTypes.c.isF32() && dotTypes.d.isF32() &&
+-        k % 2 == 0) {
+-      return true;
+-    }
++      // CDNA4 has Bf16 v_dot2
++      if (targetFeatures.isCDNA4() && dotTypes.a.isBF16() &&
++          dotTypes.b.isBF16() && dotTypes.c.isF32() && dotTypes.d.isF32() &&
++          k % 2 == 0) {
++        return true;
++      }
+ 
+-    // TODO: enable this condition, when fp32 -> fp16 cast works correctly
+-    // Consider this case as non legal, despite this case is covered by fp16
+-    // FMA. Because v_dot expected to give both better performance and
+-    // computational precision.
+-    if (false && dotTypes.a.isF16() && dotTypes.b.isF16() &&
+-        dotTypes.c.isF16() && dotTypes.d.isF16() && k % 2 == 0) {
+-      return false;
+-    }
++      // TODO: enable this condition, when fp32 -> fp16 cast works correctly
++      // Consider this case as non legal, despite this case is covered by fp16
++      // FMA. Because v_dot expected to give both better performance and
++      // computational precision.
++      if (false && dotTypes.a.isF16() && dotTypes.b.isF16() &&
++          dotTypes.c.isF16() && dotTypes.d.isF16() && k % 2 == 0) {
++        return false;
++      }
+ 
+-    // Try I8 x I8 -> I32 v_dot
+-    // if k % 4 != 0: can not use integer V_DOT instruction
+-    if (dotTypes.a.isInteger(8) && dotTypes.b.isInteger(8) &&
+-        dotTypes.c.isInteger(32) && dotTypes.d.isInteger(32) && k % 4 == 0) {
+-      return true;
++      // Try I8 x I8 -> I32 v_dot
++      // if k % 4 != 0: can not use integer V_DOT instruction
++      if (dotTypes.a.isInteger(8) && dotTypes.b.isInteger(8) &&
++          dotTypes.c.isInteger(32) && dotTypes.d.isInteger(32) &&
++          k % 4 == 0) {
++        return true;
++      }
+     }
+ 
+     auto expectedElTy = dotTypes.a;
+@@ -1655,6 +1663,10 @@ public:
+ 
+   LogicalResult tryAccelerateF16WithVDot(DotOp dotOp, PatternRewriter &rewriter,
+                                          const DotElTypes &dotTypes) const {
++    if (!targetFeatures.supportsVDot())
++      return rewriter.notifyMatchFailure(
++          dotOp, "Target architecture does not support V_DOT instruction.");
++
+     // If this is fp16 x fp16 ->fp16 case prioritize using v_dot.
+     auto aOpType = dotOp.getA().getType();
+     int rank = aOpType.getRank();

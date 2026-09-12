@@ -24,7 +24,7 @@ rm -rf "$PROBES"
 mkdir -p "$PROBES"
 cp "$REPO/verify.py" "$PROBES/"
 cp "$REPO"/tools/tc-staleness/{ms3,ms4,multistream2,conbrace3,xprobe2,pinnedhost,graphprobe}.py "$PROBES/"
-cp "$REPO"/tools/correctness-suite/{torch_op_suite,fp16_gemm_sweep}.py "$PROBES/"
+cp "$REPO"/tools/correctness-suite/{torch_op_suite,fp16_gemm_sweep,triton_dot_probe}.py "$PROBES/"
 
 cleanup() {
   podman exec "$NAME" bash -lc "pkill -9 -f '[p]ython3' >/dev/null 2>&1; true" 2>/dev/null
@@ -109,6 +109,20 @@ for i in $(seq 0 26); do
   esac
 done
 echo "F16SWEEP-NOSHIM pass=$pass2 fail=$fail2 (want 27/0)"
+
+echo "--- triton dot canary: one process per dtype, because a compiler abort kills the process"
+# Nothing else in this gate compiles a triton kernel, and vLLM cannot start
+# without an fp16 dot, so a silent triton/fdot2 regression reaches a published
+# image otherwise. Missing output is the abort, not a skip.
+for dt in fp16 bf16 fp32 i8; do
+  cleanup
+  r=$(timeout 600 podman exec "$NAME" python3 /data/s6/imgval-probes/triton_dot_probe.py --dtype "$dt" 2>&1 \
+      | grep -aoE 'TRITONDOT .*' | tail -1)
+  case "$r" in
+    *'"ok": true'*) echo "   triton dot $dt OK: $r";;
+    *)              echo "   triton dot $dt FAILED: ${r:-<no output: the triton compiler aborted>}";;
+  esac
+done
 
 echo "--- op suite (long)"
 cleanup

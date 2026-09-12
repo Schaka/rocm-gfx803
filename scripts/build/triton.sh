@@ -26,11 +26,16 @@ TRITON_REF="${TRITON_REF:?TRITON_REF is required}"
 git -C /triton-src submodule sync --recursive
 git -C /triton-src submodule update --init --recursive --depth 1
 
-# bash, not sh: these three drivers are written against bash (${BASH_SOURCE[0]},
+# bash, not sh: these four drivers are written against bash (${BASH_SOURCE[0]},
 # [[ ]]), unlike every other patch driver in this repo.
+#
+# Order matters for the last two: gfx803-isa-family.patch is what makes the AMD
+# backend accept gfx803 at all, and both later patches keep one of its lines as
+# context.
 bash /patches/triton/apply-gfx803-isa-family.sh /triton-src
 bash /patches/triton/apply-gfx803-dpp-broadcast-warpreduce.sh /triton-src
 bash /patches/triton/apply-fold-true-cmpi-while-nested-in-for-hang.sh /triton-src
+bash /patches/triton/apply-gfx803-vdot-gate.sh /triton-src
 
 llvm_hash="$(python3 -c "import json; print(json.load(open('/triton-src/cmake/llvm-info.json'))['llvm_hash'])")"
 llvm_repo="$(python3 -c "import json; print(json.load(open('/triton-src/cmake/llvm-info.json')).get('repository', 'triton-lang/llvm-project'))")"

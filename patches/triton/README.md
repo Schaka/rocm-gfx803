@@ -14,15 +14,17 @@ work, measured on a real RX 470.
 | `apply-gfx803-dpp-broadcast-warpreduce.sh` | Applies the patch and verifies it. Requires `gfx803-isa-family.patch` first. |
 | `fold-true-cmpi-while-nested-in-for-hang.patch` | Fixes a real GPU hang (BACO reset, hardware-verified). A `while` loop nested inside a `for`-loop with trip count 1 gets its own exit condition folded to a constant by `TritonAMDFoldTrueCmpI`. This produces an infinite loop, or a zero-iteration loop. The bug is not gfx803-specific in mechanism, only proven on gfx803 hardware. |
 | `apply-fold-true-cmpi-while-nested-in-for-hang.sh` | Applies the patch and verifies it. Independent of the other two patches. |
+| `gfx803-vdot-gate.patch` | Emissions of `llvm.amdgcn.fdot2`/`sdot4` are gated on the target actually having v_dot. Without it an fp16 `tl.dot` is a fatal LLVM abort on gfx803, and no vLLM engine can start. |
+| `apply-gfx803-vdot-gate.sh` | Applies the patch and verifies it. Requires `gfx803-isa-family.patch` first. |
 
 Apply order: apply `gfx803-isa-family.patch` before
-`gfx803-dpp-broadcast-warpreduce.patch`, because the second patch's context
-assumes `ISAFamily::GCN3` already exists. Apply
-`fold-true-cmpi-while-nested-in-for-hang.patch` in any order, because it is
-independent of the other two.
+`gfx803-dpp-broadcast-warpreduce.patch` and before `gfx803-vdot-gate.patch`,
+because both of those patches' context assumes `ISAFamily::GCN3` already
+exists. Apply `fold-true-cmpi-while-nested-in-for-hang.patch` in any order,
+because it is independent of the other three.
 
 This repo pins triton to one exact commit, not a branch. See `TRITON_REF` in
-`docker-bake.hcl` for why. It mirrors PyTorch's own triton pin. All three
+`docker-bake.hcl` for why. It mirrors PyTorch's own triton pin. All four
 patches are re-diffed against that exact commit. Each patch header's RE-DIFF
 section says what moved since the patch was first written and
 hardware-verified. Check that the header's WHY still holds before you trust a
@@ -46,11 +48,15 @@ so it was Unknown. The patch:
    `gfx803-dpp-broadcast-warpreduce.patch`'s own header).
 
 Feature flags are already correct by default for GCN3. `isCDNA()` and
-`isRDNA()` return false, so GCN3 gets no MFMA. Every `v_dot`-gated path in
-`AccelerateAMDMatmul.cpp` is reached only through `isCDNA()`/`isCDNA4()`, so
-it stays off. Triton lowers `tl.dot` to FMA on this arch. That is correct. When a
-dot-product instruction is needed, the packed-dp4a trick from llama.cpp
-applies instead.
+`isRDNA()` return false, so GCN3 gets no MFMA, and the `v_dot`-gated choices
+that do ask the family stay off. What does not stay off by itself is the packed
+intrinsic emission: `lm.amdgcn.fdot2` and `llvm.amdgcn.sdot4` are emitted
+whenever a dot takes the FMA path, whatever the family, and on a target without
+v_dot that is not a slow path but a fatal one -- LLVM finds no instruction to
+select and aborts codegen, taking the whole compile with it. So triton does not
+lower every `tl.dot` to FMA on this arch by default: an fp16 dot with f32
+accumulation goes to those intrinsics, and `gfx803-vdot-gate.patch` is what puts
+it back on the FMA path. See that patch's header for the hardware measurements.
 
 ## Build requirements (triton's LLVM must be built a specific way)
 
@@ -141,6 +147,45 @@ Every test below ran from that `final` image on the real RX 470.
 
 This closes the re-diff gap for all three patches, including the
 while-nested-in-for fix.
+
+## Verification (real hardware, 2026-09-12): v_dot gate on the pinned triton
+
+Found while validating the published `final` image on the card: `vllm
+0.20.1+gfx803` could not start an engine at all, because the ROCm attention
+backend's prefill kernel is an fp16 dot with f32 accumulation and triton emitted
+`llvm.amdgcn.fdot2` for it. LLVM has no instruction to select, and aborts instead
+of falling back:
+
+    LLVM ERROR: Cannot select: t1002: f32 = AMDGPUISD::FDOT2
+    In function: _fwd_kernel
+
+Per-dtype 16x16 `tl.dot`, compiled and run on the RX 570, GPU result against a
+float64 CPU reference, before and after `gfx803-vdot-gate.patch`:
+
+| dtype | before | after |
+| --- | --- | --- |
+| fp16 | LLVM abort (`FDOT2`) | OK, max_err 1.19e-06 |
+| i8 | LLVM abort (`sdot4`) | OK, max_err 0.0 |
+| fp32 | OK | OK, max_err 1.69e-06 |
+| bf16 | OK | OK, max_err 4.77e-07 |
+
+That table also states what the 2026-09-07 pass above did not cover: its `tl.dot`
+GEMM shapes cannot have been fp16, because an fp16 dot on that image aborts.
+fp32 and bf16 dots both reach the f32 FMA path, so both passed. fp16 is the one
+every attention and prefill kernel uses.
+
+End to end, on the same image with only triton replaced by the build carrying
+this patch: the engine starts and generates coherent text (greedy, 64 tokens,
+46.6 tok/s) where it previously died in core init with "Engine core
+initialization failed".
+
+Two limits on this pass. The wheel was built against triton's prebuilt LLVM for
+the same `cmake/llvm-info.json` pin and with gcc, not through CI's self-built
+LLVM and clang, so only a CI rebuild of the `triton` and `final` images makes a
+published `latest-gfx803` carry a verified version of this patch. And a bf16 run
+of the same model, prompt and settings produced incoherent output, identically
+before and after this patch -- a separate, still unidentified problem that this
+patch neither causes nor fixes.
 
 ## Known limitations
 

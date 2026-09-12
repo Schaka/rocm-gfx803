@@ -100,6 +100,16 @@ the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0 tok/s, decode
 `patches/rocm-systems/d2h-null-dsthost.patch`; `AGENTS.md` gives the reason for
 each.
 
+The published `latest-gfx803` image carries that fork too: `final` installs the
+wheel and the three compiled gfx803 kernels into `/opt/venv`, so running vLLM
+needs no box-native install. What it does need is
+`patches/triton/gfx803-vdot-gate.patch` inside the image's triton: without it an
+fp16 `tl.dot` is a fatal LLVM abort and no engine starts, because the attention
+backend's prefill kernel is one. Measured on the image (2026-09-12) with that
+patch: engine init 88 s and coherent greedy generation at 46.6 tok/s on
+Qwen3-0.6B. A bf16 run of the same model starts but produces incoherent output;
+that is a separate, open problem, and fp16 is the dtype the numbers above use.
+
 ## Component images, pins, and line provenance
 
 A component target either builds from source or consumes a published

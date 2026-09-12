@@ -302,8 +302,19 @@ device. Verified on the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0
 tok/s, decode 30.2 tok/s, on a 2101-token prompt and 128 decode tokens. The
 7.14 record for the same bench is 331.7 and 24.4.
 
-The fork is not built by this repo's Dockerfile. vLLM runs as a box-only editable
-install. It is also not documented with `.patch.md` files under `patches/vllm/`.
+CI builds the fork into the published image. `docker/vllm.Dockerfile` wheels it
+and compiles its three gfx803 kernels, and `final.Dockerfile` installs both into
+`/opt/venv` through `scripts/build/final-vllm.sh`, which also asserts the package
+imports. The box-only editable install under `/data/vllm-mobydick/` is the same
+source tree and stays for hardware debugging, where a container's PID namespace
+gets in the way of gdb and ftrace. Both paths carry the same source, so a result
+measured on one is a claim about the other only once the other has been rebuilt.
+
+vLLM in the image runs only if triton can compile an fp16 dot on gfx803, because
+the ROCm attention backend's prefill kernel is one. That is
+`patches/triton/gfx803-vdot-gate.patch`. Evidence from the box-native stack is
+not evidence about the image on this point: the two run different triton builds.
+It is also not documented with `.patch.md` files under `patches/vllm/`.
 That convention belonged to an older version of this repo that did not vendor
 vLLM at all, and commit `a8485b4` ("[Build] Bring working vLLM in") removed it on
 purpose. Do not bring it back. Every gfx803 finding in vLLM goes into the real
