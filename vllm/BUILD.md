@@ -9,14 +9,17 @@ vLLM here is vendored, not patched. This folder is upstream vLLM
 patch file. You install this folder as a Python package and compile
 three small kernel files.
 
-The port touches twelve existing files, plus the three kernels and
-their `ctypes` loaders. `NOTES.md` records what each change does and
-how it was measured.
+The port touches twelve existing files, three hand-written kernels with
+their `ctypes` loaders, and one module that calls rocBLAS directly to
+get around a Tensile GEMV path that returns silently wrong results.
+`NOTES.md` records what each change does and how it was measured.
 
-If you have not read `NOTES.md`, read it first. It records that this
-vLLM path is not usable end to end yet. The cause is an open hardware
-bug, the gfx7/8 EOP-interrupt-loss erratum. The build steps below
-still work. Only long, uninterrupted runs hit that separate bug.
+If you have not read `NOTES.md`, read it first. It records what the port
+changes and how each change was measured, including the gfx7/8
+EOP-interrupt-loss erratum. That erratum is a firmware-level finding from
+earlier runs on this line; it has not reproduced in the runs since, so
+this path does run end to end. A workload you expect to run for hours
+should still use the relaunch supervisor `NOTES.md` describes.
 
 ## Where you build
 
@@ -90,14 +93,15 @@ change alone.
 
 ## Step 5: Check the build
 
-Run this sanity check. It loads a small model and generates a few
-tokens. It does not check speed, only that the build produces coherent
-text.
+Run this sanity check. It loads the box's small fp16 test model and
+generates a few tokens. It does not check speed, only that the build
+produces coherent text. Point `model=` at any local fp16 model if that
+one is not on your box.
 
 ```
 cd /data/vllm-mobydick && /opt/venv/bin/python3 -c "
 from vllm import LLM, SamplingParams
-llm = LLM(model='/data/qwen2.5-1.5b', gpu_memory_utilization=0.7,
+llm = LLM(model='/data/models/Qwen3-0.6B', gpu_memory_utilization=0.7,
           max_model_len=1024, dtype='float16',
           compilation_config={'cudagraph_capture_sizes': [1]})
 for p in ['The capital of France is', '2 + 2 =']:
@@ -106,9 +110,18 @@ for p in ['The capital of France is', '2 + 2 =']:
 "
 ```
 
-Use `dtype='float16'` always. Do not use `dtype='bfloat16'` on gfx803.
-This hardware has no native bf16 support, and the first bf16 kernel
-call hangs.
+The `cd` is deliberate: that folder holds a `vllm/` source tree, so a
+Python started from it imports that tree rather than the installed
+package. That is what you want while iterating on the source, but it
+also means this check reports on the folder, not on whatever `pip` last
+installed there.
+
+Use `dtype='float16'` always. gfx803 has no bf16 instruction, and the
+ROCm GEMM fallback that would run in its place keeps only about bf16
+precision in its accumulator, so bf16 produces incoherent text instead
+of an error. The platform refuses it up front instead: `dtype='auto'`
+warns and falls back to fp16, and an explicit `dtype='bfloat16'` raises
+with a message pointing at `--dtype=half`.
 
 If you changed a kernel, also run the correctness probes under
 `tools/vllm-bench/` (`probe_gemv_m.py`, `verify_gemv_m.py`) before you
@@ -135,10 +148,16 @@ of the "Build gfx803 (ROCm 10.0)" workflow builds and wires in vLLM by
 default. Uncheck "Build the vendored gfx803 vLLM fork" to skip it and
 reuse the last published `vllm` image instead.
 
-Nobody ran the resulting final image on real hardware yet. The image
-builds and `import vllm` succeeds in CI, and that is a build check
-only. Someone must run the checks below on the box and record the
-result here before this counts as verified.
+An image build verifies that the package imports, not that an engine
+runs: nothing in the pipeline starts vLLM on the card. The on-card gate
+`tools/imgvalidate.sh` covers the shipped libraries, the coherence
+probes, the fp16 GEMM sweep and a triton dot canary, but never imports
+vLLM, so Step 5 below is the only engine check there is. It has been run
+against the image carrying the previous fork (`vllm 0.20.1+gfx803`),
+which started an engine and generated coherent greedy text at 46.6 tok/s
+on Qwen3-0.6B. The 0.29.0 fork in this folder has so far been checked on
+the box-native install only, so that run is still owed for an image of
+it.
 
 ## Using vLLM in the final image
 
@@ -153,7 +172,26 @@ docker run -it --device=/dev/kfd --device=/dev/dri --group-add video \
     <final-image-tag> bash
 ```
 
-Then run Step 5's sanity check inside the container, unchanged.
+Then run the same check inside the container. Two things change from
+Step 5: leave out the `cd`, and mount the directory your model lives in.
+The `cd` has to go because the image installs the package into
+`/opt/venv`, and a `vllm/` source directory in the working directory
+would be imported ahead of it. `python -c` is used rather than a script
+file because the engine spawns a core process that re-imports `__main__`
+unless it is guarded:
+
+```
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+    -v /data:/data <final-image-tag> /opt/venv/bin/python3 -c "
+from vllm import LLM, SamplingParams
+llm = LLM(model='/data/models/Qwen3-0.6B', gpu_memory_utilization=0.7,
+          max_model_len=1024, dtype='float16',
+          compilation_config={'cudagraph_capture_sizes': [1]})
+for p in ['The capital of France is', '2 + 2 =']:
+    out = llm.generate([p], SamplingParams(temperature=0.0, max_tokens=32))
+    print(repr(out[0].outputs[0].text))
+"
+```
 
 Are you iterating on a kernel change and want to test it before it
 lands in CI? Keep using the box-native build in Steps 1 through 5. You

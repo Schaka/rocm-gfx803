@@ -17,8 +17,8 @@ cd /vllm-src
 jobs="$(resolve_build_jobs)"
 echo "vLLM build: arch $ROCM_ARCH, $jobs parallel jobs"
 
-# VLLM_VERSION_OVERRIDE: this vendored tree carries no .git of its own (see
-# AGENTS.md, "vLLM lives in vllm/ as a hard fork"), so setuptools-scm has no
+# VLLM_VERSION_OVERRIDE: this vendored tree carries no .git of its own (this
+# repo tracks the fork directly), so setuptools-scm has no
 # tag or commit history to derive a version from and fails outright. The
 # value names the upstream release the port sits on, so the built wheel says
 # which vLLM line it is. Bump it whenever vllm/ is re-based onto a new

@@ -102,6 +102,18 @@ the new one for a reader to reconcile. `git log` and `git blame` already
 hold every past version. That history is what makes overwriting the doc's
 own text safe.
 
+### A doc aimed at a person never points at an agent-only file.
+
+`README.md`, a `BUILD.md`, a `NOTES.md`, a patch header, a tool's docstring, and
+any message a tool prints are all written for a person. Never cite `AGENTS.md`,
+`CLAUDE.md`, a skill file, or any other file whose only reader is an agent: a
+person following this repo has no reason to open one, and sending them there
+hands them instructions that were never meant for them. If a rule that lives in
+an agent file is what makes a human-facing doc correct, restate the rule in that
+doc, in its own words. The same goes for a `::error::` line or a warning a script
+prints at build time: state the reason itself, never a pointer at a file the
+reader may not have.
+
 ## Why this repo exists, and what that means for your work
 
 AMD dropped support for gfx803 (Polaris) in ROCm 6.0. Every fix here is local.

@@ -14,14 +14,19 @@ depending on prompt length. See `llama-cpp-gfx803/POSSIBLE_LLAMA_CPP_
 IMPROVEMENTS.md` for the sibling llama.cpp-side investigation this work
 grew out of.
 
-**This vLLM path is not currently usable end-to-end.** A real hardware
-erratum (gfx7/8 EOP-completion-interrupt loss — see "The blocking issue"
-below) intermittently and unrecoverably wedges HIP kernel-module upload,
-independent of everything documented here. All the performance work
-below is real and hardware-verified in isolation; it was never able to
-run for long, uninterrupted stretches because of that separate bug. "The
-blocking issue" section below is the current, complete record of that
-erratum on this line.
+This vLLM path runs end to end on the 10.0 line. Every number below comes
+from uninterrupted runs on the card: engine init, coherent generation, the
+kernel probes and the concurrency sweep, including a 2101-token prompt on
+2026-09-02 and the 0.29.0 validation runs on 2026-09-12.
+
+The gfx7/8 EOP-completion-interrupt loss described under "The blocking
+issue" is a firmware-level erratum that intermittently wedged HIP
+kernel-module upload during earlier runs on this line. It has not
+reproduced in any run recorded here, and the current stack does not
+provoke it, but it is intermittent and was never explained away. That
+section is kept intact as the record to start from if module upload ever
+wedges again, and a workload expected to run for hours still goes under
+`tools/host-setup/vllm-relaunch-supervisor.sh`.
 
 ## What ships and works
 
@@ -180,20 +185,26 @@ carries the gemm1 and wna16 plumbing the fork had added. This repo's rule
 applies: a change that applied cleanly before is not evidence it is still
 needed.
 
-One consequence is worth stating plainly. **None of this is verified on
-hardware.** v0.29.0 is a long way from the line the port was measured on,
-and a tree that compiles is not a tree that computes correctly. The gates
-in "How to reproduce" still have to run, in order. Until they do, every
-performance number in this document describes the previous tree.
+One consequence is worth stating plainly: a rebase that compiles is not a
+rebase that computes correctly, and the items dropped above were dropped
+by reading, not by testing. The tree has since been validated on the card
+— open item 10 has what ran and what came back — but that validation
+covers the paths a dense fp16 run reaches, which is the same set those
+items were dropped for being outside of. Anything outside it is still
+unverified here.
+
+The performance numbers in the sections above were measured on the
+previous tree, not this one; open item 10 carries this tree's own.
 
 The vendored `vllm/` tree is wired into this repo's Dockerfile build:
 `docker-bake.hcl`'s `vllm` target builds the wheel and the three
 kernels, and `docker/final.Dockerfile` installs both into the published
-final image. This is a build-only check. Nobody ran the resulting final
-image on real hardware yet — see `BUILD.md`. Iterating on the box with
-`/data/vllm-mobydick` and `pip3 install --no-build-isolation --no-deps
--e .` still works, and stays the right way to test a kernel change
-before it lands in CI.
+final image. That is a build check, not an engine check: an image can
+pass CI, and the on-card gate, without vLLM ever starting. `BUILD.md`
+has the engine check and says which fork it has been run against.
+Iterating on the box with `/data/vllm-mobydick` and `pip3 install
+--no-build-isolation --no-deps -e .` still works, and stays the right way
+to test a kernel change before it lands in CI.
 
 ### Building this tree: one TU needs a lower optimization level
 
@@ -449,8 +460,8 @@ misdirect) the real completion. Root-caused and fixed in this repo
 already (`patches/kernel/REFERENCE-amdkfd-gfx7-8-missed-interrupt-
 wakeup.patch`) — **but this was found chasing a *different*, now-fixed
 symptom** (a multi-hour engine-startup hang during compiled-kernel
-loading); it reduced but did not eliminate the deeper, still-open EOP-
-interrupt-loss erratum documented below, in "The blocking issue." Don't
+loading); it reduced but did not eliminate the separate EOP-interrupt-loss
+erratum documented below, in "The blocking issue." Don't
 confuse the two — this fix is real and should stay, but it is not the
 fix for that section.
 
@@ -592,7 +603,7 @@ of not writing into someone else's buffer.
   fast; the real decode win came entirely from the kernel fixes above,
   not from graph capture itself.
 
-## The blocking issue: gfx7/8 EOP-interrupt loss (open, unresolved)
+## The blocking issue: gfx7/8 EOP-interrupt loss (intermittent, not currently reproducing)
 
 This is the same erratum documented in `rocm7.14/MIGRATION_NOTES.md`
 ("gfx7/8 EOP-completion-notification-loss" section), from the archived
@@ -771,9 +782,10 @@ minBlocksPerMultiprocessor)` before anything else.
 
 ## Open items (as of the last session that touched this work)
 
-1. **The EOP-interrupt-loss hang is the actual blocker** — see "The
-   blocking issue" above for the current state; nothing in this
-   document changes that status.
+1. **The EOP-interrupt-loss hang is not currently reproducing.** No run
+   recorded here has hit it, and the current stack does not provoke it,
+   but it is intermittent and unexplained — see "The blocking issue"
+   above. The relaunch supervisor stays in place until it is explained.
 2. `qkv_proj` bias support for the prefill GEMM kernel — currently
    excluded entirely (`bias is None` gate), meaning one of the four
    linear layers gets none of the prefill speedup.
@@ -808,9 +820,10 @@ minBlocksPerMultiprocessor)` before anything else.
 8. The user's longer-term goal (4-6x RX 470/580 8GB cards, multi-GPU,
    larger models) is entirely unstarted — every number in this document
    is single-GPU.
-9. The vendored `vllm/` tree is wired into the CI Dockerfile build now,
-   but nobody ran the resulting final image on the box — see `BUILD.md`
-   for the build steps and what still needs checking.
+9. The vendored `vllm/` tree is wired into the CI Dockerfile build. The
+   image carrying the previous fork (`vllm 0.20.1+gfx803`) was run on the
+   box and generated coherent text; an image carrying this 0.29.0 fork has
+   not been built yet, so its engine check is still owed — see `BUILD.md`.
 10. **The 0.29.0 rebase is built and hardware-validated.**
     Validated on the RX 570 box with `vllm 0.29.0+gfx803`, `triton 3.8.0`,
     `torch 2.14.0+git80271d2` against the ROCm 10.0 stack. Results:

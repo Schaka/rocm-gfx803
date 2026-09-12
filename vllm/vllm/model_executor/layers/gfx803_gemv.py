@@ -17,8 +17,8 @@ Three fast paths, combined:
    only portable HIP intrinsics (`__hmul2`/`__hfma2`/`__shfl_xor`), no
    GFX9+-only dot-product ASM (`v_dot2_f32_f16`) or MFMA -- and the
    compiled `_rocm_C.abi3.so` on this box already contains gfx803 code
-   objects (this whole stack is built targeting gfx803 -- see
-   AGENTS.md), so it runs as-is, no rebuild needed. **BUT: silently wrong
+   objects (this whole stack is built targeting gfx803), so it runs as-is,
+   no rebuild needed. **BUT: silently wrong
    at larger K, including within vLLM's own stated `k<=8192` safety gate**
    -- direct correctness check (`torch.nn.functional.linear` reference)
    found K=1536 correct up to M=151936, while K=8192 and K=8064 both

@@ -145,8 +145,8 @@ Every test below ran from that `final` image on the real RX 470.
   data dependency, nested in a `tl.range` for-loop with trip count 1) ran
   to completion with the correct output. No hang.
 
-This closes the re-diff gap for all three patches, including the
-while-nested-in-for fix.
+This closes the re-diff gap for the three patches re-diffed at that
+point, including the while-nested-in-for fix.
 
 ## Verification (real hardware, 2026-09-12): v_dot gate on the pinned triton
 

@@ -12,9 +12,9 @@
 # seen re-running (not serving from cache) the same multi-minute COPY on every
 # attempt, so a retry loop on this failure only burns CI time to fail the same
 # way each time. Recognized once and failed fast instead. If the runner is
-# genuinely this tight on space, the fix belongs in docker-bake.hcl or
-# AGENTS.md's "Runner disk budget for the final stage", not in a longer retry
-# loop here.
+# genuinely this tight on space, the fix belongs in docker-bake.hcl -- give the
+# component a trimmed wheels-only image, so final copies less than it pulls --
+# not in a longer retry loop here.
 bake_push_with_retry() {
     _attempt=1
     _max_attempts=5
@@ -28,7 +28,7 @@ bake_push_with_retry() {
             return 0
         fi
         if grep -qi "no space left on device" "$_log"; then
-            echo "::error::bake --push $* failed on disk space, not retrying -- see AGENTS.md's \"Runner disk budget for the final stage\"" >&2
+            echo "::error::bake --push $* failed on disk space, not retrying -- the final stage pulls more image than it copies; give the component a wheels-only image or free space on the runner" >&2
             rm -f "$_log"
             return 1
         fi

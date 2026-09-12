@@ -54,7 +54,8 @@ line up with this exactly:
     vLLM build -- if it reproduces there too, it's a generic/portability
     bug worth reporting upstream to vLLM regardless of gfx803's
     unsupported status here; if it's gfx803-only, it stays this repo's to
-    fix (matches AGENTS.md's differential-testing guidance). Per this
+    fix (compare against another architecture before calling a bug
+    gfx803-specific). Per this
     repo's standing scope, gfx803 is unsupported upstream since ROCm 6.0
     and nothing here gets filed/upstreamed -- any fix stays local
     (already shipped: gfx803_gemv.py's `gfx803_triton_gemv` Triton

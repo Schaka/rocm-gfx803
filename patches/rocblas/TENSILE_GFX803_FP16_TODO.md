@@ -199,8 +199,8 @@ A real patch now exists and gets the kernel **all the way to running on
 the RX 470** -- which is past every blocker this document originally
 scoped -- but the kernel **miscomputes silently** (Tensile's client
 validation reports mismatches; the kernel runs without crashing). This is
-the "silent miscompute" class this repo's `AGENTS.md` warns about, so
-nothing below counts as verified.
+the "silent miscompute" class that is this architecture's recurring failure
+mode, so nothing below counts as verified.
 
 ### What's implemented (all edits tagged `GFX803_FP16_NOD16_PATCH`)
 
@@ -502,7 +502,7 @@ Toolchain needed (already present on the box, confirmed working):
 
 ## How to validate a fix (do not skip any of this)
 
-Matching this repo's standing philosophy (`AGENTS.md`): **a patch that
+**A patch that
 compiles clean has confirmed nothing about correctness.** This
 architecture's recurring failure mode is *silent* miscompute, not
 crashes.
@@ -563,6 +563,6 @@ crashes.
   re-selects among *already-generated* candidate solutions; it cannot
   generate new ones. gfx803 has none to retune among until this codegen
   gap is fixed.
-- Per `AGENTS.md`: this is local-patches-only work. gfx803 has been
+- This is local-patches-only work. gfx803 has been
   unsupported upstream since ROCm 6.0 -- do not file this upstream to
   AMD/Tensile. Any fix stays in this repo.

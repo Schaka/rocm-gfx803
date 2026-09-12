@@ -200,8 +200,9 @@ function "cache_ref" {
 # pulls; the plain image(component) tag above still publishes the full stage,
 # because torchvision and torchaudio build against pytorch's full one. This is
 # the fix for final running the runner disk out of space every time a new
-# from-source component (most recently triton) is wired into it: see the
-# "Runner disk budget for the final stage" section in AGENTS.md.
+# from-source component is wired into it: a COPY --from=<component> needs that
+# component's whole published image on disk before it can copy one file out of
+# it, so what final pulls has to be the wheel-only image.
 function "wheels_image" {
   params = [component]
   result = "${pkg(component)}:${ROCM_ARCH}-${LINE}-wheels"
@@ -547,8 +548,9 @@ target "triton-wheels" {
   cache-to   = []
 }
 
-# The gfx803 vLLM fork lives in-tree at vllm/ (see AGENTS.md, "vLLM lives in
-# vllm/ as a hard fork"), so this target takes no *_REF pin and clones nothing:
+# The gfx803 vLLM fork lives in-tree at vllm/ (this repo tracks the tree
+# directly, with no submodule and no separate history), so this target takes no
+# *_REF pin and clones nothing:
 # the build context already is the pinned source.
 #
 # Independent of the rocBLAS/MIOpen/rocSOLVER/MIGraphX chain, the same way

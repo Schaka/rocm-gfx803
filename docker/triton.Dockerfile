@@ -3,12 +3,16 @@
 # Triton built from source for gfx803, with a self-built LLVM/MLIR (triton's
 # setup.py otherwise downloads a prebuilt one that carries none of these fixes).
 #
-# Triton has never targeted pre-RDNA/pre-CDNA GCN. Three patches make it work on
+# Triton has never targeted pre-RDNA/pre-CDNA GCN. Four patches make it work on
 # gfx803: an ISA-family entry (Triton's AMD backend hard-rejects any arch whose
 # family is Unknown), a DPP lowering fix (the fallback path Triton picks for
-# non-CDNA/non-RDNA targets uses an instruction gfx803 does not have), and an
-# unrelated compiler miscompile that hangs the GPU on a specific loop shape. See
-# patches/triton/README.md for the hardware verification each one carries.
+# non-CDNA/non-RDNA targets uses an instruction gfx803 does not have), an
+# unrelated compiler miscompile that hangs the GPU on a specific loop shape, and a
+# gate on the packed v_dot intrinsics (without it an fp16 dot with f32
+# accumulation is a fatal LLVM abort, because gfx803 has no v_dot to select -- and
+# that is the shape of the ROCm attention backend's prefill kernel, so no vLLM
+# engine starts). See patches/triton/README.md for the hardware verification each
+# one carries.
 #
 # Needs no other component's /opt/rocm: it links no ROCm library at build time,
 # only ROCm C headers it vendors itself, and it resolves libamdhip64 and

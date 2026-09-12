@@ -44,24 +44,25 @@ what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
 
 ## Status
 
-rocm10 (this repo's root) is the only line, under active development and partly
-hardware-tested. The ROCm 10.0 stack on the test box runs rocBLAS, MIOpen,
-MIGraphX, PyTorch, ORT, and the vLLM fork on a real card. The torch correctness
-suite gives 202/202 PASS with the current patch set on the box stack. The image
-ships Triton, verified on the real card: the JIT-compile, GEMM, and hang-repro
-checks all pass (`patches/triton/README.md`).
-The full image builds end to end, and `tools/imgvalidate.sh` runs that whole
-gate against the image itself on the card: its `libamdhip64` and its
-`librocsolver.so.0` (13 of 13 `torch.linalg` routines within 1.0e-5 of CPU) are
-the shipped binaries, not a hand-built pair swapped in. `tools/imgvalidate.sh <image-tag>` is the on-card gate for a whole
-image: it asserts the shipped libraries' markers, runs `verify.py`, the coherence
-probes with a control arm that must reproduce the corruption, the fp16 GEMM and
-convolution sweep with and without the shim's takeover, and the op suite. The
-last run of it (2026-09-05) came back with verify.py all-pass, 0 anomalies in 480
-cross-stream checks against 16 in the same-configuration control, 27/27 fp16
-cases with the shim and 27/27 against real rocBLAS, op suite `BAD 0, NONFINITE
-0`, and no GPU reset or ring timeout in dmesg. `MIGRATION_NOTES.md` has the
-details, and each patch header states its own verification state.
+rocm10 (this repo's root) is the only line, under active development. The image
+carries the whole ROCm 10.0 stack built from source — ROCr and the CLR runtime,
+rocBLAS, MIOpen, rocSOLVER, MIGraphX, PyTorch, ONNX Runtime and Triton — with the
+gfx803 vLLM fork installed beside it. Everything is on its default path, and the
+environment the card needs is already set (`LD_PRELOAD` for the rocBLAS sgemm
+shim, `PYTHONPATH` for amdsmi, `HSA_OVERRIDE_GFX_VERSION`), so a container started
+from the image imports and runs any of it with no further setup.
+
+Where each part is documented:
+
+- The image as a whole, on the card: `tools/imgvalidate.sh <image-tag>`.
+- Triton, and the four patches that make it work on gfx803:
+  `patches/triton/README.md`.
+- Building vLLM, running it inside the image, and its engine check:
+  `vllm/BUILD.md`. Findings and measured numbers: `vllm/NOTES.md`.
+- The ROCm stack and kernel-side fixes: `patches/*/`, each patch header stating
+  the fault it removes and the evidence for it.
+- Pins, provenance and the tag scheme: "Component images, pins, and line
+  provenance" below.
 
 ### Required host setup
 
@@ -97,8 +98,8 @@ Hardware validation of vLLM on the 10.0 stack is done (2026-09-02). Measured on
 the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0 tok/s, decode
 30.2 tok/s. vLLM's runs on this stack depend on
 `patches/rocm-systems/va-reuse-defer-noremap.patch` and
-`patches/rocm-systems/d2h-null-dsthost.patch`; `AGENTS.md` gives the reason for
-each.
+`patches/rocm-systems/d2h-null-dsthost.patch`, each of which states the fault it
+removes in its own header.
 
 The published `latest-gfx803` image carries that fork too: `final` installs the
 wheel and the three compiled gfx803 kernels into `/opt/venv`, so running vLLM
@@ -141,7 +142,7 @@ enough.
   instead of stopping, because that is every image published to date. Set
   `GFX803_LINE_STRICT=1` to make the missing marker fatal too.
 - Branch pins stay the policy, and CI adds the commit. The `*_REF` args are still
-  release branches (see "Component pins" in `AGENTS.md`). A `git clone` of a
+  release branches. A `git clone` of a
   branch happens inside a `RUN`, so the layer's cache key is the command text,
   and that text does not change when upstream pushes. So a stale layer can
   survive a tip move with nothing to show it. `scripts/ci/resolve-pins.sh` reads
@@ -229,9 +230,9 @@ expected. It is not a sign that the patch is wrong. Before you re-diff:
 
 1. Make sure that the bug is still there. A newer upstream commit sometimes fixes
    the underlying fault outright, or replaces the whole code path a patch
-   targeted with something new. This repo's history has both outcomes; see
-   `MIGRATION_NOTES.md`. Grep the new source for the target function or struct
-   before you assume a re-diff is needed.
+   targeted with something new. This repo's history has both outcomes; the
+   archived `rocm7.14/MIGRATION_NOTES.md` records them. Grep the new source for
+   the target function or struct before you assume a re-diff is needed.
 2. Make sure that the fix is still gfx803-specific. Some of these bugs are
    architecture-general faults that gfx803's kernel and solver selection merely
    exposes, such as the WGM Tensile swizzle bug and the small-GEMM assembly
