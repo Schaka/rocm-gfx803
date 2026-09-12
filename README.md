@@ -107,8 +107,13 @@ needs no box-native install. What it does need is
 fp16 `tl.dot` is a fatal LLVM abort and no engine starts, because the attention
 backend's prefill kernel is one. Measured on the image (2026-09-12) with that
 patch: engine init 88 s and coherent greedy generation at 46.6 tok/s on
-Qwen3-0.6B. A bf16 run of the same model starts but produces incoherent output;
-that is a separate, open problem, and fp16 is the dtype the numbers above use.
+Qwen3-0.6B. bf16 is not usable on this card and the platform says so rather than
+computing it: gfx803 has no bf16 instruction, and the ROCm GEMM fallback that
+would run instead keeps ~bf16 precision in its accumulator (3.1e-03 relative
+error against 3.9e-04 for fp16), which produced incoherent text instead of an
+error. `supported_dtypes` omits bf16 on this arch, so `dtype="auto"` warns and
+falls back to fp16, and an explicit `--dtype bfloat16` fails with a message
+pointing at `--dtype=half`.
 
 ## Component images, pins, and line provenance
 

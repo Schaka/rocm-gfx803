@@ -948,9 +948,29 @@ class RocmPlatform(Platform):
     def device_count(cls) -> int:
         return _rocm_device_count_stateless(getattr(envs, cls.device_control_env_var))
 
+    @property
+    def supported_dtypes(self) -> list[torch.dtype]:
+        # gfx803 has no bf16 instruction at all, and the ROCm GEMM fallback that
+        # runs in its place keeps ~bf16 precision in the accumulator: 3.1e-03
+        # relative error on a 1024x1024 matmul, against 3.9e-04 for fp16 and
+        # 1.6e-06 for fp32. A bf16 model therefore generates incoherent text
+        # rather than failing. Leaving bf16 out of this list is what makes auto
+        # dtype resolution land on fp16 (the first entry) with a warning
+        # instead; fp16 is native here, so nothing is given up by it.
+        if on_gfx803():
+            return [torch.float16, torch.float32]
+        return super().supported_dtypes
+
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
         if dtype == torch.bfloat16:  # noqa: SIM102
+            if on_gfx803():
+                raise ValueError(
+                    "Bfloat16 is not supported on gfx803 (Polaris). The card has "
+                    "no bf16 instruction, and the ROCm fallback GEMM keeps ~bf16 "
+                    "precision in its accumulator, which returns wrong output "
+                    "instead of an error. Use float16 instead: --dtype=half."
+                )
             if not cls.has_device_capability(80):
                 capability = cls.get_device_capability()
                 gpu_name = cls.get_device_name()
