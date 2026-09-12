@@ -19,12 +19,12 @@ from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
 if TYPE_CHECKING:
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
-    )
-    from vllm.entrypoints.openai.engine.protocol import (
+    from vllm.entrypoints.generate.base.protocol import (
         DeltaMessage,
         ExtractedToolCallInformation,
+    )
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
     )
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
     from vllm.parser.engine.parser_engine import ParserEngine
@@ -47,6 +47,11 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs) -> None:
         super().__init__(tokenizer, *args, **kwargs)
         self._parser_engine = self._parser_engine_cls(tokenizer, **kwargs)  # type: ignore[call-arg]
+        self._parser_engine_kwargs = kwargs
+        self._counting_parser_engine: ParserEngine | None = None
+        # TODO: Remove once Responses finalization reuses accumulated streaming
+        # parser results instead of reparsing the complete output.
+        self._streaming_count_valid = False
 
     @contextmanager
     def _skip_tool_parsing(self) -> Iterator[None]:
@@ -60,6 +65,9 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
 
+    def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+        self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)
+
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         return self._parser_engine.extract_content_ids(input_ids)
 
@@ -68,6 +76,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         model_output: str,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
+        self._streaming_count_valid = False
         with self._skip_tool_parsing():
             return self._parser_engine.extract_reasoning(model_output, request)
 
@@ -80,6 +89,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
+        self._streaming_count_valid = True
         with self._skip_tool_parsing():
             return self._parser_engine.extract_reasoning_streaming(
                 previous_text,
@@ -108,7 +118,8 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         return self._parser_engine.reasoning_ended
 
     def finish_streaming(self) -> DeltaMessage | None:
-        return self._parser_engine.finish_streaming()
+        with self._skip_tool_parsing():
+            return self._parser_engine.finish_streaming()
 
     def get_streaming_fallback_content(
         self,
@@ -118,7 +129,18 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         return self._parser_engine.get_streaming_fallback_content(text, request)
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
-        return self._parser_engine.count_reasoning_tokens(token_ids)
+        if self._streaming_count_valid:
+            return self._parser_engine.count_reasoning_tokens(token_ids)
+        if not token_ids:
+            return 0
+        if self._counting_parser_engine is None:
+            self._counting_parser_engine = self._parser_engine_cls(
+                self.model_tokenizer, **self._parser_engine_kwargs
+            )  # type: ignore[call-arg]
+        self._counting_parser_engine._single_pass_parse(
+            self.model_tokenizer.decode(token_ids), token_ids
+        )
+        return self._counting_parser_engine.count_reasoning_tokens(token_ids)
 
 
 class ParserEngineToolAdapter(ToolParser):

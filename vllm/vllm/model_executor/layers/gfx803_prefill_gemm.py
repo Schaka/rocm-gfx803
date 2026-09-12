@@ -19,7 +19,7 @@ higher-occupancy config than this kernel's real register need supports.
 `__launch_bounds__(256, 1)` (trade occupancy for register budget)
 eliminates the spilling entirely, and combined with double buffering
 (prefetch the next K-tile while computing on the current one) is what
-gets it competitive at all (see SESSION_HANDOFF.md section 30 for the
+gets it competitive at all (see NOTES.md for the
 full investigation).
 
 Compiled once via `hipcc --offload-arch=gfx803 -O3 -shared -fPIC -o
@@ -42,7 +42,7 @@ the same one-time-cost-then-reuse pattern as everything else in this
 gfx803 kernel set.
 
 A native-[N,K]-layout variant (no transpose, no cache) was tried and
-reverted -- see SESSION_HANDOFF.md section 31/32. Reading the weight in
+reverted -- see NOTES.md. Reading the weight in
 its native layout means adjacent threads land on far-apart rows (K*2
 bytes apart) instead of the contiguous, coalesced reads the transposed
 layout gives, and that per-call slowdown outweighed the coverage gain it
@@ -88,8 +88,8 @@ def _lib() -> ctypes.CDLL:
 # shape left where this kernel actually wins once Tensile's fixed fp16
 # kernel is in the built image. Previously this cap was set to EXCLUDE
 # gate_up_proj and admit o_proj/down_proj instead, back when this kernel
-# was the fast path for those shapes too -- see SESSION_HANDOFF.md section
-# 33 for why that routing changed.
+# was the fast path for those shapes too -- see NOTES.md for why
+# that routing changed.
 _MAX_CACHED_WEIGHT_BYTES = 64 * 1024 * 1024
 # Total budget across every cached weight, not just the per-weight cap
 # above. Default 768MB (~10% of an 8GB card) leaves ~8-12 of Qwen3.5-2B's

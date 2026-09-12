@@ -6,13 +6,13 @@ library (a portability-only path, never benchmark-tuned), which dispatches
 a large-M-tile (e.g. 128-row) kernel even for decode's actual M=1 shape --
 ~127/128 of every compute grid wasted on padding. Measured ~1.31ms/call
 average via rocprofv3 kernel-trace on real hardware, ~98.6% of decode
-step time (see SESSION_HANDOFF.md, "ROOT CAUSE" section).
+step time (see NOTES.md, "Root-caused bugs and their fixes").
 
 Three fast paths, combined:
 
 1. **`ops.LLMM1`** (vLLM's own existing custom kernel,
    `csrc/rocm/skinny_gemms.cu`'s `LLGemm1_kernel`) -- despite being gated
-   in vLLM upstream to `on_gfx9()`/`on_gfx1x()`/`on_gfx906()` only, this
+   in vLLM upstream to `on_gfx9()`/`on_gfx1x()` only, this
    specific kernel (unlike the `wvSplitK_*` family in the same file) uses
    only portable HIP intrinsics (`__hmul2`/`__hfma2`/`__shfl_xor`), no
    GFX9+-only dot-product ASM (`v_dot2_f32_f16`) or MFMA -- and the
@@ -24,7 +24,7 @@ Three fast paths, combined:
    found K=1536 correct up to M=151936, while K=8192 and K=8064 both
    launch cleanly but return `max_abs_diff` ~4.2-4.5 (catastrophic, not
    fp16 noise) -- a real bug in this kernel at scale. Candidate root cause
-   (not yet confirmed by disassembly/profiling, see SESSION_HANDOFF.md):
+   (not yet confirmed by disassembly/profiling, see NOTES.md):
    `LLMM1()`'s host launcher computes `NUM_THREADS = ceil_to_64(K/8)`,
    which lands at exactly 1024 threads/block for both K=8064 and K=8192 --
    plausibly at or past this hardware's real per-block limit once combined
@@ -58,7 +58,7 @@ o_proj ~2x, qkv_proj ~1.9x, gate_up_proj ~1.6x. gfx803_triton_gemv beats
 rocblas_hssgemv by ~9% at down_proj's K=8960 shape. rocblas_hssgemv itself
 is 32x/27x/7.2x/9.8x/3.3x faster than the original untuned-Tensile-GEMM
 path average across o_proj/qkv_proj/gate_up_proj/down_proj/lm_head
-respectively (see git history / SESSION_HANDOFF.md §16-18 for the
+respectively (see NOTES.md for the
 GEMM-vs-GEMV numbers). Correctness verified against
 `torch.nn.functional.linear` for every routed shape actually used in this
 model (o_proj, qkv_proj, gate_up_proj, down_proj, lm_head) -- diffs
@@ -205,7 +205,7 @@ def gfx803_triton_gemv(
     unrelated, extremely slow first-time LLVM/Triton compile in the vision
     encoder path that doesn't reliably finish). Kept here, undispatched,
     for a future attempt with a cleaner instrumentation approach. See
-    SESSION_HANDOFF.md § 34 for the full investigation.
+    NOTES.md for the full investigation.
     """
     M, K = weight.shape
     out = torch.empty(M, dtype=torch.float32, device=x.device)

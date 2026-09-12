@@ -20,10 +20,10 @@ echo "vLLM build: arch $ROCM_ARCH, $jobs parallel jobs"
 # VLLM_VERSION_OVERRIDE: this vendored tree carries no .git of its own (see
 # AGENTS.md, "vLLM lives in vllm/ as a hard fork"), so setuptools-scm has no
 # tag or commit history to derive a version from and fails outright. The
-# override matches what the box-native editable install already reports (see
-# NOTES.md's vLLM 0.28.0 migration item), so both build paths name the same
-# version until that migration happens.
-env "MAX_JOBS=$jobs" "PYTORCH_ROCM_ARCH=$ROCM_ARCH" "VLLM_VERSION_OVERRIDE=0.20.1+gfx803" \
+# value names the upstream release the port sits on, so the built wheel says
+# which vLLM line it is. Bump it whenever vllm/ is re-based onto a new
+# upstream release.
+env "MAX_JOBS=$jobs" "PYTORCH_ROCM_ARCH=$ROCM_ARCH" "VLLM_VERSION_OVERRIDE=0.29.0+gfx803" \
     pip wheel --no-build-isolation --no-deps --no-cache-dir -w /wheels .
 
 hipcc="/opt/rocm/bin/hipcc"

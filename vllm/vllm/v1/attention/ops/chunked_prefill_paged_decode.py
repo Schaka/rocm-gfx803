@@ -13,12 +13,6 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.ops.torch_attention import (
-    can_use_torch_sdpa_prefill,
-    torch_sdpa_prefill_attention,
-)
-from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
 from .gfx803_split_attn import gfx803_split_decode_attention
 from .prefix_prefill import context_attention_fwd
@@ -26,11 +20,8 @@ from .prefix_prefill import context_attention_fwd
 logger = init_logger(__name__)
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx803, on_gfx906
+    from vllm.platforms.rocm import on_gfx803
 else:
-
-    def on_gfx906() -> bool:
-        return False
 
     def on_gfx803() -> bool:
         return False
@@ -195,26 +186,45 @@ def kernel_paged_attention_2d(
             + internal_offsets[:, None] * stride_v_cache_3
         )
 
-        # K : (HEAD_SIZE, BLOCK_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None],
-            other=0.0,
-            eviction_policy="evict_last",
-        )
+        # Only the final tile can straddle seq_len. Slots >= seq_len are
+        # unwritten KV cache that may hold NaN/garbage; they are score-masked
+        # below, but 0 * NaN = NaN would still poison the output, so mask them
+        # out of the K/V loads too. Earlier tiles are fully written, so they
+        # use the cheaper token-uniform dim_mask (matching the pre-0.25.0 fast
+        # path) and skip the per-token predicate entirely.
+        # K : (HEAD_SIZE, BLOCK_SIZE), V : (BLOCK_SIZE, HEAD_SIZE)
+        if j == num_blocks - 1:
+            kv_load_mask = abs_token_idx < seq_len
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & kv_load_mask[None, :],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & kv_load_mask[:, None],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+        else:
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
 
         if K_load.dtype.is_fp8():
             K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
             K = K_load
-
-        # V : (BLOCK_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :],
-            other=0.0,
-            eviction_policy="evict_last",
-        )
 
         if V_load.dtype.is_fp8():
             V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
@@ -303,9 +313,6 @@ def chunked_prefill_paged_decode(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
-    query_start_loc_cpu: torch.Tensor | None = None,
-    seq_lens_cpu: torch.Tensor | None = None,
-    attn_type: AttentionType = AttentionType.DECODER,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -315,119 +322,46 @@ def chunked_prefill_paged_decode(
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
 
+    if max_query_len > 1:
+        context_attention_fwd(
+            q=query,
+            k=key,
+            v=value,
+            o=output,
+            kv_cache_dtype=kv_cache_dtype,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            b_loc=block_table,
+            b_start_loc=query_start_loc,
+            b_seq_len=seq_lens,
+            max_seq_len=max_seq_len,
+            max_input_len=max_query_len,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            skip_decode=True,
+            fp8_out_scale=output_scale,
+            sinks=sinks,
+            causal=causal,
+        )
+
+    block_size = value_cache.shape[3]
+    num_seqs = len(seq_lens)
     num_query_heads = query.shape[1]
     # key may be None in cross-attention decode (already cached from encoder)
     num_kv_heads = key.shape[1] if key is not None else key_cache.shape[1]
     num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = query.shape[2]
 
-    if max_query_len > 1:
-        prefill_handled = False
-        if on_gfx906() or on_gfx803():
-            q_dtype = query.dtype
-            k_dtype = key_cache.dtype
-            v_dtype = value_cache.dtype
-            kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
-
-            if query_start_loc_cpu is not None:
-                q_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-            else:
-                q_lens_cpu = (query_start_loc[1:] - query_start_loc[:-1]).cpu()
-
-            if seq_lens_cpu is None:
-                if max_seq_len == max_query_len:
-                    seq_lens_cpu = q_lens_cpu
-                else:
-                    seq_lens_cpu = seq_lens.cpu()
-
-            if can_use_torch_sdpa_prefill(
-                    num_actual_tokens=query.shape[0],
-                    max_query_len=max_query_len,
-                    query_lens_cpu=q_lens_cpu,
-                    seq_lens_cpu=seq_lens_cpu,
-                    attn_type=attn_type,
-                    kv_quant_mode=kv_quant_mode,
-                    q_dtype=q_dtype,
-                    k_dtype=k_dtype,
-                    v_dtype=v_dtype,
-                    alibi_slopes=alibi_slopes,
-                    use_alibi_sqrt=False,
-                    sinks=sinks,
-                    logits_soft_cap=0,
-                    sliding_window=(sliding_window - 1, 0)
-                    if sliding_window > 0 else (-1, -1),
-                    chunk_lookback=-1,
-                    output_scale=output_scale,
-                    mm_prefix_range_tensor=None,
-            ):
-                if query_start_loc_cpu is None:
-                    query_start_loc_cpu = query_start_loc.cpu()
-
-                torch_sdpa_prefill_attention(
-                    q=query,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=block_table,
-                    query_start_loc_cpu=query_start_loc_cpu,
-                    seq_lens_cpu=seq_lens_cpu,
-                    num_kv_heads=num_kv_heads,
-                    num_queries_per_kv=num_queries_per_kv,
-                    scale=sm_scale,
-                    output=output,
-                )
-                prefill_handled = True
-
-        if not prefill_handled:
-            context_attention_fwd(
-                q=query,
-                k=key,
-                v=value,
-                o=output,
-                kv_cache_dtype=kv_cache_dtype,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                b_loc=block_table,
-                b_start_loc=query_start_loc,
-                b_seq_len=seq_lens,
-                max_seq_len=max_seq_len,
-                max_input_len=max_query_len,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                alibi_slopes=alibi_slopes,
-                sliding_window=sliding_window,
-                sm_scale=sm_scale,
-                skip_decode=True,
-                fp8_out_scale=output_scale,
-                sinks=sinks,
-                causal=causal,
-            )
-
-    block_size = value_cache.shape[3]
-    num_seqs = len(seq_lens)
-
-    # gfx803: decode attention's Triton fallback launches only
-    # (num_seqs, num_kv_heads) threadblocks -- 2 on this model's 32-CU RX
-    # 470, each looping sequentially over every KV block. Route pure-decode
-    # calls (every sequence here contributes exactly 1 token -- checked via
-    # query.shape[0]==num_seqs; a mixed prefill+decode batch falls through
-    # to the unmodified path below since gfx803_split_decode_attention
-    # doesn't support per-sequence query-length filtering) through a
-    # split-KV kernel instead, raising the grid to (num_seqs, num_kv_heads,
-    # NUM_KV_SPLITS). See gfx803_split_attn.py's module docstring and
-    # SESSION_HANDOFF.md for the correctness investigation (a real,
-    # confirmed, fixed use-after-free race in the intermediate buffers --
-    # not a logic bug in the split math).
-    #
-    # NUM_KV_SPLITS itself was originally fixed at 2, tuned only against a
-    # ~192-token context -- at a 2229-token decode context (long-prompt
-    # Qwen3.5-2B, this box, 2026-08-29) that same value left decode at 22.6
-    # tok/s; sweeping {2,4,8,16,32} on real hardware found 16 fastest
-    # (31.1 tok/s, +37%), 32 already regressing (29.7, per-split overhead
-    # outweighing the extra parallelism). Two real measured points (192
-    # tok -> 2 splits, 2229 tok -> 16 splits) is not enough to fit a
-    # trustworthy curve, so this scales conservatively (roughly one
-    # doubling of splits per doubling of context, matching the ratio
-    # between those two points) rather than a tuned formula -- re-measure
-    # if this stops tracking well at very short or very long contexts.
+    # Decode's Triton fallback launches only (num_seqs, num_kv_heads)
+    # threadblocks -- two on a 32-CU RX 470 -- and each one loops sequentially
+    # over every KV block. A pure-decode call (every sequence contributing
+    # exactly one token, which is what query.shape[0] == num_seqs asserts) is
+    # served instead by a split-KV kernel whose grid adds a NUM_KV_SPLITS axis.
+    # A mixed prefill+decode batch falls through to the path below, because
+    # gfx803_split_decode_attention has no per-sequence query-length filter.
     if (
         on_gfx803()
         and query.shape[0] == num_seqs
@@ -437,7 +371,19 @@ def chunked_prefill_paged_decode(
         and output_scale is None
         and "fp8" not in kv_cache_dtype
     ):
+        # Splits track context length. Two measured points (192 tokens -> 2
+        # splits, 2229 -> 16) bracket the sweep's best result: 16 splits
+        # measured 31.1 tok/s against 22.6 at 2, while 32 regressed to 29.7 as
+        # per-split overhead overtook the added parallelism. Two points do not
+        # make a trustworthy curve, so this scales conservatively rather than
+        # fitting a formula -- re-measure if it stops tracking at the extremes.
         num_kv_splits = min(32, max(2, 1 << (max_seq_len // 192).bit_length()))
+        # The kernel needs a power-of-two block size no larger than 128; a
+        # non-power-of-two one (Qwen3's 544, say) uses the fallback value the
+        # path below also picks when it cannot take the native layout.
+        split_block_size = min(block_size, 128)
+        if split_block_size & (split_block_size - 1):
+            split_block_size = 32
         gfx803_split_decode_attention(
             output=output,
             query=query,
@@ -448,12 +394,10 @@ def chunked_prefill_paged_decode(
             scale=sm_scale,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_size=min(block_size, 128) if (block_size & (block_size - 1) == 0) else 32,
+            block_size=split_block_size,
             num_kv_splits=num_kv_splits,
         )
         return
-
-    head_size = query.shape[2]
 
     # Conversion of FP8 Tensor from uint8 storage to
     # appropriate torch.dtype for interpretation by Triton
@@ -474,7 +418,7 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
-    if on_gfx906() or on_gfx803():
+    if on_gfx803():
         num_queries_per_kv_padded = triton.next_power_of_2(num_queries_per_kv)
     else:
         num_queries_per_kv_padded = max(
@@ -502,12 +446,12 @@ def chunked_prefill_paged_decode(
     if not is_pow2 or not has_native_layout:
         use_custom = False
 
+    # gfx803 is sensitive to Triton's default launch choices here. These keep
+    # register and LDS pressure low on the fallback path; waves_per_eu=0 (let
+    # the compiler pick occupancy) measured 0.2% faster decode than the
+    # conservative =1 this started at.
     triton_launch_kwargs = {}
-    if on_gfx906() or on_gfx803():
-        # waves_per_eu=0 (let the compiler pick occupancy) measured 0.2%
-        # faster decode throughput on gfx803 than the conservative =1 this
-        # was previously pinned to (median of repeated vllm bench latency
-        # runs, real hardware -- see SESSION_HANDOFF.md).
+    if on_gfx803():
         triton_launch_kwargs = {
             "num_warps": 4,
             "num_stages": 1,

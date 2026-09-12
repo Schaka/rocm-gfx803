@@ -4,10 +4,14 @@ This guide explains how to build the gfx803 (Polaris) port of vLLM that
 lives in this folder. This build ran on real hardware before. Follow
 the steps below to repeat it.
 
-vLLM here is vendored, not patched. This folder is a full copy of the
-vLLM source with the gfx803 port already applied. You do not write a
+vLLM here is vendored, not patched. This folder is upstream vLLM
+`v0.29.0` with the gfx803 port applied on top. You do not write a
 patch file. You install this folder as a Python package and compile
 three small kernel files.
+
+The port touches twelve existing files, plus the three kernels and
+their `ctypes` loaders. `NOTES.md` records what each change does and
+how it was measured.
 
 If you have not read `NOTES.md`, read it first. It records that this
 vLLM path is not usable end to end yet. The cause is an open hardware

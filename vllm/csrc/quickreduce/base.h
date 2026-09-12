@@ -79,6 +79,7 @@ union BufferResource {
   };
 };
 
+#if !defined(__gfx1250__)
 __quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
     int32x4_t srsrc, int32_t voffset, int32_t soffset,
     int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
@@ -86,6 +87,16 @@ __quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
 __quickreduce_device_inline__ static void buffer_store_dwordx4(
     int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset,
     int32_t aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+#else
+__quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
+    int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {}
+
+__quickreduce_device_inline__ static void buffer_store_dwordx4(int32x4_t data,
+                                                               int32x4_t srsrc,
+                                                               int32_t voffset,
+                                                               int32_t soffset,
+                                                               int32_t aux) {}
+#endif
 
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
 #if defined(__gfx942__)
@@ -100,7 +111,6 @@ union bf162_int_union {
   int i;
   nv_bfloat162 bf2;
 };
-
 union half2_int_union {
   int i;
   __half2 h2;
@@ -113,12 +123,14 @@ __quickreduce_device_inline__ void packed_assign_add(int32x4_t* A,
 template <>
 __quickreduce_device_inline__ void packed_assign_add<half>(int32x4_t* A,
                                                            int32x4_t* B) {
+  
   __half2* tA = reinterpret_cast<__half2*>(A);
   __half2* tB = reinterpret_cast<__half2*>(B);
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     tA[i] = __hadd2(tA[i], tB[i]);
   }
+
 }
 
 template <>
@@ -137,11 +149,13 @@ __quickreduce_device_inline__ int packed_max(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_max<half>(int a, int b) {
+  
   half2_int_union A, B, R;
   A.i = a;
   B.i = b;
   R.h2 = __halves2half2(__hmax(A.h2.x, B.h2.x), __hmax(A.h2.y, B.h2.y));
   return R.i;
+
 }
 
 template <>
@@ -158,11 +172,13 @@ __quickreduce_device_inline__ int packed_min(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_min<half>(int a, int b) {
+  
   half2_int_union A, B, R;
   A.i = a;
   B.i = b;
   R.h2 = __halves2half2(__hmin(A.h2.x, B.h2.x), __hmin(A.h2.y, B.h2.y));
   return R.i;
+
 }
 
 template <>
@@ -205,11 +221,13 @@ __quickreduce_device_inline__ int packed_add(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_add<half>(int a, int b) {
+  
   half2_int_union A, B, R;
   A.i = a;
   B.i = b;
   R.h2 = __hadd2(A.h2, B.h2);
   return R.i;
+
 }
 
 template <>
@@ -223,11 +241,13 @@ __quickreduce_device_inline__ int packed_add<nv_bfloat16>(int a, int b) {
 
 template <>
 __quickreduce_device_inline__ int packed_add<int16_t>(int a, int b) {
+  
   // v_pk_add_i16 is gfx906+; scalar lane-wise add is portable and codegens
   // to the packed instruction on archs that have it.
   int32_t lo = (int16_t)(a & 0xFFFF) + (int16_t)(b & 0xFFFF);
   int32_t hi = (int16_t)(a >> 16) + (int16_t)(b >> 16);
   return (hi << 16) | (lo & 0xFFFF);
+
 }
 
 template <typename T>
@@ -235,11 +255,13 @@ __quickreduce_device_inline__ int packed_sub(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_sub<half>(int a, int b) {
+  
   half2_int_union A, B, R;
   A.i = a;
   B.i = b;
   R.h2 = __hsub2(A.h2, B.h2);
   return R.i;
+
 }
 
 template <>
@@ -256,11 +278,13 @@ __quickreduce_device_inline__ int packed_mul(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_mul<half>(int a, int b) {
+  
   half2_int_union A, B, R;
   A.i = a;
   B.i = b;
   R.h2 = __hmul2(A.h2, B.h2);
   return R.i;
+
 }
 
 template <>
@@ -285,6 +309,29 @@ __quickreduce_device_inline__ int packed_rcp<nv_bfloat16>(int a) {
   A.i = a;
   R.bf2 = h2rcp(A.bf2);
   return R.i;
+}
+
+template <typename T>
+__quickreduce_device_inline__ int packed_from_int16_pair(int16_t low,
+                                                         int16_t high);
+
+template <>
+__quickreduce_device_inline__ int packed_from_int16_pair<half>(int16_t low,
+                                                               int16_t high) {
+  // Convert two signed integers to one fp16x2 packed 32-bit lane.
+  half2 h = __halves2half2(__int2half_rn(static_cast<int>(low)),
+                           __int2half_rn(static_cast<int>(high)));
+  return __builtin_bit_cast(int, h);
+}
+
+template <>
+__quickreduce_device_inline__ int packed_from_int16_pair<nv_bfloat16>(
+    int16_t low, int16_t high) {
+  // Convert two signed integers to one bf16x2 packed 32-bit lane.
+  nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+  nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+  nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
+  return *reinterpret_cast<int*>(&bf2);
 }
 
 // changes dtype

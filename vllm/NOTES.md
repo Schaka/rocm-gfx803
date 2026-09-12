@@ -30,25 +30,161 @@ erratum on this line.
 Unlike every other component in this repo (`patches/rocblas/`,
 `patches/rocm-systems/`, etc.), vLLM's gfx803 port is **not** a patch
 against pristine upstream. It's vendored: a `vllm/` folder at repo root
-with its own `.git`, based on `ai-infos/vllm-gfx906-mobydick @ ff063e4`
-(the current tip of that fork's `main` at time of vendoring — not
-`eb450bd`, a stale preset pin that's been force-pushed away on origin),
-with the gfx803 port as one squashed commit on top
-(`0b5207679`, "Vendor gfx803 port on top of ML-gfx906's vllm-v2 base").
+holding a full copy of upstream vLLM `v0.29.0` with the gfx803 port
+applied on top. There is no `.git` of its own and no independent history;
+this repo tracks the tree directly.
 
 Why vendored instead of patched: the port touches `CMakeLists.txt`
-(`HIP_SUPPORTED_ARCHS`), 3 `csrc/` files (arch `#if` gates —
-`quickreduce/base.h`, `quick_reduce_impl.cuh`, `attention/
-dtype_float16.cuh`), `vllm/platforms/rocm.py` (capability/arch-detection
-wiring), the GEMM/GEMV dispatch in `vllm/model_executor/layers/utils.py`,
-two full custom kernels (below), and 5 attention-kernel files — real
+(`HIP_SUPPORTED_ARCHS`), 3 `csrc/` files (`quickreduce/base.h`,
+`quick_reduce_impl.cuh`, `attention/dtype_float16.cuh`),
+`vllm/platforms/rocm.py` (capability and arch detection), the GEMM/GEMV
+dispatch in `vllm/model_executor/layers/utils.py`, three hand-written
+kernels with their `ctypes` loaders, and 4 attention files — real
 diverging code, not a small deltas-against-upstream diff that would
 survive an upstream bump cleanly.
 
 Triton stays a small (~7-line) patch against `ai-infos/triton-gfx906`
 instead (that fork itself is just upstream Triton + ~2 commits, so a
-patch against it is the right convention there — unlike vLLM's much
-larger fork distance from upstream).
+patch against it is the right convention there — unlike vLLM's larger
+fork distance from upstream).
+
+### The v0.29.0 rebase: what was carried, and what was left behind
+
+The tree was replaced rather than rebased mechanically, because the old
+tree had no upstream history to rebase against. The result is
+deliberately small: **12 modified files, about 360 changed lines, plus 6
+new paths** (the three `.hip` kernels, their three Python loaders, and
+one `.gitignore`).
+
+Carried because gfx803 needs it:
+
+| file | change |
+| --- | --- |
+| `CMakeLists.txt` | `gfx803` added to `HIP_SUPPORTED_ARCHS` |
+| `csrc/attention/dtype_float16.cuh` | `v_pk_{add,mul,fma}_f16` asm replaced with `__hadd2`/`__hmul2`/`__hfma2` |
+| `csrc/quickreduce/base.h` | 7 packed-asm sites replaced with portable intrinsics; `packed_add<int16_t>` made scalar |
+| `csrc/quickreduce/quick_reduce_impl.cuh` | one `v_pk_add_f16` site, same treatment |
+| `vllm/platforms/rocm.py` | `_ON_GFX803`/`on_gfx803()`; capability floor lowered from major 9 to major 8 |
+| `vllm/model_executor/layers/utils.py` | the three GEMM/GEMV dispatch branches |
+| `vllm/v1/attention/ops/chunked_prefill_paged_decode.py` | split-KV decode routing, `num_queries_per_kv_padded`, Triton launch kwargs |
+| `vllm/v1/attention/ops/prefix_prefill.py` | LDS-aware prefill tile, `waves_per_eu` |
+| `vllm/v1/attention/ops/triton_decode_attention.py` | `BLOCK`, `num_warps`, `num_stages`, and no matrix-core `extra_kargs` |
+| `vllm/v1/attention/ops/triton_unified_attention.py` | prefill tile size and launch kwargs |
+| `vllm/v1/executor/multiproc_executor.py` | force-exit after parent death so VRAM is released |
+| `.gitignore` | whitelist `vllm/gfx803_kernels/*.hip` |
+
+Three of those are build or launch blockers rather than tuning, which is
+what makes them non-negotiable. The `csrc/` ones: `v_pk_*` is Vega (gfx9)
+and later, and vLLM compiles `csrc/` for every arch in
+`HIP_SUPPORTED_ARCHS`, so unguarded packed-fp16 assembly fails the gfx803
+build outright. The `prefix_prefill.py` one: the 128x64 tile needs about
+80 KB of LDS and gfx803 has 64 KB, so the launch raises
+`OutOfResources`. The `rocm.py` one: gfx803 parses as major 8, and the
+capability parser rejected anything below major 9.
+
+Three more are not gfx803 inventions at all. They come from the gfx906
+fork the port was originally written on, where they were load-bearing for
+the same underlying reason, and they are what "apply our changes" has to
+mean here: the conservative Triton launch settings in the three attention
+ops files, `num_queries_per_kv_padded` dropping its minimum-16 floor, and
+the `on_gfx906()` platform helper that the dispatch branches hang off.
+The clearest case is the fork's removal of `matrix_instr_nonkdim` and
+`kpack` — those steer MFMA codegen, and gfx803 has no matrix cores
+either. The fork's `_set_gfx906_nccl_workarounds`, by contrast, is
+genuinely gfx906-only and was not carried.
+
+Two facts about v0.29.0 decided several of the calls below. gfx803's
+default attention backend is `ROCM_ATTN`, which v0.29.0 puts first in
+`_get_backend_priorities`; `TRITON_ATTN` comes later. So
+`chunked_prefill_paged_decode.py`, where the split-KV decode path lives,
+is on the live path, while `triton_unified_attention.py` is not. And
+`NUM_PAR_SOFTMAX_SEGMENTS` is 16 upstream, so the 3D softmax path is
+already on by default; the fork's env var only made it tunable.
+
+A third check was worth making, and it is the one that decides whether the
+decode path exists at all. At v0.29.0 `skinny_gemms.cu` — the file holding
+`LLMM1` and `wvSplitK`, which `gfx803_gemv.py` calls — is removed from the
+default ROCm source list and re-added only for `VLLM_SKINNY_ARCHES`, whose
+comment reads "gfx9/gfx11 ISA (MFMA, dot2/dot4, legacy ...)". Reading the
+logic instead of trusting that comment: the list starts as all of
+`VLLM_GPU_ARCHES` and only filters out `gfx1250`, so gfx803 is in it and
+the ops are built. The gfx803-absent instructions in that file sit inside
+`__HIP__GFX9__`/`__HIP__GFX1X__` regions, and `__HIP__GFX9__` is defined by
+the file itself for gfx90a/gfx942/gfx950 only — not gfx906, not gfx803.
+Those regions close with an `#else` that defines `{UNREACHABLE_CODE}`
+stubs, so the host functions and the op registrations still compile. That
+is why `LLMM1` already ran on this card unchanged, and why `wvSplitK`
+compiles here as a stub it would trap on. The only other file mentioning
+`v_dot2`, `q_gemm_rdna3.cu`, is added to the source list solely under
+`if(VLLM_GPU_ARCHES MATCHES "gfx1100")` and is never built for this target.
+
+That last point generalises, and it is why the `csrc/` half of this port
+stays at three files. Upstream guards its arch-specific kernels and supplies
+`#else` stubs (`{UNREACHABLE_CODE}`) so that every arch in
+`HIP_SUPPORTED_ARCHS` compiles. `skinny_gemms_int4.cu`, new at v0.29 and
+built here, looks like a build breaker -- `__builtin_amdgcn_fdot2` sits
+unguarded in its `DOT2C` definition, and `fdot2` does not select on gfx803 --
+but all eight uses of that macro are inside `__HIP__GFX1X__` blocks, so it is
+never expanded here. Likewise all 21 `mfma`/`wmma`/`cvt_pk` builtins in
+`attention.cu`, which is always built, sit inside `__HIP__GFX9__` /
+`__GFX11__` / `__HIP__FP8MFMA__` / `__gfx1250__` guards. The three `csrc/`
+files this port does change are the exception that proves the rule: they were
+hand-written packed-fp16 asm with no guard and no fallback, so gfx803 could
+not compile them at all. Re-run this sweep on the next base bump -- the
+failure mode is a hard compile error in a file nobody edited, which is easy
+to misread as a toolchain problem.
+
+Left behind, with the reason:
+
+- **The fork's Torch-SDPA fallback bundle** — `torch_attention.py` (621
+  lines) plus its hooks in `triton_attn.py`, `rocm_attn.py` and
+  `chunked_prefill_paged_decode.py`. Every entry point is gated by an env
+  var that defaults off (`VLLM_TORCH_SDPA_PREFILL`,
+  `VLLM_TORCH_SDPA_DECODE`, `VLLM_TORCH_SDPA_MTP_DECODE`), so on gfx803
+  it was inert as shipped, and the fork's own commit subjects call it a
+  fallback and a performance option rather than a fix for a kernel that
+  is wrong.
+- **`triton_unified_attention.py`'s `query_mask_1` fix.** It is a no-op
+  at v0.29.0. The kernel derives
+  `BLOCK_Q = BLOCK_M // num_queries_per_kv`, and `BLOCK_M` is 16,
+  `next_power_of_2(num_queries_per_kv)`, or 32, so
+  `BLOCK_Q * num_queries_per_kv == BLOCK_M` and the fork's
+  `offs_m < BLOCK_Q * num_queries_per_kv` is identically true for
+  `offs_m = tl.arange(0, BLOCK_M)`.
+- **`use_3d`'s widened condition, and the `IS_GFX906` fp32→fp16 cast.**
+  Both reach only the Triton attention backend, which is not gfx803's
+  default, and the widened condition exists to enable the 3D softmax
+  path for multi-token decode.
+- **`fla/ops/chunk.py`'s fp32 auto-downcast** (the file now lives at
+  `vllm/third_party/flash_linear_attention/ops/chunk.py`). It replaces a
+  hard `assert q.dtype != torch.float32` with a silent downcast to fp16,
+  which turns a loud failure into precision loss nobody asked for — the
+  failure class this repo's rules exist to prevent — and it cannot fire
+  on the fp16 runs gfx803 is restricted to anyway. If an fp32 config on a
+  no-bf16 card deserves a better answer than upstream's "please use
+  bfloat16", the honest one is an error that says so, not a silent cast.
+- **`cuda_communicator.py`'s FlashInfer guard.** Inert at
+  `world_size == 1`, the only configuration tested so far. Worth
+  revisiting alongside the multi-GPU work in open item 8.
+- **The bulk of the gfx906 fork's own delta** (82 files, +6501 lines):
+  its quant kernels (marlin, w4a16/wna16, fp8 emulation, exllama), the
+  MLA/DeepSeek sparse stack, MiniMax M3, the MoE tuning tables, and its
+  tests and docs. None of it is reachable from a dense fp16 run.
+- **A `logger.warning_once` → `logger.warning` change in `rocm.py`.**
+  Unrelated to gfx803 and consistent with a leftover from a debugging
+  session; dropped.
+
+Some of the old tree's inventory is shorter now because upstream caught
+up. v0.29.0 already lists `gfx906` in `HIP_SUPPORTED_ARCHS` and already
+carries the gemm1 and wna16 plumbing the fork had added. This repo's rule
+applies: a change that applied cleanly before is not evidence it is still
+needed.
+
+One consequence is worth stating plainly. **None of this is verified on
+hardware.** v0.29.0 is a long way from the line the port was measured on,
+and a tree that compiles is not a tree that computes correctly. The gates
+in "How to reproduce" still have to run, in order. Until they do, every
+performance number in this document describes the previous tree.
 
 The vendored `vllm/` tree is wired into this repo's Dockerfile build:
 `docker-bake.hcl`'s `vllm` target builds the wheel and the three
@@ -58,6 +194,26 @@ image on real hardware yet — see `BUILD.md`. Iterating on the box with
 `/data/vllm-mobydick` and `pip3 install --no-build-isolation --no-deps
 -e .` still works, and stays the right way to test a kernel change
 before it lands in CI.
+
+### Building this tree: one TU needs a lower optimization level
+
+`csrc/libtorch_stable/custom_all_gather_reduce_scatter.cu` costs
+disproportionate build time at `-O2` for gfx803 and is built at `-O1`
+instead. Measured on the same file, flags and compiler: gfx803 `-O2` was
+still running after seven minutes with over 20 GB resident, gfx803 `-O1`
+finishes in 9 seconds, and gfx906 `-O2` also finishes in 9 seconds. The
+same file at `-O2` with debug info disabled also ran past seven minutes,
+so the cost is the optimizer on the gfx803 target rather than debug info.
+A longer timeout may well finish it, but no gfx803 build should pay that,
+so `CMakeLists.txt` sets `-O1` for this one hipified source under
+`VLLM_GPU_LANG STREQUAL "HIP"`. Only the optimization level changes; the
+kernel's logic does not.
+
+Also worth knowing for anyone auditing this port: upstream guards its
+arch-specific kernels and supplies `#else` stubs (`{UNREACHABLE_CODE}`) so
+that every arch in `HIP_SUPPORTED_ARCHS` compiles. That is why this whole
+port needs only three `csrc/` files — the packed-fp16 asm in those three
+was hand-written with no guard and no fallback.
 
 ### Triton on gfx803: works, 6-line ISA wiring
 
@@ -655,29 +811,88 @@ minBlocksPerMultiprocessor)` before anything else.
 9. The vendored `vllm/` tree is wired into the CI Dockerfile build now,
    but nobody ran the resulting final image on the box — see `BUILD.md`
    for the build steps and what still needs checking.
-10. **Move the port to vLLM 0.28.0 — the agreed next task, not started.**
-    This fork is based on `ai-infos/vllm-gfx906-mobydick @ ff063e4` and
-    installs as `0.20.1+gfx803`; upstream is at 0.28.0. The gfx803 delta
-    between those two lines is probably not significant, so starting a
-    fresh fork at 0.28.0 and re-applying the port on top is a legitimate
-    option alongside rebasing the existing tree, and either way the surface
-    to re-apply is small and enumerable: `CMakeLists.txt`'s
-    `HIP_SUPPORTED_ARCHS`, the 3 `csrc/` arch gates, `platforms/rocm.py`,
-    the GEMM/GEMV dispatch in `model_executor/layers/utils.py`, the three
-    hand-written kernel pairs under `gfx803_kernels/` with their `ctypes`
-    loaders, and the attention files listed under "What ships and works"
-    (14 files under `vllm/vllm` mention gfx803 today).
+10. **The 0.29.0 rebase is built and hardware-validated.**
+    Validated on the RX 570 box with `vllm 0.29.0+gfx803`, `triton 3.8.0`,
+    `torch 2.14.0+git80271d2` against the ROCm 10.0 stack. Results:
 
-    Do not carry the "probably not significant" assumption into the
-    validation. The 0.20 line needed two ROCm-10.0 stack fixes before vLLM
-    ran at all on this box, and this repo's history holds both an outcome
-    where a patch had become obsolete upstream and one where the code a
-    patch targeted had been replaced by something whose behavior on the
-    same bug class was unverified. Validate on the card, using the gates
-    already in "How to reproduce": the sanity generation first, then
-    `probe_gemv_m.py` and `verify_gemv_m.py` for the decode paths, with the
-    `bench_queries.py` table above as the before/after baseline. The
-    precondition for starting is that the current performance work has
-    settled — the GEMM path is at 14.9 ms per step at M=8 against a 6.7 ms
-    memory floor, so "roughly where expected" rather than "at the floor"
-    is the likely stopping point.
+    - Sanity generation (Qwen3-0.6B, fp16, greedy): coherent output on
+      both prompts, exit 0.
+    - `probe_gemv_m.py`: 76/76 `ok`, every M in 2..16 against a float32
+      reference, all five shapes, error ~1e-07. Copy bandwidth 168.7 GB/s.
+    - `verify_gemv_m.py`: token ids **identical** with
+      `VLLM_GFX803_GEMV_M=0` and `=1` at concurrency 1, 3, 5, 8 with 24
+      decode tokens, so the multi-token GEMV path agrees with the
+      fallback token for token.
+    - `bench_queries.py` (Qwen3-0.6B, prompt 128, decode 128, 3 repeats,
+      2 warm-up, gpu-memory 0.85):
+
+      | concurrency | prefill tok/s | decode tok/s | per-request tok/s |
+      | ---: | ---: | ---: | ---: |
+      | 1 | 1217.9 | 106.7 | 106.7 |
+      | 4 | 1408.1 | 243.1 | 60.8 |
+      | 8 | 1595.0 | 336.8 | 42.1 |
+      | 16 | 1679.5 | 326.0 | 20.4 |
+
+    The numbers above were produced on this tree. `douyamd/DeepSeek-R1-
+    Distill-0.5B` could not be fetched: that repo does not exist, and the
+    box's egress returns "Invalid username or password" for *any*
+    `huggingface.co` model file even from plain `curl` with no token, so
+    only the Qwen model is represented here. A like-for-like comparison
+    against the previous tree is still open — it needs the old editable
+    checkout reinstalled, and it ran against triton 3.6.0 where this line
+    runs 3.8.0.
+
+11. **Declined carries from the gfx906 fork, recorded so they are not
+    rediscovered from scratch.** Each is real work that helps no
+    configuration reachable today, but two are silent-wrong-answer
+    classes rather than performance, so they deserve a deliberate look:
+
+    - **Cross-dtype KV cache store.** `csrc/libtorch_stable/
+      cache_kernels.cu`'s `CopyWithScaleOp` and its `kAuto` sites do
+      `static_cast<OutT>(src)`, which is only right when the source and
+      cache types match. For `(src=float, cache=uint16_t)` a float is
+      truncated *numerically* into a 16-bit pattern rather than
+      converted, with no error raised. The fork pairs an `is_same` guard
+      there with a `"float16"` branch in `csrc/quantization/w8a8/fp8/
+      amd/quant_utils.cuh` that pins the cache type to `uint16_t` for
+      float/bfloat16 sources, and neither half is useful alone. It does
+      not bite the fp16 model plus default cache dtype this port is
+      validated with, which is why it was left out of a fresh fork; an
+      fp32 or bf16 model on an fp16 KV cache would want both.
+    - **`v_dot2` in the GPTQ path.** The fork rewrites `dot22_8_f`'s body
+      to `__ockl_fdot2`, which lowers to `llvm.amdgcn.fdot2` and selects
+      `v_dot2_f32_f16`. gfx803 has no such instruction: LLVM reports
+      `Cannot select`, so copying that file is a hard build break rather
+      than neutral tuning, and it sits in a helper both the 4-bit and
+      8-bit GPTQ kernels call. Upstream's `q_gemm.cu`, `qdq_4.cuh`,
+      `qdq_8.cuh` and `qdq_util.cuh` are kept verbatim.
+    - **The `moe_wna16` HIP port.** Upstream compiles `moe_wna16.cu` only
+      under `if(VLLM_GPU_LANG STREQUAL "CUDA")`, and its dequantization
+      uses NVIDIA-only `lop3.b32`/`prmt.b32` plus `atomicAdd(half*)`. The
+      fork makes it buildable on HIP with a `bfi()` helper that emits
+      `v_bfi_b32`, a compare-and-swap `atomicAdd_half`, and
+      `sizeof(scalar_t)` shared-memory sizing -- all plain GCN-compatible.
+      It is needed only for quantized MoE, which this port does not run,
+      and leaving the file CUDA-only is safe precisely because it is then
+      never compiled for gfx803.
+    - **The two fp16 indexer K-cache kernels** in `cache_kernels.cu` and
+      their `ops.h` / `torch_bindings.cpp` registrations. Plain fp16
+      SIMD with no matrix-core or fp8 dependency, so they would compile
+      and run here, but their only caller is the MLA-sparse Python path,
+      which is not part of this fork.
+
+12. **`--dtype bfloat16` is not rejected on gfx803, though it hangs the
+    card.** Pre-existing, not introduced by the 0.29.0 rebase: the guard is
+    byte-identical in the previous tree (`vllm/platforms/rocm.py`,
+    `check_if_supports_dtype`). It rejects bfloat16 only when
+    `has_device_capability(80)` is false, and gfx803 reports capability
+    (8, 0) -- so the comparison passes and bf16 is accepted silently. The
+    threshold is CUDA's "compute capability 8.0" (Ampere, which does have
+    bf16) applied to an AMD arch number that has nothing to do with it, so
+    every ROCm arch parsing at or above major 8 slips through. The failure
+    mode is the worst kind for this hardware: instead of a clear error, the
+    first bf16 kernel call hangs, which is the rule this document states in
+    prose and the code does not enforce. A one-line fix exists -- reject
+    bf16 when `on_gfx803()` -- and belongs in the same call, but it is new
+    behaviour rather than a ported change, so it was left out of the rebase
+    rather than added silently.

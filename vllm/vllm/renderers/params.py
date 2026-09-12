@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
@@ -87,6 +87,15 @@ class ChatParams:
     mm_processor_kwargs: dict[str, Any] | None = None
     """The kwargs to pass to the multi-modal processor."""
 
+    return_assistant_tokens_mask: bool = False
+    """Request a per-token assistant mask from apply_chat_template."""
+
+    tool_choice: Any | None = None
+    """Request-level tool choice for renderers that need API metadata."""
+
+    response_format: Any | None = None
+    """Request-level response format for renderers that need API metadata."""
+
     def with_defaults(
         self,
         default_chat_template_kwargs: dict[str, Any] | None = None,
@@ -115,6 +124,9 @@ class ChatParams:
                 default_mm_processor_kwargs,
                 self.mm_processor_kwargs,
             ),
+            return_assistant_tokens_mask=self.return_assistant_tokens_mask,
+            tool_choice=self.tool_choice,
+            response_format=self.response_format,
         )
 
     def get_apply_chat_template_kwargs(self) -> dict[str, Any]:
@@ -166,6 +178,11 @@ class TokenizeParams:
 
     add_special_tokens: bool = True
     """Whether to add special tokens."""
+
+    return_token_offsets: bool = False
+    """If true, request char-level (start, end) offsets per token. Honored
+    only for Fast (Rust-backed) tokenizers with text input and no multimodal
+    data; otherwise silently ignored."""
 
     needs_detokenization: bool = False
     """
@@ -305,10 +322,11 @@ class TokenizeParams:
             # while still failing `self._token_len_check` as expected by users
             max_length = self.max_input_tokens + 1
 
-        # Explicit truncation-side overrides require the full token sequence so
-        # we can slice from the requested side in _token_truncation. Disable
-        # tokenizer-level truncation because generation tokenizers default to
-        # left truncation while callers may request right truncation.
+        # Explicit truncation-side overrides require the full token sequence
+        # so we can slice from the requested side in _token_truncation.
+        # Disable tokenizer-level truncation because its default side may
+        # differ from the requested side.  The defense against unbounded
+        # tokenization lives in _text_len_check (character-level pre-trim).
         if self.truncation_side is not None and self.truncate_prompt_tokens is not None:
             return dict(
                 truncation=False,
@@ -324,15 +342,13 @@ class TokenizeParams:
     def _text_len_check(self, tokenizer: TokenizerLike | None, text: str) -> str:
         """Apply length checks to prompt text if necessary."""
         max_input_tokens = self.max_input_tokens
-        if max_input_tokens is None:
+        if max_input_tokens is None or tokenizer is None:
             return text
 
-        if self.truncate_prompt_tokens is None and tokenizer is not None:
-            max_input_chars = max_input_tokens * tokenizer.max_chars_per_token
+        max_input_chars = max_input_tokens * tokenizer.max_chars_per_token
 
+        if self.truncate_prompt_tokens is None:
             if len(text) > max_input_chars:
-                # To save resources, fail the request outright without even
-                # attempting tokenization
                 raise VLLMValidationError(
                     f"This model's maximum context length is "
                     f"{self.max_total_tokens} tokens. However, you requested "
@@ -345,6 +361,11 @@ class TokenizeParams:
                     parameter="input_text",
                     value=len(text),
                 )
+        elif self.truncation_side is not None and len(text) > max_input_chars:
+            if self.truncation_side == "left":
+                text = text[-max_input_chars:]
+            else:
+                text = text[:max_input_chars]
 
         return text
 
@@ -393,24 +414,39 @@ class TokenizeParams:
 
         return tokens + [tokenizer.pad_token_id] * (pad_length - len(tokens))
 
-    def _token_truncation(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
-        """Apply truncation to prompt tokens if necessary."""
+    def _truncation_slice(
+        self, tokenizer: TokenizerLike | None, length: int
+    ) -> slice | None:
+        """The slice truncation applies to a sequence of `length` tokens.
+
+        `None` means no truncation. Anything parallel to the prompt tokens
+        (see `prompt_token_offsets` and `prompt_is_token_ids`) must be reduced
+        with this same slice to stay aligned with them.
+        """
         max_length = self.truncate_prompt_tokens
         if max_length is not None and max_length < 0:
             max_length = self.max_input_tokens
 
-        if max_length is None or max_length >= len(tokens):
-            return tokens
+        if max_length is None or max_length >= length:
+            return None
         if max_length == 0:
-            return tokens[:0]
+            return slice(0, 0)
 
         side = self.truncation_side or (
             tokenizer.truncation_side if tokenizer is not None else None
         )
         if side == "left":
-            return tokens[-max_length:]
+            return slice(-max_length, None)
 
-        return tokens[:max_length]
+        return slice(0, max_length)
+
+    def _token_truncation(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
+        """Apply truncation to prompt tokens if necessary."""
+        truncation = self._truncation_slice(tokenizer, len(tokens))
+        if truncation is None:
+            return tokens
+
+        return tokens[truncation]
 
     def _token_len_check(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
         """Apply length checks to prompt tokens if necessary."""
@@ -441,9 +477,13 @@ class TokenizeParams:
 
     def _validate_tokens(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
         """Apply all validators to a token sequence."""
+        # Truncation runs before padding, matching the Transformers pipeline
+        # these parameters are named after. Padding first would let a
+        # subsequent left-side truncation keep only the pad tokens it just
+        # appended, discarding the prompt entirely.
         for validator in (
-            self._token_padding,
             self._token_truncation,
+            self._token_padding,
             self._token_len_check,
         ):
             tokens = validator(tokenizer, tokens)
@@ -471,5 +511,15 @@ class TokenizeParams:
                 tokenizer,
                 prompt["prompt_embeds"],  # type: ignore[typeddict-item]
             )
+        offsets = cast(TokensPrompt, prompt).get("prompt_token_offsets")
+        if offsets is not None:
+            truncation = self._truncation_slice(tokenizer, len(offsets))
+            if truncation is not None:
+                prompt["prompt_token_offsets"] = offsets[truncation]  # type: ignore[typeddict-unknown-key]
+        is_token_ids = cast(EmbedsPrompt, prompt).get("prompt_is_token_ids")
+        if is_token_ids is not None:
+            truncation = self._truncation_slice(tokenizer, len(is_token_ids))
+            if truncation is not None:
+                prompt["prompt_is_token_ids"] = is_token_ids[truncation]  # type: ignore[typeddict-unknown-key]
 
         return prompt

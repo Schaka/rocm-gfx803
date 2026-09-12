@@ -18,7 +18,7 @@ Decode-only real-hardware result (Qwen2.5-1.5B-Instruct, ~192-token
 context): NUM_KV_SPLITS=2 measured fastest of {1,2,4,8} (median-of-N
 `vllm bench latency`/isolated decode-throughput trials) -- 62.76 tok/s vs
 61.98 tok/s without this kernel, ~99% of llama.cpp-Vulkan's 63.39 tok/s
-ceiling on the same hardware. See SESSION_HANDOFF.md for the full
+ceiling on the same hardware. See NOTES.md for the full
 investigation, including a real, confirmed, and fixed use-after-free race
 this kernel pair hit during development (not a logic bug -- see the long
 comment at the `_split_reduce_barrier` call site below).
@@ -143,7 +143,7 @@ def kernel_paged_attention_2d_split(
     # split_end)`) and an `if`-guard wrapping loop-carried acc/M/L updates
     # inside a fixed range(0, num_blocks) both produced wrong results on
     # this ROCm/Triton backend even at NUM_KV_SPLITS=1 (see
-    # SESSION_HANDOFF.md) -- likely a codegen issue with either dynamic
+    # NOTES.md) -- likely a codegen issue with either dynamic
     # loop start or with predicated loop-carried state, not the split math
     # itself. Iterate 0..blocks_per_split unconditionally, compute the real
     # block index by offsetting inside the body instead. j can run past

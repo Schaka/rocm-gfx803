@@ -39,11 +39,8 @@ from vllm.triton_utils import tl, triton
 
 is_hip_ = current_platform.is_rocm()
 if is_hip_:
-    from vllm.platforms.rocm import on_gfx803, on_gfx906
+    from vllm.platforms.rocm import on_gfx803
 else:
-
-    def on_gfx906() -> bool:
-        return False
 
     def on_gfx803() -> bool:
         return False
@@ -65,6 +62,15 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+def _page_stride(buf, page_size):
+    # Stride between pages. 4D buffers have a page dim; 3D buffers pack pages
+    # along the token dim, so split it out first. Read the real stride (a
+    # cross-layer view has gaps), don't assume PAGE_SIZE * token stride.
+    if buf.ndim == 3:
+        buf = buf.unflatten(-3, (-1, page_size))
+    return buf.stride(-4)
+
+
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -77,8 +83,10 @@ def _fwd_kernel_stage1(
     stride_req_to_tokens_b,
     stride_qbs,
     stride_qh,
+    stride_buf_kpbs,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_buf_vpbs,
     stride_buf_vbs,
     stride_buf_vh,
     stride_mid_ob,
@@ -131,10 +139,12 @@ def _fwd_kernel_stage1(
                 + offs_n // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
-            )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            ).to(tl.int64)  # page_number * page stride overflows int32
+            kv_in_page = offs_n % PAGE_SIZE
             offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
+                (kv_page_number * stride_buf_kpbs + kv_in_page * stride_buf_kbs)[
+                    :, None
+                ]
                 + cur_kv_head * stride_buf_kh
                 + offs_d[None, :]
             )
@@ -154,7 +164,9 @@ def _fwd_kernel_stage1(
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
+                (kv_page_number * stride_buf_vpbs + kv_in_page * stride_buf_vbs)[
+                    :, None
+                ]
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )
@@ -215,7 +227,7 @@ def _decode_att_m_fwd(
     k_scale,
     v_scale,
 ):
-    BLOCK = 64 if not is_hip_ else (16 if (on_gfx906() or on_gfx803()) else 8)
+    BLOCK = 64 if not is_hip_ else (16 if on_gfx803() else 8)
 
     NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
@@ -228,7 +240,9 @@ def _decode_att_m_fwd(
 
     num_warps = 4
     if kv_group_num != 1:
-        num_warps = 4 if (on_gfx906() or on_gfx803()) else (1 if is_hip_ else 2)
+        # gfx803's wave64 SIMDs lose to the 1-warp setting the other non-NVIDIA
+        # targets use here, so it keeps the 4 this function already defaults to.
+        num_warps = 4 if on_gfx803() else (1 if is_hip_ else 2)
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
@@ -244,8 +258,10 @@ def _decode_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
+        _page_stride(k_buffer, page_size),
         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+        _page_stride(v_buffer, page_size),
         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         att_out.stride(0),
@@ -261,7 +277,7 @@ def _decode_att_m_fwd(
         PAGE_SIZE=page_size,
         logit_cap=logit_cap,
         num_warps=num_warps,
-        num_stages=1 if (on_gfx906() or on_gfx803()) else 2,
+        num_stages=1 if on_gfx803() else 2,
         Lk=Lk,
         Lv=Lv,
     )
@@ -279,8 +295,10 @@ def _fwd_grouped_kernel_stage1(
     stride_req_to_tokens_b,
     stride_qbs,
     stride_qh,
+    stride_buf_kpbs,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_buf_vpbs,
     stride_buf_vbs,
     stride_buf_vh,
     stride_mid_ob,
@@ -365,11 +383,13 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
                 cache_modifier=".ca",
+            ).to(tl.int64)  # page_number * page stride overflows int32
+            kv_off_k = (
+                kv_page_number * stride_buf_kpbs + (offs_n % PAGE_SIZE) * stride_buf_kbs
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
 
             # explicitly facilitate overlapping load/compute
-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+            offs_buf_k = kv_off_k[None, :] + base_offs_k
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
@@ -381,7 +401,7 @@ def _fwd_grouped_kernel_stage1(
                 k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
@@ -401,7 +421,11 @@ def _fwd_grouped_kernel_stage1(
             )
 
             if not IS_MLA:
-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                kv_off_v = (
+                    kv_page_number * stride_buf_vpbs
+                    + (offs_n % PAGE_SIZE) * stride_buf_vbs
+                )
+                offs_buf_v = kv_off_v[:, None] + base_offs_v
                 v = tl.load(
                     V_Buffer + offs_buf_v,
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
@@ -505,9 +529,10 @@ def _decode_grouped_att_m_fwd(
     extra_kargs = {}
     num_stages = 2
     if is_hip_:
-        # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        if not (on_gfx906() or on_gfx803()):
+        # matrix_instr_nonkdim and kpack steer MFMA codegen, and the
+        # waves_per_eu value here was tuned for matrix-core parts. gfx803 has
+        # neither, so it takes the backend's own defaults instead.
+        if not on_gfx803():
             extra_kargs = {
                 "waves_per_eu": 1,
                 "matrix_instr_nonkdim": 16,
@@ -531,8 +556,10 @@ def _decode_grouped_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
+        _page_stride(k_buffer, page_size),
         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+        _page_stride(v_buffer, page_size),
         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         att_out.stride(0),
@@ -663,7 +690,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
-        num_stages=1 if (on_gfx906() or on_gfx803()) else 2,
+        num_stages=1 if on_gfx803() else 2,
         **extra_kargs,
     )
 

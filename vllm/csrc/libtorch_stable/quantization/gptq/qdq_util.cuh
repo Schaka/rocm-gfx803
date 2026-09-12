@@ -22,15 +22,6 @@ union half_uint16 {
   __device__ half_uint16(half val) : as_half(val) {}
 };
 
-// Max_scale premultiplied by 1/256
-
-__forceinline__ __device__ half dq_scale(const int qs, const half max_scale) {
-  int qs_i = qs + 1;
-  half qs_h = __int2half_rn(qs_i * qs_i);
-  qs_h = __hmul(qs_h, max_scale);
-  return qs_h;
-}
-
 __forceinline__ __device__ half dq(const int q, const int qzero,
                                    const half scale) {
   return __hmul(__int2half_rn(q - qzero), scale);
@@ -49,22 +40,6 @@ __forceinline__ __device__ int exb(const uint32_t q, const int shift,
 __forceinline__ __device__ int exb(const uint32_t q1, const uint32_t q0,
                                    const int shift, const int mask) {
   return (int)(__funnelshift_rc(q0, q1, shift) & mask);
-}
-
-
-__forceinline__ __device__ uint32_t bfi(const uint32_t S0, const uint32_t S1,
-                                        const uint32_t S2) {
-#if defined(USE_ROCM)
-  uint32_t result;
-  __asm__ (
-    "  v_bfi_b32  %0, %1, %2, %3  \n"
-    : "=v" (result)
-    : "v"(S0), "v"(S1), "v"(S2)
-  );
-  return result;
-#else
-  return (S0 & S1) | (~S0 & S2);
-#endif
 }
 
 }  // namespace gptq

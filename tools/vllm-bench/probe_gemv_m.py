@@ -32,7 +32,22 @@ import sys
 
 import torch
 
-_LOADER = "/data/vllm-mobydick/vllm/model_executor/layers/gfx803_gemv_m.py"
+def _resolve_loader() -> str:
+    """Locate the multi-token GEMV loader in whichever vllm is installed.
+
+    Resolving from the installed package keeps this probe pointed at the tree
+    under test instead of at one checkout path.
+    """
+    import os
+
+    import vllm
+
+    return os.path.join(
+        os.path.dirname(vllm.__file__), "model_executor", "layers", "gfx803_gemv_m.py"
+    )
+
+
+_LOADER = _resolve_loader()
 
 SHAPES = {
     "qkv_proj": (4096, 1024),

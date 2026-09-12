@@ -1,6 +1,6 @@
 // Shared-library entry point for gfx803_handwritten_gemm_v2_doublebuffer's
 // kernel -- same kernel, no benchmark/main() harness, exported as a plain
-// C function for ctypes. See SESSION_HANDOFF.md sections 27-31 and
+// C function for ctypes. See NOTES.md and
 // patches/rocblas/gfx803_handwritten_gemm_v2_doublebuffer.hip for the full
 // investigation and derivation of every design choice below.
 #include <hip/hip_runtime.h>

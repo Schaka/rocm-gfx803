@@ -18,6 +18,9 @@ vllm/third_party/deep_gemm/
 # fmha_sm100 vendored package built from source
 vllm/third_party/fmha_sm100/
 
+# tml-fa4 vendored package built from source
+vllm/third_party/tml_fa4/
+
 # triton jit
 .triton
 
@@ -170,9 +173,6 @@ venv.bak/
 
 # mkdocs documentation
 /site
-docs/argparse
-docs/examples/*
-!docs/examples/README.md
 
 # mypy
 .mypy_cache/
@@ -199,7 +199,9 @@ cython_debug/
 .vscode/
 
 # Claude
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 
 # Codex
 .codex/
@@ -228,9 +230,9 @@ _build/
 *_hip*
 hip_compat.h
 
-# gfx803_kernels/ is the opposite of the above: hand-written HIP source for
-# gfx803 (no .cu original to hipify from), meant to be tracked. Whitelisted
-# instead of force-adding each file -- see rocm-gfx803/AGENTS.md.
+# The gfx803 kernels are the opposite of the rule above: hand-written HIP with
+# no .cu original to hipify from, so they are tracked. Whitelisted here rather
+# than force-added one file at a time.
 !/vllm/gfx803_kernels/*.hip
 
 # Benchmark dataset

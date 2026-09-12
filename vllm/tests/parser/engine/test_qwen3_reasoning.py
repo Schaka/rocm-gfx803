@@ -15,13 +15,20 @@ import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
 from tests.parser.engine.streaming_helpers import simulate_reasoning_streaming
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.engine.parser_engine_config import ParserState
+from vllm.parser.engine.registered_adapters import (
+    Qwen3ParserReasoningAdapter,
+    Qwen3ParserToolAdapter,
+)
 from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
 
 _THINK_START_ID = 50
 _THINK_END_ID = 51
 _TOOL_CALL_ID = 60
 _TOOL_CALL_END_ID = 61
+_IM_START_ID = 70
+_IM_END_ID = 71
 _TEXT_ID = 100
 
 _QWEN3_VOCAB = {
@@ -29,7 +36,14 @@ _QWEN3_VOCAB = {
     "</think>": _THINK_END_ID,
     "<tool_call>": _TOOL_CALL_ID,
     "</tool_call>": _TOOL_CALL_END_ID,
+    "<|im_start|>": _IM_START_ID,
+    "<|im_end|>": _IM_END_ID,
 }
+
+
+class _Qwen3DelegatingParser(DelegatingParser):
+    reasoning_parser_cls = Qwen3ParserReasoningAdapter
+    tool_parser_cls = Qwen3ParserToolAdapter
 
 
 @pytest.fixture
@@ -162,6 +176,10 @@ class TestIsReasoningEnd:
         """Unpaired <tool_call> is implicit reasoning end."""
         assert parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
 
+    def test_prompt_tool_example_before_generation_think_not_end(self, parser):
+        """Tool examples before the generation <think> must not end reasoning."""
+        assert not parser.is_reasoning_end([_TOOL_CALL_ID, _TEXT_ID, _THINK_START_ID])
+
     def test_paired_tool_call_not_end(self, parser):
         """Paired <tool_call>...</tool_call> (from template) is NOT end."""
         assert not parser.is_reasoning_end(
@@ -176,6 +194,142 @@ class TestIsReasoningEnd:
 
     def test_empty_ids(self, parser):
         assert not parser.is_reasoning_end([])
+
+
+class TestIsReasoningEndTurnBoundaries:
+    """Reasoning markers from earlier turns must not mark the new turn's
+    reasoning as finished (think-marker injection / interleaved-thinking
+    replay).
+    """
+
+    def test_injected_think_end_in_history_not_end(self, parser):
+        assert not parser.is_reasoning_end(
+            [_IM_START_ID, _TEXT_ID, _THINK_END_ID, _IM_END_ID, _IM_START_ID]
+        )
+
+    def test_replayed_reasoning_block_in_history_not_end(self, parser):
+        assert not parser.is_reasoning_end(
+            [
+                _IM_START_ID,
+                _THINK_START_ID,
+                _TEXT_ID,
+                _THINK_END_ID,
+                _TEXT_ID,
+                _IM_END_ID,
+                _IM_START_ID,
+            ]
+        )
+
+    def test_think_end_in_current_turn_is_end(self, parser):
+        assert parser.is_reasoning_end(
+            [_IM_START_ID, _TEXT_ID, _IM_END_ID, _IM_START_ID, _THINK_END_ID]
+        )
+
+    def test_unpaired_tool_call_in_history_not_end(self, parser):
+        assert not parser.is_reasoning_end(
+            [_TOOL_CALL_ID, _TEXT_ID, _IM_END_ID, _IM_START_ID]
+        )
+
+    def test_continued_turn_with_closed_thinking_is_end(self, parser):
+        assert parser.is_reasoning_end(
+            [_IM_START_ID, _THINK_START_ID, _TEXT_ID, _THINK_END_ID, _TEXT_ID]
+        )
+
+    def test_continued_turn_with_open_thinking_not_end(self, parser):
+        assert not parser.is_reasoning_end([_IM_START_ID, _THINK_START_ID, _TEXT_ID])
+
+    def test_empty_boundary_config_keeps_global_walk(self):
+        """Configs without turn_boundary_tokens keep the pre-existing
+        behavior: any </think> in the sequence ends reasoning."""
+        cfg = qwen3_config(turn_boundary_tokens=frozenset())
+        parser = Qwen3Parser(
+            make_mock_tokenizer(_QWEN3_VOCAB), parser_engine_config=cfg
+        )
+        assert parser.is_reasoning_end(
+            [_IM_START_ID, _TEXT_ID, _THINK_END_ID, _IM_END_ID, _IM_START_ID]
+        )
+
+    def test_boundary_tokens_missing_from_vocab_keep_global_walk(self):
+        """Boundary tokens absent from the vocabulary resolve to nothing,
+        so subclasses reusing the default on a non-ChatML vocab keep the
+        pre-existing behavior."""
+        vocab = {
+            token: token_id
+            for token, token_id in _QWEN3_VOCAB.items()
+            if not token.startswith("<|im_")
+        }
+        parser = Qwen3Parser(make_mock_tokenizer(vocab))
+        assert parser.is_reasoning_end([_TEXT_ID, _THINK_END_ID, _TEXT_ID])
+
+
+class TestDelegatingPromptDetection:
+    def test_prompt_tool_example_does_not_skip_streaming_reasoning(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = _Qwen3DelegatingParser(mock_tokenizer)
+        prompt_ids = [_TOOL_CALL_ID, _TEXT_ID, _THINK_START_ID]
+
+        delta = parser.parse_delta(
+            "thinking",
+            [_TEXT_ID],
+            mock_request,
+            prompt_token_ids=prompt_ids,
+            finished=False,
+        )
+
+        assert delta is not None
+        assert delta.reasoning == "thinking"
+        assert delta.content is None
+
+    def test_injected_think_end_in_history_keeps_streaming_reasoning(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = _Qwen3DelegatingParser(mock_tokenizer)
+        prompt_ids = [
+            _IM_START_ID,
+            _TEXT_ID,
+            _THINK_END_ID,
+            _TEXT_ID,
+            _IM_END_ID,
+            _IM_START_ID,
+        ]
+
+        delta = parser.parse_delta(
+            "thinking",
+            [_TEXT_ID],
+            mock_request,
+            prompt_token_ids=prompt_ids,
+            finished=False,
+        )
+
+        assert delta is not None
+        assert delta.reasoning == "thinking"
+        assert delta.content is None
+
+    def test_think_end_in_generation_prompt_still_seeds_reasoning_ended(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = _Qwen3DelegatingParser(mock_tokenizer)
+        prompt_ids = [
+            _IM_START_ID,
+            _TEXT_ID,
+            _IM_END_ID,
+            _IM_START_ID,
+            _THINK_START_ID,
+            _THINK_END_ID,
+        ]
+
+        delta = parser.parse_delta(
+            "answer",
+            [_TEXT_ID],
+            mock_request,
+            prompt_token_ids=prompt_ids,
+            finished=False,
+        )
+
+        assert delta is not None
+        assert delta.reasoning is None
+        assert delta.content == "answer"
 
 
 class TestStreaming:
