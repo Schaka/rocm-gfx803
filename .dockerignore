@@ -1,14 +1,32 @@
-# The build context is the repo root. Only docker/, scripts/ and patches/ are
-# ever read from it. The rest is documentation, host-side tooling, investigation
-# output (the ORT backend-test logs run to tens of megabytes), the vLLM fork, and
-# the archived rocm7.14/ and rocm6.4.4/ lines.
+# The build context is the repo root. docker/, scripts/, patches/ and vllm/ are
+# what the build graph actually reads from it -- vllm/ since the vllm bake
+# target started building the vendored fork (docker/vllm.Dockerfile). The rest
+# is documentation, host-side tooling, investigation output (the ORT
+# backend-test logs run to tens of megabytes), and the archived rocm7.14/ and
+# rocm6.4.4/ lines.
 #
 # This does not affect layer caching. BuildKit keys a COPY or a bind mount on the
 # checksums of the files it actually reads, not on the whole context.
 *.md
 *.log
 tools/
-vllm/
 rocm7.14/
 rocm6.4.4/
 llama-cpp-gfx803/
+
+# The bare "*.md" rule above matches only the context root -- BuildKit's
+# ignore patterns are not gitignore's recursive globs, so it drops the root
+# AGENTS.md and README.md but not a nested one, and needs its own line here for
+# vllm/AGENTS.md (upstream's own PR policy; see this repo's AGENTS.md, "vLLM
+# lives in vllm/ as a hard fork" for why it does not apply), vllm/BUILD.md and
+# vllm/NOTES.md. docs/, tests/, examples/, benchmarks/ and .buildkite/ are the
+# fork's own bulk that the build never reads; build/ and *.egg-info/ are local
+# artifacts a host build can leave behind.
+vllm/*.md
+vllm/docs/
+vllm/tests/
+vllm/examples/
+vllm/benchmarks/
+vllm/.buildkite/
+vllm/build/
+vllm/*.egg-info/
