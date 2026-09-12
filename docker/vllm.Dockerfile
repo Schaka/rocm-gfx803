@@ -19,8 +19,11 @@ FROM python-base AS builder
 ARG ROCM_ARCH
 ARG BUILD_PARALLEL_LEVEL
 
+# libopenblas0: the pytorch wheel installed below links libopenblas.so.0 at
+# import time, and python-base's stock apt set carries no BLAS at all -- the
+# same reason final.Dockerfile installs it for the runtime venv.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake ninja-build build-essential pkg-config ccache \
+        cmake ninja-build build-essential pkg-config ccache libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN uv venv /build-venv --python 3.12 --seed \
