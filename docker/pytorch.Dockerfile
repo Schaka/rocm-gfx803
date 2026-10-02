@@ -48,6 +48,11 @@ RUN --mount=type=bind,source=scripts/git-pin.sh,target=/git-pin \
 RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
     bash /patches/pytorch/apply-gfx803-c10-warp-size-wave64.sh /pytorch
 
+# torch._int_mm reaches hipBLASLt unconditionally, and hipBLASLt has no gfx803
+# kernels, so every int8 matmul fails. This routes it to rocBLAS instead.
+RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
+    bash /patches/pytorch/apply-gfx803-int8-gemm-rocblas.sh /pytorch
+
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py

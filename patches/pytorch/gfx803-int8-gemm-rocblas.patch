@@ -1,0 +1,114 @@
+torch._int_mm (int8 x int8 -> int32) always fails on gfx803. On ROCm,
+at::cuda::blas::int8_gemm calls hipBLASLt and has no other path, and
+hipBLASLt has never shipped kernels for gfx803. The heuristic query finds no
+TensileLibrary_lazy_gfx803.dat and returns HIPBLAS_STATUS_INVALID_VALUE:
+
+  rocblaslt error: Cannot read ".../hipblaslt/library/TensileLibrary_lazy_gfx803.dat"
+  RuntimeError: CUDA error: HIPBLAS_STATUS_INVALID_VALUE when calling
+  `hipblasLtMatmulAlgoGetHeuristic( ltHandle, ...`
+
+TORCH_BLAS_PREFER_HIPBLASLT=0 does not help, because int8_gemm never asks
+for the preferred backend. The fp gemm, bgemm and addmm paths already check
+getHipblasltSupportedArchs() and fall back to rocBLAS. int8_gemm is the one
+caller in this file that does not. Anything that quantizes a linear layer to
+int8 reaches it, for example ComfyUI's comfy_kitchen int8 backend. To
+reproduce, run torch._int_mm on two 1024x1024 int8 CUDA tensors.
+
+With this patch, int8_gemm calls rocblas_gemm_ex (i8 inputs, i32 output and
+compute) on any arch outside getHipblasltSupportedArchs(). It uses the same
+handle, stream and column-major contract as the fp16 rocblas_gemm_ex call
+earlier in this file. The arch check comes first, so archs that hipBLASLt
+supports keep the Lt path unchanged. rocBLAS ships I8I_HPA Tensile kernels
+for gfx803 in all four transpose layouts. Called directly on an RX 570, they
+matched a CPU reference bit for bit on 32 cases: 8 shapes from 17x8x8 to
+2048x6144x2048, each in NN, NT, TN and TT.
+
+Verified on an RX 570 with this patch built into torch 2.14 (245c136):
+torch._int_mm matches a CPU reference bit for bit on 5 shapes from 17x8x8 to
+4096x4096x64, each with plain, transposed-A and transposed-B inputs. Those
+are the 15 cases that failed without the patch.
+
+gfx803 has no int8 dot instruction, so these kernels are not fast. They reach
+about 1.56 TOPS at 2048^3 and larger, half of fp16 matmul on the same card
+(3.1 TFLOPS). On this card int8 saves memory but does not add speed.
+
+--- a/aten/src/ATen/cuda/CUDABlas.cpp
++++ b/aten/src/ATen/cuda/CUDABlas.cpp
+@@ -2090,6 +2090,61 @@
+   return;
+ }
+ 
++#ifdef USE_ROCM
++// GFX803_INT8_GEMM_ROCBLAS_PATCH: hipBLASLt ships no kernels for archs outside
++// getHipblasltSupportedArchs(), so on those the Lt heuristic query below fails
++// with HIPBLAS_STATUS_INVALID_VALUE. rocBLAS carries int8 -> int32 Tensile
++// kernels for them, with the same column-major contract as the Lt call.
++static void int8_gemm_rocblas(
++    bool transpose_mat1,
++    bool transpose_mat2,
++    int64_t m,
++    int64_t n,
++    int64_t k,
++    const int8_t* mat1_ptr,
++    int64_t mat1_ld,
++    const int8_t* mat2_ptr,
++    int64_t mat2_ld,
++    int32_t* result_ptr,
++    int64_t result_ld) {
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, m);
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, n);
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, k);
++  CUDABLAS_POSINT_CHECK(int8_gemm, mat1_ld);
++  CUDABLAS_POSINT_CHECK(int8_gemm, mat2_ld);
++  CUDABLAS_POSINT_CHECK(int8_gemm, result_ld);
++  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
++  CUBLAS_SM_CARVEOUT_GUARD(handle);
++  int32_t alpha = 1;
++  int32_t beta = 0;
++  TORCH_CUDABLAS_CHECK(rocBLASStatusToHIPStatus(rocblas_gemm_ex(
++      (rocblas_handle)handle,
++      transpose_mat1 ? rocblas_operation_transpose : rocblas_operation_none,
++      transpose_mat2 ? rocblas_operation_transpose : rocblas_operation_none,
++      m,
++      n,
++      k,
++      &alpha,
++      mat1_ptr,
++      rocblas_datatype_i8_r,
++      mat1_ld,
++      mat2_ptr,
++      rocblas_datatype_i8_r,
++      mat2_ld,
++      &beta,
++      result_ptr,
++      rocblas_datatype_i32_r,
++      result_ld,
++      result_ptr,
++      rocblas_datatype_i32_r,
++      result_ld,
++      rocblas_datatype_i32_r,
++      rocblas_gemm_algo_standard,
++      0,
++      0)));
++}
++#endif
++
+ void int8_gemm(
+     bool transpose_mat1,
+     bool transpose_mat2,
+@@ -2102,6 +2157,15 @@
+     int64_t mat2_ld,
+     int32_t* result_ptr,
+     int64_t result_ld) {
++#ifdef USE_ROCM
++  if (!at::detail::getCUDAHooks().isGPUArch(
++          at::detail::getCUDAHooks().getHipblasltSupportedArchs())) {
++    int8_gemm_rocblas(
++        transpose_mat1, transpose_mat2, m, n, k,
++        mat1_ptr, mat1_ld, mat2_ptr, mat2_ld, result_ptr, result_ld);
++    return;
++  }
++#endif
+ 
+   cublasComputeType_t computeType = CUBLAS_COMPUTE_32I;
+   cudaDataType_t scaleType = CUDA_R_32I;
