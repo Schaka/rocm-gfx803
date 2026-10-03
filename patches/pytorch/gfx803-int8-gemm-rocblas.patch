@@ -23,10 +23,12 @@ for gfx803 in all four transpose layouts. Called directly on an RX 570, they
 matched a CPU reference bit for bit on 32 cases: 8 shapes from 17x8x8 to
 2048x6144x2048, each in NN, NT, TN and TT.
 
-Verified on an RX 570 with this patch built into torch 2.14 (245c136):
-torch._int_mm matches a CPU reference bit for bit on 5 shapes from 17x8x8 to
-4096x4096x64, each with plain, transposed-A and transposed-B inputs. Those
-are the 15 cases that failed without the patch.
+Verified on an RX 570 with this patch built into torch 2.14 at two
+release/2.14 commits, 245c136 and c299f65: torch._int_mm matches a CPU
+reference bit for bit on 5 shapes from 17x8x8 to 4096x4096x64, each with
+plain, transposed-A and transposed-B inputs. Those are the 15 cases that
+failed without the patch. The c299f65 run used the published final image as
+CI built it, with nothing installed over it.
 
 gfx803 has no int8 dot instruction, so these kernels are not fast. They reach
 about 1.56 TOPS at 2048^3 and larger, half of fp16 matmul on the same card
