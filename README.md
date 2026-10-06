@@ -8,15 +8,15 @@ repository.
 ## Prebuilt images: do not build this yourself
 
 CI builds the final image and pushes it to GHCR. You only need a local build
-when you change a patch. Pull the image you want:
+when you change a patch. Pull the newest successful build:
 
 ```bash
-# versioned tag
-docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:rocm10.0-gfx803
-
-# always the newest successful build
 docker pull ghcr.io/schaka/rocm-migraphx-ort-torch-builder:latest-gfx803
 ```
+
+Every ROCm 10.x release also gets a fixed tag, `rocm<major.minor>-gfx803`.
+`ROCM_VERSION` in `docker-bake.hcl` names the release that the current pin
+builds.
 
 `docker-bake.hcl` gives the whole tag scheme: per-component images, cache tags, and
 dated tags.
@@ -39,18 +39,26 @@ The link between the two repos runs one way. The mainline docs point here for
 gfx803. This repo does not track or copy the mainline per-architecture matrix.
 The versions do follow the mainline release track. Every pinned ref here matches
 what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
-`release/rocm-rel-10.0`, ORT `v1.29.0`, and PyTorch `2.14.0` /
+`release/rocm-rel-<major.minor>`, ORT `v1.29.0`, and PyTorch `2.14.0` /
 `release/2.14`. So gfx803 does not silently lag the supported line it came from.
 
 ## Status
 
-rocm10 (this repo's root) is the only line, under active development. The image
-carries the whole ROCm 10.0 stack built from source — ROCr and the CLR runtime,
-rocBLAS, MIOpen, rocSOLVER, MIGraphX, PyTorch, ONNX Runtime and Triton — with the
-gfx803 vLLM fork installed beside it. Everything is on its default path, and the
+ROCm 10.x (this repo's root) is the only line, under active development. The
+image carries the whole ROCm 10.x stack, at the release that `ROCM_VERSION` in
+`docker-bake.hcl` names, built from source: ROCr and the CLR runtime, rocBLAS,
+MIOpen, rocSOLVER, MIGraphX, PyTorch, ONNX Runtime and Triton. The gfx803 vLLM
+fork is installed beside them. Everything is on its default path, and the
 environment the card needs is already set (`LD_PRELOAD` for the rocBLAS sgemm
 shim, `PYTHONPATH` for amdsmi, `HSA_OVERRIDE_GFX_VERSION`), so a container started
 from the image imports and runs any of it with no further setup.
+
+The hardware measurements in this README and in the patch headers ran on ROCm
+10.0. None of them ran again on the current 10.x pin yet. Until they do, every
+gfx803 fix in the image is built and applied but NOT YET RE-VERIFIED ON REAL
+HARDWARE on that pin. `tools/imgvalidate.sh` and `verify.py` on the card are the
+first check for an image built from a new pin, and each patch header names the
+repro for its own fix.
 
 Where each part is documented:
 
@@ -84,18 +92,19 @@ must not be combined with `graph-replay-queue-size-cap.patch`. With it,
 
 ### vLLM on gfx803
 
-The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line). It targets
-the ROCm 10.0 stack and is assumed to work against it. The hand-written gfx803
+The gfx803 vLLM hard fork lives at `vllm/` (repo root). It targets the ROCm 10.x
+stack. The hand-written gfx803
 kernels (`vllm/vllm/gfx803_kernels/*.hip`) are version-agnostic source. Each one
 is compiled once with the stack's own
 `hipcc --offload-arch=gfx803 -O3 -shared -fPIC`, and each loader's docstring
 gives the exact call. `librocblas.so` resolves through the stack's
-`LD_LIBRARY_PATH`, which is `/opt/rocm/core-10.0/lib` on 10.0. The compiled `.so`
-files are built on the box next to their loaders and never committed, so this
-repo pins nothing stack-specific and a fresh build on the 10.0 stack works.
+`LD_LIBRARY_PATH`, which is `/opt/rocm/core-<major.minor>/lib`. The compiled
+`.so` files are built on the box next to their loaders and never committed, so
+this repo pins nothing stack-specific and a fresh build against the pinned stack
+works.
 
-Hardware validation of vLLM on the 10.0 stack is done (2026-09-02). Measured on
-the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0 tok/s, decode
+Hardware validation of vLLM ran on ROCm 10.0 (2026-09-02) and is open on the
+current 10.x pin. Measured on the box with `qwen35_2b_bench_v3.py`: EXIT=0, prefill 311.0 tok/s, decode
 30.2 tok/s. vLLM's runs on this stack depend on
 `patches/rocm-systems/va-reuse-defer-noremap.patch` and
 `patches/rocm-systems/d2h-null-dsthost.patch`, each of which states the fault it
@@ -124,16 +133,18 @@ by the `WITH_*_IMAGE` variables in `docker-bake.hcl`. That handoff is not a
 cache. It is an artifact handoff, and a tag name alone did not identify it well
 enough.
 
-- The intermediate component tags name the line (`:gfx803-rocm10`, from the `LINE`
-  variable). The main line used to publish and consume
-  the unsuffixed `:gfx803`, which is also what an earlier line of this repo
-  published under. So a component whose 10.0 job had not run since the switch was
-  consumed into a 10.0 image as if it belonged there. This was seen directly:
+- The intermediate component tags name the line (`:gfx803-rocm<major.minor>`,
+  from the `LINE` variable, which `docker-bake.hcl` derives from `ROCM_VERSION`).
+  The main line used to publish and consume the unsuffixed `:gfx803`, which is
+  also what an earlier line of this repo published under. So a component whose
+  job had not run since the switch was consumed into an image of another line as
+  if it belonged there. This was seen directly:
   `rocm-migraphx-builder:gfx803` and `rocm-migraphx-torch-builder:gfx803` held
   `/opt/rocm/core-7.14` and a torch 2.13 wheel. A mixed-line image assembles,
-  imports, and misbehaves only on real hardware. The final image keeps the names
-  that downstream pulls: `latest-gfx803`, `rocm10.0-gfx803`, and
-  `<date>-gfx803`.
+  imports, and misbehaves only on real hardware. Because the line names the
+  minor release, a component image from one 10.x release cannot enter a build
+  for another. The final image keeps the names that downstream pulls:
+  `latest-gfx803`, `rocm<major.minor>-gfx803`, and `<date>-gfx803`.
 - Every target states which line it inherited. A component image carries
   `/opt/rocm/.gfx803-line` (written by `scripts/gfx803-line.sh`) with the line,
   the `rocm-gfx803` revision, and the resolved upstream commits, plus the
@@ -175,6 +186,16 @@ docker buildx bake --print final
 
 # every version pin in one place
 docker buildx bake --print pins
+```
+
+Set `TENSOR_TOPK_OPT_LEVEL=-O0` in the environment of any local bake that builds
+PyTorch, which includes `final`. ROCm 10.1's compiler does not finish the gfx803
+code of the one file `TensorTopK.hip` at -O1 or higher: it keeps taking memory
+until the host runs out. At -O0 the file compiles in under a minute. CI passes
+-O0 as well.
+
+```sh
+TENSOR_TOPK_OPT_LEVEL=-O0 docker buildx bake final
 ```
 
 Every component (ROCR-Runtime and CLR, rocBLAS, MIOpen, rocSOLVER, MIGraphX,

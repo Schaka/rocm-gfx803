@@ -2,7 +2,7 @@
 # Apply d2h-null-dsthost.patch with `git apply`, then make sure that the hunk
 # landed. That patch file gives the reason and the change. In short: for a device
 # allocation that is also host-accessible, getHostMem() returns NULL, so a D2H copy
-# passed address 0 to memcpy and crashed vLLM 10.0 during inference. The change
+# passed address 0 to memcpy and crashed vLLM on ROCm 10.x during inference. The change
 # passes the destination device VA instead.
 #
 # Run this after d2h-staged-copy.sh, because it edits the branch that patch adds.

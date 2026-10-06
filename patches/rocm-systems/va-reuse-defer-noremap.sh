@@ -3,7 +3,7 @@
 # Drop the va-reuse-defer park branch's _fmm_map_to_gpu re-map: it leaves a
 # kernel GPUVM mapping behind that the fmm allocator then re-hands out, so
 # every code-object load on gfx803 fails with the kernel rejecting the VA
-# (EINVAL -> HSA_STATUS_ERROR_OUT_OF_RESOURCES -> vLLM 10.0 SIGSEGV).
+# (EINVAL -> HSA_STATUS_ERROR_OUT_OF_RESOURCES -> vLLM SIGSEGV on ROCm 10.x).
 # Must run AFTER va-reuse-defer.sh.
 set -eu
 

@@ -8,8 +8,9 @@ set -eu
 
 # A component image from another ROCm line assembles, imports, and misbehaves
 # only on real hardware, so fail at the first layer that inherits a whole tree.
-if [ ! -d /opt/rocm/core-10.0 ]; then
-    echo "FATAL: the inherited /opt/rocm has no core-10.0 (found: $(ls -d /opt/rocm/core-* 2>/dev/null | tr '\n' ' '))." >&2
+core="${ROCM_CORE:?ROCM_CORE is required}"
+if [ ! -d "/opt/rocm/$core" ]; then
+    echo "FATAL: the inherited /opt/rocm has no $core (found: $(ls -d /opt/rocm/core-* 2>/dev/null | tr '\n' ' '))." >&2
     echo "       A component image from a different ROCm line is wired into this build." >&2
     exit 1
 fi

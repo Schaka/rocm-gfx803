@@ -22,6 +22,21 @@ On the one commit the user does ask for, write it as a human alone wrote it.
 Never add a `Co-Authored-By: Claude ...` trailer or any other AI-attribution
 line, in this repo or any other.
 
+### Every local build sets TENSOR_TOPK_OPT_LEVEL=-O0.
+
+Export `TENSOR_TOPK_OPT_LEVEL=-O0` before every local `docker buildx bake` that
+builds the `pytorch` target. That includes a bake of `final`, `vllm`,
+`torchvision` or `torchaudio`, because each of them pulls `pytorch` in.
+`docker-bake.hcl` defaults the value to `-O3`. ROCm 10.1's clang 24 does not
+finish the gfx803 device code of the one file `TensorTopK.hip` at -O1 or higher.
+Its SelectionDAG instruction selection grows by about 20 MB/s with no end, and a
+96 GB host ran out of memory on it. The same file at -O1 compiles in minutes for
+gfx900 and with ROCm 10.0's clang 23, so the cause is a gfx803-only fault in
+the 10.1 compiler, not the build setup. `scripts/build/pytorch.sh` has the
+measurements. The level reaches only that one file, through the compiler wrapper
+in that script. Before you wait on a build, make sure that its log says
+`TensorTopK at -O0`.
+
 ### Fix at the source. Do not use workarounds.
 
 Fix a gfx803 bug where the bug lives. That can be the broken Tensile logic, the
@@ -185,7 +200,7 @@ These steps worked many times in this repo's history.
 - Every `.sh` driver makes sure that its own apply worked. It greps for a marker
   string, and it stops with `exit 1` when the marker is absent. Do not add a driver
   that trusts only the exit code of the patch tool.
-- The three lines (`rocm10` at the root, `rocm7.14/`, and `rocm6.4.4/`) are
+- The three lines (ROCm 10.x at the root, `rocm7.14/`, and `rocm6.4.4/`) are
   separate copies by design. Do not make one line point at another line's
   `patches/`. Each one carries its own patch set, and a shared file risks a
   half-fixed bug on one line reaching the hardware-tested state of another.
@@ -247,13 +262,16 @@ runner that it does not fit.
 ## Component pins: branches, not commit SHAs, and no nightlies
 
 Every upstream component that this repo builds from source is pinned to a named
-release branch. On the 10.0 line the pins are variables in `docker-bake.hcl`:
+release branch. On the 10.x line the pins are variables in `docker-bake.hcl`:
 `ROCM_SYSTEMS_REF`, `ROCM_LIBRARIES_REF`, `MIGRAPHX_REF` and `PYTORCH_REF`.
-`docker buildx bake --print pins` lists all of them. The values are
-`release/therock-10.0`, `release/rocm-rel-10.0`, and similar. Do not pin a
-frozen commit SHA, and do not resolve `develop` or `main` per run. The mainline
-repo (`rocm-migraphx-ort-builder`) uses the same convention in its
-`release.yml`. The archived `rocm7.14/` line uses `release/therock-7.14` and
+`docker buildx bake --print pins` lists all of them. The three ROCm refs, the
+base image, the release tag, the line and the `/opt/rocm/core-<major.minor>`
+path all derive from the one `ROCM_VERSION` variable, so a move to another 10.x
+release changes that value and nothing else in the build files. The derived
+values are `release/therock-<major.minor>`, `release/rocm-rel-<major.minor>`,
+and similar. Do not pin a frozen commit SHA, and do not resolve `develop` or
+`main` per run. The mainline repo (`rocm-migraphx-ort-builder`) uses the same
+convention in its `release.yml`. The archived `rocm7.14/` line uses `release/therock-7.14` and
 `release/rocm-rel-7.14`.
 
 This is safe only because CI here runs on manual dispatch and has no schedule.
@@ -269,7 +287,8 @@ Two additions to that rule matter for how the build finds the tip. CI resolves
 each branch to its commit once per run and passes it as a `*_SHA` build-arg, so
 a moved tip changes the layer cache key instead of being reused invisibly. See
 "Component images, pins and line provenance" in `README.md`. Nobody sets these
-values by hand. `docker-bake.hcl` keeps the branch names as the readable pin.
+values by hand. `docker-bake.hcl` keeps the branch names as the readable pin,
+and `docker buildx bake --print pins` shows them resolved.
 
 If you add a component that has no release branch, pin it to an exact commit
 SHA. Say why in a comment next to it. This happens for a component
@@ -288,19 +307,20 @@ was discussed and explicit. The fork will never be upstreamed, so a separate
 history to reconcile later has no value. Do not run `git submodule add` on it,
 and do not reconnect it to that remote unless you are told to.
 
-The fork lives on the 10.0 root line. It was copied there when the 7.14 line was
+The fork lives on the 10.x root line. It was copied there when the 7.14 line was
 archived under `rocm7.14/` on 2026-08-29. The untouched fork copy stays under
-`rocm7.14/vllm/` for the record. The fork targets the 10.0 stack by assumption.
+`rocm7.14/vllm/` for the record. The fork targets the 10.x stack by assumption.
 Its hand-written gfx803 kernels in `vllm/vllm/gfx803_kernels/*.hip` are
 version-agnostic source. They compile once with the stack's own
 `hipcc --offload-arch=gfx803`, and each loader's docstring gives the exact
 command. `librocblas.so` resolves through the stack's `LD_LIBRARY_PATH`, which
-is `/opt/rocm/core-10.0/lib` on 10.0. The compiled `.so` files are built on the
+is `/opt/rocm/core-<major.minor>/lib`. The compiled `.so` files are built on the
 box next to their loaders and are never committed, so this repo pins nothing
 stack-specific.
 
-Hardware validation of vLLM on the 10.0 stack is done, on 2026-09-02. Two
-crashes blocked it, and both were in the ROCm 10.0 stack rather than in vLLM.
+Hardware validation of vLLM ran on the ROCm 10.0 stack on 2026-09-02, and it is
+open on the current 10.x pin. Two crashes blocked it, and both were in the ROCm
+stack rather than in vLLM.
 `patches/rocm-systems/va-reuse-defer-noremap.patch` fixes the first one. The
 va-reuse-defer park branch re-mapped a buffer in `_fmm_map_to_gpu` and left a
 kernel GPUVM mapping behind. libhsakmt's aperture allocator handed that range

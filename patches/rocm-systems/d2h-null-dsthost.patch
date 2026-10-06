@@ -1,4 +1,4 @@
-CLR (rocclr) D2H copy destination address (gfx803, ROCm 10.0): a D2H copy
+CLR (rocclr) D2H copy destination address (gfx803, ROCm 10.x): a D2H copy
 whose destination is a host-accessible *device* allocation (large-BAR
 gfx803) crashed writing to address 0x0 -- `memcpy(dst=0x0, ...)` inside
 KernelBlitManager::readBuffer's staging path.

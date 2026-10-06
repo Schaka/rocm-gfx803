@@ -160,7 +160,7 @@ def main():
         fail(f"conv2d is numerically wrong (max rel err {rel:.3g})")
 
     step("rocSOLVER embeds device code")
-    # The stock 10.0 and 7.14 rocSOLVER ships host stubs, a kernel-registration
+    # The stock 10.x and 7.14 rocSOLVER ships host stubs, a kernel-registration
     # table (.hipFatBinSegment), and an empty .hip_fatbin. That section is
     # SHT_NOBITS with zero file bytes, so the library holds no code object for
     # any architecture. Every hipSOLVER-backed torch.linalg entry point then dies

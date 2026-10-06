@@ -64,15 +64,11 @@ WHAT
 ----
 - rocvirtual.cpp: clamp `kPeriod` to `min(DEBUG_HIP_GRAPH_BATCH_SIZE,
   sw_queue_size)` in `dispatchAqlPacketBatchFlat`.
-Applies to: CLR @ rocm-systems release/therock-10.0 (commit 6b0e43f341,
-2026-08-29). Re-diffed from the 7.14-era version: dispatchAqlPacketBatchFlat
-moved to ~1624, its packet-buffer parameter type changed
-(std::vector<uint8_t> -> amd::AlignedVector64<uint8_t>), and upstream added
-a ramp-up/lead-chunk path below the kPeriod line that the old hunk's
-post-context couldn't match. The unclamped kPeriod = DEBUG_HIP_GRAPH_BATCH_SIZE
-is still present and the gfx803 deadlock mechanism is unchanged -- same fix,
-new hunk. Verified on real gfx803 hardware on the 7.14 line (see WHY); not
-yet re-verified on a 10.0 image.
+Applies to: CLR @ rocm-systems release/therock-10.1 (commit
+7da43026e4f2ef7600433c38c820732f7a205d22), where the unclamped
+kPeriod = DEBUG_HIP_GRAPH_BATCH_SIZE is still present. Verified on real
+gfx803 hardware on the 7.14 line (see WHY). NOT YET RE-VERIFIED ON REAL
+HARDWARE on a 10.x image.
 
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 index 77afcab4d4..b224c0dce7 100644

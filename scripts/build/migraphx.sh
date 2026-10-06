@@ -10,12 +10,12 @@ REF="${MIGRAPHX_REF:?MIGRAPHX_REF is required}"
 . /scripts/lib/build-jobs.sh
 
 sh /patches/migraphx/gfx-default-rocblas-hipblaslt-off-build-failure.sh "$SRC"
-sh /patches/migraphx/mlir-stub-missing-symbols.sh "$SRC"
 
 # Neither composable_kernel nor rocMLIR has ever supported gfx8, and rbuild would
-# otherwise spend hours building both.
-sed -i '/composable_kernel/d; /rocMLIR/d' "$SRC/requirements.txt"
-if grep -q 'composable_kernel\|rocMLIR' "$SRC/requirements.txt"; then
+# otherwise spend hours building both. The match ignores case because MIGraphX
+# names rocMLIR's repository both ROCm/rocMLIR and ROCm/rocmlirTriton.
+sed -i '/composable_kernel/Id; /rocmlir/Id' "$SRC/requirements.txt"
+if grep -qi 'composable_kernel\|rocmlir' "$SRC/requirements.txt"; then
     echo "FATAL: requirements.txt still lists composable_kernel or rocMLIR." >&2
     exit 1
 fi

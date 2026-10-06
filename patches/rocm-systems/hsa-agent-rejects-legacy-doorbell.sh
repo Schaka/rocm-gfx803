@@ -16,15 +16,15 @@ QUEUE_FILE="$SRC/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_
 # touch the same files, so a clean reverse of this patch only applies while
 # the tree holds nothing after it.
 if grep -q "doorbell_type_ = agent->properties().Capability.ui32.DoorbellType;" "$QUEUE_FILE" \
-   && ! grep -q "DoorbellType != 2" "$AGENT_FILE"; then
+   && grep -q "only types 0, 1 and 2 are supported" "$AGENT_FILE"; then
     echo "already patched, skipping"
     exit 0
 fi
 
 git -C "$SRC" apply --verbose "$PATCH"
 
-if grep -q "DoorbellType != 2" "$AGENT_FILE"; then
-    echo "FATAL: DoorbellType != 2 throw still present in $AGENT_FILE after git apply reported success" >&2
+if ! grep -q "only types 0, 1 and 2 are supported" "$AGENT_FILE"; then
+    echo "FATAL: the doorbell switch in $AGENT_FILE still rejects types 0 and 1 after git apply reported success" >&2
     exit 1
 fi
 if ! grep -q "doorbell_type_ == 0" "$QUEUE_FILE"; then

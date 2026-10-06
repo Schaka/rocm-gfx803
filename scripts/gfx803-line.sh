@@ -3,11 +3,11 @@
 #
 # A stage inherits another stage's /opt/rocm either through a named build
 # context or through COPY --from. Neither one can say which ROCm line the
-# artifact belongs to. Intermediate tags name the line today (:gfx803-rocm10),
-# but images published before that carried a bare :gfx803 that an older line of
-# this repo used as well. Such an image is consumed silently: it assembles, it
-# imports, and it misbehaves only on real hardware. This script puts an
-# assertion on that boundary.
+# artifact belongs to. Intermediate tags name the line
+# (:gfx803-rocm<major.minor>), but images published before that carried a bare
+# :gfx803 that an older line of this repo used as well. Such an image is
+# consumed silently: it assembles, it imports, and it misbehaves only on real
+# hardware. This script puts an assertion on that boundary.
 #
 # An inherited tree with no marker predates this scheme. That case is reported
 # and accepted, because a refusal would break every build that reuses an already

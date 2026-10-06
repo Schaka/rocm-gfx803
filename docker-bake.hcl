@@ -1,4 +1,4 @@
-# Build graph for the gfx803 ROCm 10.0 pipeline. One target per component, one
+# Build graph for the gfx803 ROCm 10.x pipeline. One target per component, one
 # Dockerfile per target under docker/.
 #
 #   python-base ─ rocr-clr ─┬─ rocblas ─┬─ rocsolver ─┐
@@ -53,17 +53,17 @@ variable "PACKAGES" {
 
 variable "ROCM_ARCH" { default = "gfx803" }
 
-# Build line. Intermediate images are tagged :gfx803-rocm10 rather than :gfx803,
-# because :gfx803 is what this repo published before the main line moved to 10.0.
-# A component whose 10.0 job has not run since would otherwise be consumed as if
-# it were a 10.0 build. The same value is stamped into every image at
-# /opt/rocm/.gfx803-line and asserted by the stage that inherits it.
-variable "LINE" { default = "rocm10" }
+# Build line, one per ROCm release (rocm<major.minor>). Intermediate images are
+# tagged with it rather than a bare :gfx803, and the same value is stamped into
+# every image at /opt/rocm/.gfx803-line and asserted by the stage that inherits
+# it. A component image built for another ROCm release then stops the build
+# instead of being consumed as if it belonged to this one.
+variable "LINE" { default = "rocm${rocm_release()}" }
 
-# The final image keeps the names people pull: latest-gfx803, rocm10.0-gfx803 and
-# <date>-gfx803. The release already names the line, so it carries no LINE
-# suffix.
-variable "RELEASE_TAG" { default = "rocm10.0" }
+# The final image keeps the names people pull: latest-gfx803,
+# rocm<major.minor>-gfx803 and <date>-gfx803. The release already names the line,
+# so it carries no LINE suffix.
+variable "RELEASE_TAG" { default = "rocm${rocm_release()}" }
 
 # YYYYMMDD, for the dated tag. Empty publishes no dated tag rather than an
 # invalid ":-gfx803".
@@ -100,24 +100,37 @@ variable "NO_CACHE" { default = "false" }
 # and says so on stderr.
 # ---------------------------------------------------------------------------
 
-variable "BASE_IMAGE" { default = "rocm/dev-ubuntu-26.04:10.0.0-full" }
+# The one value a move to another ROCm release changes. The base image, the
+# three ROCm release branches, RELEASE_TAG and the versioned /opt/rocm/core-*
+# directory all derive from it, so they cannot drift apart.
+variable "ROCM_VERSION" { default = "10.1.0" }
+
+# "10.1" out of "10.1.0": AMD names release branches and /opt/rocm/core-* after
+# major.minor only.
+function "rocm_release" {
+  params = []
+  result = join(".", slice(split(".", ROCM_VERSION), 0, 2))
+}
+
+variable "BASE_IMAGE" { default = "rocm/dev-ubuntu-26.04:${ROCM_VERSION}-full" }
 
 # rocm-libraries and rocm-systems stopped cutting per-component rocm-rel-X.Y
-# branches after 7.2. TheRock's release/therock-10.0 is the release line both
-# repos track for 10.0.
-variable "ROCM_SYSTEMS_REF"   { default = "release/therock-10.0" }
-variable "ROCM_LIBRARIES_REF" { default = "release/therock-10.0" }
+# branches after 7.2. TheRock's release/therock-X.Y is the release line both
+# repos track.
+variable "ROCM_SYSTEMS_REF"   { default = "release/therock-${rocm_release()}" }
+variable "ROCM_LIBRARIES_REF" { default = "release/therock-${rocm_release()}" }
 variable "ROCM_SYSTEMS_SHA"   { default = "" }
 variable "ROCM_LIBRARIES_SHA" { default = "" }
 
 # MIGraphX is still a standalone repo and still cuts its own
 # release/rocm-rel-<major.minor> branch.
-variable "MIGRAPHX_REF" { default = "release/rocm-rel-10.0" }
+variable "MIGRAPHX_REF" { default = "release/rocm-rel-${rocm_release()}" }
 variable "MIGRAPHX_SHA" { default = "" }
 
-# release/2.14 matches what the mainline repo pins for ROCm 10.0. The two
-# companion refs come from that repo's own from-source fallback logic for torch
-# 2.14, which is the path gfx803 always takes.
+# release/2.14 is the newest release branch ROCm/pytorch has and matches what
+# the mainline repo pins. The two companion refs come from that repo's own
+# from-source fallback logic for torch 2.14, which is the path gfx803 always
+# takes.
 variable "PYTORCH_REF"     { default = "release/2.14" }
 variable "TORCHVISION_REF" { default = "release/0.28" }
 variable "TORCHAUDIO_REF"  { default = "release/2.11.0.2" }
@@ -142,9 +155,10 @@ variable "TRITON_REF" { default = "675c59878aa2280b31f722aaf42b825fcee21de8" }
 # scripts/lib/build-jobs.sh.
 variable "BUILD_PARALLEL_LEVEL" { default = "auto" }
 
-# TensorTopK.hip at -O3 has been measured taking 40GB of RSS and swap and several
-# hours. CI passes -O1 for the pytorch job. Left at -O3 here because it stays a
-# real performance tradeoff to opt into, not a fact about the file.
+# The optimization level for TensorTopK.hip alone. See scripts/build/pytorch.sh
+# for why gfx803 cannot compile that file at -O1 or higher on ROCm 10.1. CI and
+# every local build pass -O0. Left at -O3 here because it stays a real
+# performance tradeoff to opt into, not a fact about the file.
 variable "TENSOR_TOPK_OPT_LEVEL" { default = "-O3" }
 
 # Recorded inside every image at /opt/rocm/.gfx803-line and in its labels, so
@@ -234,6 +248,14 @@ function "ctx" {
 function "wheels_ctx" {
   params = [component, use_image]
   result = use_image == "true" ? "docker-image://${wheels_image(component)}" : "target:${component}-wheels"
+}
+
+# /opt/rocm/lib resolves into /opt/rocm/core-<major.minor>/lib through
+# /etc/alternatives. A COPY with a wildcard source cannot follow that symlink,
+# so migraphx and final copy their libraries through this directory instead.
+function "rocm_core" {
+  params = []
+  result = "core-${rocm_release()}"
 }
 
 function "labels" {
@@ -396,6 +418,7 @@ target "migraphx" {
   }
   args = {
     ROCM_ARCH            = ROCM_ARCH
+    ROCM_CORE            = rocm_core()
     MIGRAPHX_REF         = MIGRAPHX_REF
     MIGRAPHX_SHA         = MIGRAPHX_SHA
     BUILD_PARALLEL_LEVEL = BUILD_PARALLEL_LEVEL
@@ -611,6 +634,9 @@ target "final" {
     ort         = wheels_ctx("ort", WITH_ORT_IMAGE)
     triton      = wheels_ctx("triton", WITH_TRITON_IMAGE)
     vllm        = wheels_ctx("vllm", WITH_VLLM_IMAGE)
+  }
+  args = {
+    ROCM_CORE = rocm_core()
   }
   labels = labels("final")
   tags = concat(

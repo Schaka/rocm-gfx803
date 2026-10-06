@@ -24,7 +24,7 @@ COPY --from=migraphx /opt/rocm /opt/rocm
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
     /gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
-# ROCm 10.0 ships flatbuffers v25 in /opt/rocm, and the MIGraphX provider sets
+# ROCm 10.x ships flatbuffers v25 in /opt/rocm, and the MIGraphX provider sets
 # CMAKE_PREFIX_PATH=/opt/rocm. ORT's FetchContent declaration treats its own
 # v23.5.26 pin as a minimum, so it find_package()s the v25 config instead of
 # downloading v23, and the v25 headers then fail ORT's generated-schema

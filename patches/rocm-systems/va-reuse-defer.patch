@@ -74,11 +74,9 @@ assumed -- the fields and functions the patch touches (`struct vm_object`,
    declaration, a `deferred/svm` struct reshuffle) -- no content changes
    needed beyond (1) and (2).
 
-NOT YET RE-VERIFIED ON REAL HARDWARE against 7.14 -- ports cleanly and
-reads correctly against the pinned source, but this specific reduction
-mis-read has not been re-run through the ReductionOpTest suite or the
-gfx803/tools/reduce-harness/ repro harness on this ROCm line yet. See
-gfx803/rocm7/README.md "Status".
+NOT YET RE-VERIFIED ON REAL HARDWARE against rocm-systems
+release/therock-10.1 (commit 7da43026e4f2ef7600433c38c820732f7a205d22). To
+verify, run the ReductionOpTest suite on an image built from that commit.
 
 WHAT
 ----
@@ -94,24 +92,8 @@ fmm_release_scratch's exit loop terminating. HSA_DISABLE_FRAGMENT_ALLOCATOR
 defaults to disabling the fragment sub-allocator (set it to "0" to
 re-enable), since that allocator recycles VAs above libhsakmt where the
 fmm-level fix cannot see it.
-diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
-index e18a6d1..9030eb3 100644
---- a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
-+++ b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
-@@ -198,7 +198,10 @@ class Flag {
-     report_tool_register_failures_ = (var == "1") ? true : false;
-
-     var = os::GetEnvVar("HSA_DISABLE_FRAGMENT_ALLOCATOR");
--    disable_fragment_alloc_ = (var == "1") ? true : false;
-+    // GFX803 VA-recycling workaround: fragment sub-allocator is OFF by
-+    // default (every alloc gets a fresh VA from the driver); set the env var
-+    // to 0 to re-enable the 2MB-block sub-allocator.
-+    disable_fragment_alloc_ = (var == "0") ? false : true;
-
-     var = os::GetEnvVar("HSA_ENABLE_SDMA_HDP_FLUSH");
-     enable_sdma_hdp_flush_ = (var == "0") ? false : true;
 diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
-index 650522f..3e3d299 100644
+index a8ab29b..2c780c3 100644
 --- a/projects/rocr-runtime/libhsakmt/src/fmm.c
 +++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
 @@ -66,7 +66,11 @@
@@ -125,12 +107,12 @@ index 650522f..3e3d299 100644
 +	.deferred_len = 0,					\
 +	.deferred_bytes = 0				\
  	}
-
+ 
  #define container_of(ptr, type, member) ({			\
 @@ -90,6 +94,26 @@
  #define START_NON_CANONICAL_ADDR (1ULL << 56)
  #define END_NON_CANONICAL_ADDR (~0ULL - (1ULL << 56))
-
+ 
 +/* GFX803 VA-recycling workaround: a freed VA is withheld from the aperture
 + * free-list until FMM_REUSE_QUEUE_MAX further frees have occurred, so a hot
 + * address is never handed straight back to the next same-size malloc. The
@@ -172,7 +154,7 @@ index 650522f..3e3d299 100644
 @@ -176,6 +208,19 @@ static const manageable_aperture_ops_t mmap_aperture_ops = {
  	mmap_aperture_release
  };
-
+ 
 +static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object);
 +
 +/* A freed allocation whose VA is being withheld from reuse for a short while.
@@ -203,9 +185,9 @@ index 650522f..3e3d299 100644
 +	uint32_t deferred_len;
 +	uint64_t deferred_bytes;
  };
-
+ 
  typedef struct {
-@@ -425,6 +479,7 @@ static vm_object_t *vm_create_and_init_object(void *start, uint64_t size,
+@@ -426,6 +480,7 @@ static vm_object_t *vm_create_and_init_object(void *start, uint64_t size,
  		object->metadata = NULL;
  		object->user_data = NULL;
  		object->is_imported_kfd_bo = false;
@@ -213,10 +195,10 @@ index 650522f..3e3d299 100644
  		object->node.key = rbtree_key((unsigned long)start, size);
  		object->user_node.key = rbtree_key(0, 0);
  #ifdef SANITIZER_AMDGPU
-@@ -957,6 +1012,83 @@ static void aperture_release_area(manageable_aperture_t *app, void *address,
+@@ -947,6 +1002,83 @@ static void aperture_release_area(manageable_aperture_t *app, void *address,
  	app->ops->release_area(app, address, MemorySizeInBytes);
  }
-
+ 
 +/* Really release a deferred object: free its BOs (this is the busy-GPU
 + * teardown -- it runs inside a later FREE call, never at a quiescent point,
 + * which is what clears the stale gfx803 state), return the area to the
@@ -297,10 +279,10 @@ index 650522f..3e3d299 100644
  /* returns 0 on success. Assumes, that fmm_mutex is locked on entry */
  static vm_object_t *aperture_allocate_object(manageable_aperture_t *app,
  					     void *new_address,
-@@ -2230,24 +2362,54 @@ static int __fmm_release(HsaKFDContext *ctx,
+@@ -2260,24 +2392,54 @@ static int __fmm_release(HsaKFDContext *ctx,
  		}
  	}
-
+ 
 -	/* If memory is user memory and it's still GPU mapped, munmap
 -	 * would cause an eviction. If the restore happens quickly
 -	 * enough, restore would also fail with an error message. So
@@ -320,7 +302,7 @@ index 650522f..3e3d299 100644
 +		pthread_mutex_unlock(&aperture->fmm_mutex);
 +		return 0;
  	}
-
+ 
 -	if (ret)
 -		goto err_free_mem_failed;
 +	/* GFX803_VA_REUSE_DEFER_PATCH: scratch-backing apertures must bypass the
@@ -358,11 +340,27 @@ index 650522f..3e3d299 100644
 +		object->deferred = true;
 +		fmm_defer_release(ctx, aperture, object);
 +	}
-
+ 
 -	aperture_release_area(aperture, object->start, object->size);
 -	vm_remove_object(aperture, object);
 +	pthread_mutex_unlock(&aperture->fmm_mutex);
 +	return 0;
-
+ 
  err_free_mem_failed:
  	pthread_mutex_unlock(&aperture->fmm_mutex);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+index e05545f..14044a9 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+@@ -226,7 +226,10 @@ class Flag {
+     hotswap_disable_ = IsEnvVarTruthy("HSA_HOTSWAP_DISABLE");
+ 
+     var = os::GetEnvVar("HSA_DISABLE_FRAGMENT_ALLOCATOR");
+-    disable_fragment_alloc_ = (var == "1") ? true : false;
++    // GFX803 VA-recycling workaround: fragment sub-allocator is OFF by
++    // default (every alloc gets a fresh VA from the driver); set the env var
++    // to 0 to re-enable the 2MB-block sub-allocator.
++    disable_fragment_alloc_ = (var == "0") ? false : true;
+ 
+     var = os::GetEnvVar("HSA_ENABLE_SDMA_HDP_FLUSH");
+     enable_sdma_hdp_flush_ = (var == "0") ? false : true;

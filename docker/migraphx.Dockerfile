@@ -9,6 +9,7 @@
 FROM python-base
 
 ARG ROCM_ARCH
+ARG ROCM_CORE
 ARG MIGRAPHX_REF
 ARG MIGRAPHX_SHA
 ARG BUILD_PARALLEL_LEVEL
@@ -22,14 +23,14 @@ RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
 # both of those start from an earlier point in the chain, so copying their
 # /opt/rocm wholesale would revert rocBLAS back to stock.
 #
-# The source and destination are /opt/rocm/core-10.0/lib, not /opt/rocm/lib,
+# The source and destination are /opt/rocm/${ROCM_CORE}/lib, not /opt/rocm/lib,
 # because /opt/rocm/lib is a symlink to /etc/alternatives/rocm-lib and a COPY
 # with a wildcard source does not follow a symlinked directory in the middle of
 # the path. It silently matches zero files instead of failing, which `ls` and
 # `readlink -f` inside a running container will not show you, because those do
-# follow it. A ROCm version bump moves this path.
-COPY --from=miopen /opt/rocm/core-10.0/lib/libMIOpen.so.* /opt/rocm/core-10.0/lib/
-COPY --from=rocsolver /opt/rocm/core-10.0/lib/librocsolver.so.* /opt/rocm/core-10.0/lib/
+# follow it.
+COPY --from=miopen /opt/rocm/${ROCM_CORE}/lib/libMIOpen.so.* /opt/rocm/${ROCM_CORE}/lib/
+COPY --from=rocsolver /opt/rocm/${ROCM_CORE}/lib/librocsolver.so.* /opt/rocm/${ROCM_CORE}/lib/
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \

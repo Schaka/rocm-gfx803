@@ -1,4 +1,4 @@
-ROCclr (gfx7/gfx8, ROCm 10.0): on CIK the CP ignores the AQL acquire and
+ROCclr (gfx7/gfx8): on CIK the CP ignores the AQL acquire and
 release fence-scope bits, and nothing else maintains the compute shader's TC
 across a command boundary. One PM4 ACQUIRE_MEM packet
 (TC_ACTION_ENA|TC_WB_ACTION_ENA, whole address range), published in its own AQL
@@ -143,16 +143,15 @@ actually be pushed from: `VirtualGPU::submitMarker()`, on the queue that is abou
 to be waited on, when the marker is an event record (`vcmd.coalesceEvent() != 0`),
 which is the same test the marker's own coalescing logic uses.
 
-This is a different thing from what the earlier version of this header said was
-impossible at that spot. What is impossible there is an extra *barrier*, because a
+What is impossible at that spot is an extra *barrier*, because a
 barrier takes a tracked completion signal and the marker path's own signal
 bookkeeping (`ShouldCoalesceMarker`, `last_barrier_hw_event_`) then ends up holding
 a recycled `ProfilingSignal`: the process dies of `malloc(): smallbin double linked
 list corrupted` within a few hundred markers, both through
 `releaseGpuMemoryFence(kSkipCpuWait)` and through a hand-built
 barrier/slot/barrier. The raw slot taken alone publishes no signal and touches no
-tracker, which is exactly the condition the earlier text told the next person to
-satisfy, and it is safe here for the same reason it is safe at the other two sites.
+signal tracker, and it is safe here for the same reason it is safe at the other two
+sites.
 
 Measured on the card with one binary and `CLR_GFX8_TC_RECORD_FENCE` toggled:
 `ms3.py` 0/2000 with the site on, 21/960 with it off; `multistream2.py` 0/1600;
@@ -177,7 +176,19 @@ that ROCr's gfx8 `ExecutePM4()` already uses, with the payload inlined instead o
 fetched through an indirect buffer. dword 0 is stored last with release semantics,
 so the CP never sees a half-built packet, and the packet that follows rings the
 doorbell at a higher ring index, which covers this slot too. The slot publishes no
-completion signal of its own. Three call sites:
+completion signal of its own.
+
+The slot takes its ring index from `ReserveAqlSlots()` and is closed with
+`CompleteAqlSubmission()`, like every other packet the stream submits. HIP streams
+that share one hardware queue drop a requested barrier bit
+(`OptimizeStreamOrderingBarrier()`, on by default through `DEBUG_CLR_AQL_BARRIER_OPT`)
+when a barrier packet already sits after the stream's latest packet. If the slot
+were not that latest packet, a foreign barrier between the stream's previous packet
+and the slot would let the dispatch behind the slot drop its barrier bit and launch
+before the cache action retires. As the latest packet, the slot keeps the barrier bit
+on the next packet, unless a foreign barrier sits after the slot itself, and that
+barrier waits for the slot to retire. The slot header has no barrier bit, so it
+records nothing in the shared barrier state. Three call sites:
 
   * `dispatchGenericAqlPacket()`, for the kernel-dispatch packet types only.
   * `releaseGpuMemoryFence()`, between its barrier and a second barrier, which
@@ -211,7 +222,9 @@ and nothing at all to a copy path's choice of engine, so D2H and H2D keep SDMA. 
 H2D +1.5%, one-element sync 3.6 to 4.2 us, and compute unchanged (fp16 2048^3 GEMM
 +0.04%, conv and GPU-to-GPU clone unchanged).
 
-Applies on top of the chain up to aql-ring-queue-full-workaround. It touches the same file as
+Applies to: rocm-systems release/therock-10.1, commit
+7da43026e4f2ef7600433c38c820732f7a205d22, on top of the chain up to
+aql-ring-queue-full-workaround. It touches the same file as
 d2h-staged-copy, d2h-null-dsthost, and pinned-release-system-scope, but different
 functions. Apply with
 patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.sh.
@@ -244,10 +257,18 @@ numbers.
 
 Not measured, and open: HIP graph replay (see the caveat).
 
+The measurements above ran on ROCm 10.0. NOT YET RE-VERIFIED ON REAL HARDWARE
+against rocm-systems commit 7da43026e4f2ef7600433c38c820732f7a205d22, where the slot
+goes through the barrier-bit bookkeeping described in WHAT. To verify, rerun the bmm
+and copy probe, `conbrace3.py` and `ms3.py` from `tools/tc-staleness/` on an image
+built from that commit.
+
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+index 7d3e394..0195d0c 100644
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -1410,6 +1410,72 @@ void VirtualGPU::ringQueueDoorbell(uint64_t index) {
-   }
+@@ -1520,6 +1520,82 @@ void VirtualGPU::CompleteAqlSubmission(const AqlSlotReservation& reservation) {
+   last_aql_packet_slot_ = reservation.start_slot + reservation.packet_count - 1;
  }
  
 +// ================================================================================================
@@ -280,6 +301,12 @@ Not measured, and open: HIP graph replay (see the caveat).
 +// No doorbell of its own: the caller must submit something after it (a dispatch,
 +// or the barrier packet releaseGpuMemoryFence() emits) which rings the doorbell
 +// at a higher ring index and so commits this slot too.
++//
++// The slot is reserved and completed like any other packet, so that it becomes this stream's
++// latest packet for OptimizeStreamOrderingBarrier(). The packet after it then keeps its barrier
++// bit unless another barrier already sits behind this slot, and either way it cannot launch
++// before the cache action has retired. The slot's own header carries no barrier bit, so it has
++// nothing to record in the shared barrier state.
 +bool VirtualGPU::insertTcFence() {
 +  if (!CLR_GFX8_TC_INVALIDATE || dev().isa().versionMajor() > 8) return true;
 +
@@ -292,6 +319,8 @@ Not measured, and open: HIP graph replay (see the caveat).
 +  constexpr uint32_t kTcWbActionEna = 1u << 18;
 +  constexpr uint32_t kTcActionEna = 1u << 23;
 +  constexpr uint32_t kReleaseEventIndexAql = 7u << 8;
++  static_assert((kAcquireMemHdr & kBarrierBit) == 0,
++                "the TC slot must not look like an AQL barrier packet");
 +
 +  uint32_t slot[kSlotDwords] = {0};
 +  slot[0] = kAcquireMemHdr;
@@ -303,7 +332,9 @@ Not measured, and open: HIP graph replay (see the caveat).
 +  slot[10] = kReleaseEventIndexAql;
 +
 +  const uint32_t queueMask = gpu_queue_->size - 1;
-+  const uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
++  const AqlSlotReservation reservation = ReserveAqlSlots(1);
++  const uint64_t index = reservation.start_slot;
++  CompleteAqlSubmission(reservation);
 +  WaitForQueueSlot(index, queueMask);
 +
 +  uint32_t* dst = reinterpret_cast<uint32_t*>(gpu_queue_->base_address) +
@@ -319,7 +350,7 @@ Not measured, and open: HIP graph replay (see the caveat).
  // ================================================================================================
  template <typename AqlPacket>
  bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, uint16_t rest,
-@@ -1418,6 +1484,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
+@@ -1528,6 +1604,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
    const uint32_t queueMask = queueSize - 1;
    const uint32_t sw_queue_size = queueMask;
  
@@ -328,10 +359,10 @@ Not measured, and open: HIP graph replay (see the caveat).
 +    if (!insertTcFence()) return false;
 +  }
 +
-   // Check for queue full and wait if needed.
-   uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
-   adjustHeader(header);
-@@ -2177,6 +2248,23 @@ bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
+   const bool header_requested_barrier = (header & kBarrierBit) != 0;
+   AqlSlotReservation reservation = ReserveAqlSlots(1);
+   const uint64_t index = reservation.start_slot;
+@@ -2358,6 +2439,23 @@ bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
    if (hasPendingDispatch_ || isFenceDirty() || !Barriers().IsExternalSignalListEmpty()) {
      // Dispatch barrier packet into the queue
      dispatchBarrierPacket(kBarrierPacketHeader);
@@ -355,7 +386,7 @@ Not measured, and open: HIP graph replay (see the caveat).
      hasPendingDispatch_ = false;
      skippedDispatches_ = 0;
      retainExternalSignals_ = false;
-@@ -5108,6 +5196,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+@@ -5307,6 +5405,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
      SetCoalesceWindow(0, nullptr);
    } else {
      profilingBegin(vcmd);
@@ -374,9 +405,11 @@ Not measured, and open: HIP graph replay (see the caveat).
      const Settings& settings = dev().settings();
      hsa_signal_t ipc_s{0};
      if (vcmd.ipcCompletionSignal() != nullptr) {
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.hpp b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+index f0c2aa0..29b580d 100644
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
-@@ -722,6 +722,14 @@ class VirtualGPU : public device::VirtualDevice {
+@@ -740,6 +740,14 @@ class VirtualGPU : public device::VirtualDevice {
                                    bool blocking = false,
                                    const std::vector<uint8_t>* flatMetadataData = nullptr) override;
  
@@ -390,7 +423,9 @@ Not measured, and open: HIP graph replay (see the caveat).
 +
    template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                                uint16_t rest, bool blocking,
-                                                               bool attach_signal = false,
+                                                               bool attach_signal = false);
+diff --git a/projects/clr/rocclr/utils/flags.hpp b/projects/clr/rocclr/utils/flags.hpp
+index 5caf9d7..981f4c8 100644
 --- a/projects/clr/rocclr/utils/flags.hpp
 +++ b/projects/clr/rocclr/utils/flags.hpp
 @@ -171,6 +171,17 @@ release(uint, HIP_HOST_COHERENT, 0,                                           \

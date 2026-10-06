@@ -6,12 +6,16 @@ ARCH="${ROCM_ARCH:?ROCM_ARCH is required}"
 TOPK_OPT="${TENSOR_TOPK_OPT_LEVEL:--O3}"
 . /scripts/lib/build-jobs.sh
 
-# TensorTopK.hip at -O3 has been measured taking 40GB of combined RSS and swap
-# and several hours, on a 4-vCPU CI runner and on a 24-core workstation alike.
-# A lower level for that one file clears it in under a minute and leaves every
-# other kernel's codegen alone. PyTorch's build system has no per-file flag
-# override, so wrap the compiler binary it invokes by absolute path. This is a
-# build-environment change, not a patch on PyTorch's source.
+# TensorTopK.hip is the one file whose gfx803 device code does not finish
+# compiling at a normal optimization level. ROCm 10.1's clang 24 at -O1 stays in
+# SelectionDAG instruction selection for gfx803 (16-bit BUILD_VECTOR lowering
+# and the DAG combiner) while its memory grows by about 20MB/s: 19.5GB after 17
+# minutes, with no end in sight. The same file at -O1 takes 3 minutes and 0.8GB
+# for gfx900 on the same compiler, and 2 minutes and 0.9GB for gfx803 on ROCm
+# 10.0's clang 23. At -O0, clang 24 compiles it for gfx803 in under a minute.
+# PyTorch's build system has no per-file flag override, so wrap the compiler
+# binary it invokes by absolute path. This is a build-environment change, not a
+# patch on PyTorch's source.
 real=/opt/rocm/lib/llvm/bin/clang++.real
 mv /opt/rocm/lib/llvm/bin/clang++ "$real"
 cat > /opt/rocm/lib/llvm/bin/clang++ <<EOF

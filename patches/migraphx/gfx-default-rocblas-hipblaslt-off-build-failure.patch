@@ -1,4 +1,4 @@
-MIGraphX (pinned tag rocm-7.14): declare/define gfx_default_rocblas()
+MIGraphX: declare/define gfx_default_rocblas()
 unconditionally, instead of only under `#if MIGRAPHX_USE_HIPBLASLT`, so
 the build compiles with hipBLASLt disabled -- the only configuration any
 non-gfx90a/gfx94x/gfx95x/gfx110x/gfx120x target (gfx803 included) can
@@ -19,9 +19,8 @@ definition (device_name.cpp) are both wrapped in
 gfx803/EVALUATION_ROCM_7.md's hipBLASLt section), the symbol simply
 doesn't exist and lowering.cpp fails to compile: "no member named
 'gfx_default_rocblas' in namespace 'migraphx::gpu'". This is a real
-upstream gap in the rocm-7.14 source, not a gfx803-specific issue -- it
-would reproduce for any target built with hipBLASLt disabled. Confirmed
-directly against the pinned tag's source, not assumed.
+upstream gap, not a gfx803-specific issue -- it would reproduce for any
+target built with hipBLASLt disabled.
 
 The call is dead code once hipBLASLt is compiled out, not just at
 runtime on this hardware: `hipblaslt_supported()` itself is `#if
@@ -43,19 +42,20 @@ hipblaslt" meaning (there being no hipblaslt at all is the strongest
 case for preferring rocblas), even though this branch is unreachable
 given hipblaslt_supported()'s own false-when-disabled behavior.
 
-Applies to: MIGraphX @ rocm-7.14 tag, any GPU_TARGETS built with
+Applies to: MIGraphX @ release/rocm-rel-10.1, commit
+95672916ed289d4be9d230a9be732e1bbad97e8c, any GPU_TARGETS built with
 MIGRAPHX_USE_HIPBLASLT=Off -- not gfx803-specific in what it touches,
 gfx803 is simply the target that surfaced it here. See
 gfx-default-rocblas-hipblaslt-off-build-failure.sh for how this patch
 is applied and verified at build time.
 
 diff --git a/src/targets/gpu/device_name.cpp b/src/targets/gpu/device_name.cpp
-index 2b825ea..5c162af 100644
+index 70aa0f4..a084ab6 100644
 --- a/src/targets/gpu/device_name.cpp
 +++ b/src/targets/gpu/device_name.cpp
-@@ -143,6 +143,22 @@ static bool hipblaslt_supported_impl(const std::string& gfx_name)
-             (starts_with(gfx_name, "gfx95") and gfx_name >= "gfx950") or
-             starts_with(gfx_name, "gfx110") or starts_with(gfx_name, "gfx120"));
+@@ -144,6 +144,22 @@ static bool hipblaslt_supported_impl(const std::string& gfx_name)
+             starts_with(gfx_name, "gfx110") or starts_with(gfx_name, "gfx115") or
+             starts_with(gfx_name, "gfx120"));
  }
 +
 +#else

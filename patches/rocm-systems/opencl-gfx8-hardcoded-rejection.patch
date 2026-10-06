@@ -60,18 +60,14 @@ WHAT
   `LogWarning`) if any query failed, and every other OpenCL device
   capability (compute, buffers, atomics, etc.) still initializes
   normally.
-Applies to: CLR @ rocm-systems release/therock-10.0 (commit 6b0e43f341,
-2026-08-29). Re-diffed from the 7.14-era version (which pinned
-2b22ab0195cc1461cd9abf3b969e9dd7c10af350): device.hpp moved up a directory
-(device/rocm/device.hpp -> device/device.hpp, now the shared CLR device
-header) and populateOCLDeviceConstants()'s image-query block shifted to
-~1463; both target hunks confirmed present at 10.0 and the intent is
-unchanged. One upstream change is preserved rather than reverted: the
-imagePitchAlignment_/imageBaseAddressAlignment_/bufferFromImageSupport_
-assignments moved OUT of the image_is_supported block upstream (set
-unconditionally, per the PAL-backend comment) -- this patch keeps them
-where 10.0 has them and only removes the return-false-on-image-query-failure
-behavior. Needs hsa-agent-rejects-legacy-doorbell.patch applied first for
+Applies to: CLR @ rocm-systems release/therock-10.1 (commit
+7da43026e4f2ef7600433c38c820732f7a205d22). device.hpp is the shared CLR
+device header at device/device.hpp. One upstream behavior is kept rather
+than reverted: the imagePitchAlignment_/imageBaseAddressAlignment_/
+bufferFromImageSupport_ assignments sit outside the image_is_supported
+block upstream (set unconditionally, per the PAL-backend comment). This
+patch leaves them there and only removes the
+return-false-on-image-query-failure behavior. Needs hsa-agent-rejects-legacy-doorbell.patch applied first for
 the HSA agent underneath to exist at all -- this patch only affects what
 CLR does once that agent is already valid. See
 opencl-gfx8-hardcoded-rejection.sh for how this is applied and verified at

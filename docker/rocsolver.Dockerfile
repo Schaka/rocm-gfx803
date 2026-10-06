@@ -2,7 +2,7 @@
 #
 # rocSOLVER built from source for gfx803, installed over /opt/rocm.
 #
-# The rocSOLVER the pinned 10.0 stack ships has an empty .hip_fatbin for every
+# The rocSOLVER the pinned 10.x stack ships has an empty .hip_fatbin for every
 # architecture: host stubs and kernel registration tables, no device code. Every
 # hipSOLVER backed torch.linalg entry point crashes at its first launch.
 #

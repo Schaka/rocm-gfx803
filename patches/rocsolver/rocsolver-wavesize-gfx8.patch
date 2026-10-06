@@ -1,4 +1,4 @@
-rocSOLVER (gfx803, ROCm 10.0): WarpSize must be 64 on every wave64 ISA, not only
+rocSOLVER (gfx803, ROCm 10.x): WarpSize must be 64 on every wave64 ISA, not only
 on gfx9xx. The upstream gate `#if defined(__GFX9__)` leaves gfx8xx, which is also
 wave64, on the 32-lane branch, and the wave-partial reductions then store each
 wave's result twice.

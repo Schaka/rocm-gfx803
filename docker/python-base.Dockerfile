@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile:1
+# check=skip=InvalidDefaultArgInFrom
 #
 # Starting point for every other target: the ROCm base image plus a uv-managed
 # Python 3.12.
 #
 # Ubuntu 26.04's own python3 is 3.14, and numpy and onnx dependency resolution
 # needs 3.12. Several tools in this build also break outright on 3.14.
-ARG BASE_IMAGE=rocm/dev-ubuntu-26.04:10.0.0-full
+#
+# BASE_IMAGE has no default because docker-bake.hcl derives it from
+# ROCM_VERSION and always passes it, which is why the check above is skipped.
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive

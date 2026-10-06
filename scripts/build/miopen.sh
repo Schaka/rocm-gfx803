@@ -20,6 +20,12 @@ cd "$SRC"
 # (GCC 15) for standard headers. GCC 15's <ciso646> self-deprecates through a
 # #warning pragma, which clang turns into a hard error under MIOpen's -Werror.
 # Downgrade that one diagnostic class rather than disabling -Werror broadly.
+#
+# MIOPEN_USE_HIPCONV=Off: hipconv registers kernels for gfx942, gfx950 and
+# gfx1250 only, so its solver is never applicable on gfx803. Built anyway, it
+# compiles its gfx950 kernel templates for the gfx803 offload target, and a
+# static_assert in them exceeds clang's constexpr step limit against this base
+# image's GCC 15 libstdc++.
 mkdir -p build
 cd build
 CXX=/opt/rocm/bin/amdclang++ cmake .. \
@@ -30,6 +36,7 @@ CXX=/opt/rocm/bin/amdclang++ cmake .. \
     -DMIOPEN_USE_COMPOSABLEKERNEL=Off \
     -DMIOPEN_USE_MLIR=Off \
     -DMIOPEN_USE_HIPBLASLT=Off \
+    -DMIOPEN_USE_HIPCONV=Off \
     -DMIOPEN_BUILD_DRIVER=Off \
     -DBUILD_TESTING=Off \
     "-DCMAKE_CXX_FLAGS=-Wno-error=#warnings"
