@@ -257,11 +257,15 @@ numbers.
 
 Not measured, and open: HIP graph replay (see the caveat).
 
-The measurements above ran on ROCm 10.0. NOT YET RE-VERIFIED ON REAL HARDWARE
-against rocm-systems commit 7da43026e4f2ef7600433c38c820732f7a205d22, where the slot
-goes through the barrier-bit bookkeeping described in WHAT. To verify, rerun the bmm
-and copy probe, `conbrace3.py` and `ms3.py` from `tools/tc-staleness/` on an image
-built from that commit.
+The measurements above ran on ROCm 10.0. On rocm-systems commit
+7da43026e4f2ef7600433c38c820732f7a205d22, where the slot goes through the
+barrier-bit bookkeeping described in WHAT, `tools/imgvalidate.sh` measured on the
+card (gfx803 RX 470, 2026-10-06): `ms3.py` 0 anomalies in 480 checks with the
+event-record site on and 2 in 480 with it off, `ms4.py` 0 in 960,
+`multistream2.py` 0 in 480, `conbrace3.py` 0, `xprobe2.py` 0 in 60,
+`pinnedhost.py` 0 in 60, `graphprobe.py` 0 in 120, and the torch op suite 202
+of 202. The bmm and copy probe of the reader direction did not run on that
+commit.
 
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 index 7d3e394..0195d0c 100644

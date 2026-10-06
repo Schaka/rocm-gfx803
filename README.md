@@ -53,12 +53,19 @@ environment the card needs is already set (`LD_PRELOAD` for the rocBLAS sgemm
 shim, `PYTHONPATH` for amdsmi, `HSA_OVERRIDE_GFX_VERSION`), so a container started
 from the image imports and runs any of it with no further setup.
 
-The hardware measurements in this README and in the patch headers ran on ROCm
-10.0. None of them ran again on the current 10.x pin yet. Until they do, every
-gfx803 fix in the image is built and applied but NOT YET RE-VERIFIED ON REAL
-HARDWARE on that pin. `tools/imgvalidate.sh` and `verify.py` on the card are the
-first check for an image built from a new pin, and each patch header names the
-repro for its own fix.
+`tools/imgvalidate.sh` passed on the card (RX 470) with the ROCm 10.1 image on
+2026-10-06. The card is a dispatch agent, and `verify.py` passes. Every
+coherence probe shows zero anomalies, and the control with the fence off
+reproduces the fault. The fp16 GEMM and convolution sweep passes 27 of 27 with
+and without the SGEMM shim. The triton dot canary passes for fp16, bf16, fp32
+and int8, and the torch op suite passes 202 of 202. The kernel log shows no GPU
+fault, reset or ring timeout.
+
+`tools/imgvalidate.sh` is the first check for an image built from a new pin.
+Each patch header names the repro for its own fix. A header that says NOT YET
+RE-VERIFIED ON REAL HARDWARE names a fix whose own repro did not run on the
+current pin. Other hardware measurements in this README and in the patch headers
+ran on ROCm 10.0.
 
 Where each part is documented:
 

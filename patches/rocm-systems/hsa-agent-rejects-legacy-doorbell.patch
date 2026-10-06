@@ -60,10 +60,10 @@ patch restores, so it applies after this patch.
 Applies to: rocm-systems release/therock-10.1, commit
 7da43026e4f2ef7600433c38c820732f7a205d22.
 
-NOT YET RE-VERIFIED ON REAL HARDWARE against this commit. To verify, run
-rocminfo in an image built from it. Make sure that rocminfo lists gfx803 as
-a KERNEL_DISPATCH agent and that stderr shows no "Skipping unsupported GPU"
-line. Then run verify.py.
+VERIFIED ON REAL HARDWARE (gfx803 RX 470, 2026-10-06) against this commit.
+Inside an image built from it, rocminfo lists gfx803 as a KERNEL_DISPATCH
+agent, and verify.py passes. To check it again, run tools/imgvalidate.sh,
+which stops at once when the card is not a dispatch agent.
 
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 index dee070b..6068717 100644

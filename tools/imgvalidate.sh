@@ -14,6 +14,7 @@
 # tree's harnesses and not whatever was on the box last week.
 set -u
 IMG="${1:?image tag required}"
+START="$(date '+%Y-%m-%d %H:%M:%S')"
 NAME=imgval
 D=/data/s6/imgval
 PROBES=/data/s6/imgval-probes
@@ -43,8 +44,13 @@ arm() { # name, seconds, script, extra env...
 
 echo "=== image: $IMG"
 podman rm -f "$NAME" >/dev/null 2>&1
+# label=disable: on an SELinux-enforcing host, the files under /data carry no
+# container label, so the container gets "Permission denied" on every probe.
+# Relabeling with :z would rewrite the label of everything under /data,
+# including podman's own storage, so the container skips SELinux confinement.
 podman run -d --name "$NAME" --device=/dev/kfd --device=/dev/dri --group-add video \
-    --security-opt seccomp=unconfined -v /data:/data "$IMG" sleep infinity >/dev/null || {
+    --security-opt seccomp=unconfined --security-opt label=disable \
+    -v /data:/data "$IMG" sleep infinity >/dev/null || {
     echo "FATAL: container start failed"; exit 1; }
 sleep 10
 
@@ -129,6 +135,15 @@ cleanup
 timeout 4200 podman exec "$NAME" python3 /data/s6/imgval-probes/torch_op_suite.py > "$D/opsuite.log" 2>&1
 echo "opsuite rc=$? :: $(grep -aE '^(CHECKS|BAD|NONFINITE|ERROR|PASS)' "$D/opsuite.log" | tr '\n' ' ')"
 
-echo "--- dmesg: GPU resets or ring timeouts during this run"
-dmesg | grep -aicE "resetting wave|ring .* timeout|GPU recovery disabled"
+echo "--- kernel log: GPU resets or ring timeouts during this run"
+# dmesg is unreadable for a non-root user where kernel.dmesg_restrict=1, and an
+# empty log would count as zero resets, so a log without any kernel line is
+# reported as unknown instead.
+klog="$(journalctl -k --since "$START" --no-pager 2>/dev/null | grep -a ' kernel: ')"
+[ -n "$klog" ] || klog="$(dmesg 2>/dev/null)"
+if [ -n "$klog" ]; then
+  printf '%s\n' "$klog" | grep -aicE "resetting wave|ring .* timeout|GPU recovery disabled"
+else
+  echo "UNKNOWN: this user can read neither journalctl -k nor dmesg"
+fi
 echo IMGVAL_DONE
