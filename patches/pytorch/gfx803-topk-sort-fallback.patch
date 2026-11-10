@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gfx803 compatibility graph <noreply@example.invalid>
+Date: Sun, 9 Nov 2026 00:00:00 +0000
+Subject: [PATCH] ROCm: use existing sort-backed TopK path on gfx803
+
+On an RX 580, both ROCm TensorTopK selection implementations fault for a
+float32 [2, 4], k=2 input:
+
+* WarpMergeSortTopK faults in the unmodified runtime.
+* sbtopk::gatherTopK faults after gfx803 is excluded from WarpMergeSort.
+
+PyTorch already provides a GPU sort-backed TopK implementation. On gfx803
+only, select that existing path before the size-based heuristic. Keep Boolean
+tensors on their existing route because ROCm sort does not support them.
+
+This preserves the torch.topk API but has different performance and its usual
+documented tie-index non-guarantee.  It is a candidate pending complete
+on-card values/index/gradient semantics and C2 verification.
+---
+ aten/src/ATen/native/cuda/TensorTopK.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/aten/src/ATen/native/cuda/TensorTopK.cpp b/aten/src/ATen/native/cuda/TensorTopK.cpp
+index 2bfb69114ee..6d5e2d4b198 100644
+--- a/aten/src/ATen/native/cuda/TensorTopK.cpp
++++ b/aten/src/ATen/native/cuda/TensorTopK.cpp
+@@ -1,6 +1,8 @@
+ #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+ #include <ATen/native/cuda/TensorTopK.h>
+ 
++#include <cstring>
++#include <ATen/cuda/CUDAContext.h>
+ #include <ATen/core/Tensor.h>
+ #include <ATen/TensorMeta.h>
+ #include <ATen/TensorUtils.h>
+@@ -33,7 +34,20 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
+ #if defined(USE_ROCM)
+   if (self.dtype() == kBool) return false; // Bool sort not supported in ROCm: https://github.com/pytorch/pytorch/issues/139972
+ 
++  // gfx803 faults in both WarpMergeSortTopK and sbtopk::gatherTopK for a
++  // float32 [2, 4], k=2 input. The existing sort-backed TopK
++  // path is a separate GPU implementation.  gcnArchName may have feature
++  // suffixes, so match the architecture token alone.
++  const auto* properties = at::cuda::getCurrentDeviceProperties();
++  constexpr char gfx803[] = "gfx803";
++  if (properties != nullptr &&
++      std::strncmp(properties->gcnArchName, gfx803, sizeof(gfx803) - 1) == 0 &&
++      (properties->gcnArchName[sizeof(gfx803) - 1] == '\0' ||
++       properties->gcnArchName[sizeof(gfx803) - 1] == ':')) {
++    return true;
++  }
++
+   // Only use full sort for 1D contiguous large arrays
+   if (self.numel() < 10000 || self.numel() != self.size(dim)) {
+     return false;
+   }
