@@ -18,8 +18,8 @@ documented tie-index non-guarantee. RX 580 selected-shape semantic coverage
 is complete; larger-input performance and dispatch behavior require a
 separate patched/unpatched GPU benchmark before merge.
 ---
- aten/src/ATen/native/cuda/TensorTopK.cpp | 8 ++++++++
- 1 file changed, 8 insertions(+)
+ aten/src/ATen/native/cuda/TensorTopK.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
 
 diff --git a/aten/src/ATen/native/cuda/TensorTopK.cpp b/aten/src/ATen/native/cuda/TensorTopK.cpp
 index 2bfb69114ee..6d5e2d4b198 100644
@@ -33,7 +33,7 @@ index 2bfb69114ee..6d5e2d4b198 100644
  #include <ATen/core/Tensor.h>
  #include <ATen/TensorMeta.h>
  #include <ATen/TensorUtils.h>
-@@ -34,7 +35,14 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
+@@ -34,7 +35,15 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
  #if defined(USE_ROCM)
    if (self.dtype() == kBool) return false; // Bool sort not supported in ROCm: https://github.com/pytorch/pytorch/issues/139972
  
