@@ -33,7 +33,7 @@ index 2bfb69114ee..6d5e2d4b198 100644
  #include <ATen/core/Tensor.h>
  #include <ATen/TensorMeta.h>
  #include <ATen/TensorUtils.h>
-@@ -33,7 +34,14 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
+@@ -34,7 +35,14 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
  #if defined(USE_ROCM)
    if (self.dtype() == kBool) return false; // Bool sort not supported in ROCm: https://github.com/pytorch/pytorch/issues/139972
  
