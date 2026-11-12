@@ -14,39 +14,34 @@ only, select that existing path before the size-based heuristic. Keep Boolean
 tensors on their existing route because ROCm sort does not support them.
 
 This preserves the torch.topk API but has different performance and its usual
-documented tie-index non-guarantee.  It is a candidate pending complete
-on-card values/index/gradient semantics and C2 verification.
+documented tie-index non-guarantee. RX 580 selected-shape semantic coverage
+is complete; larger-input performance and dispatch behavior require a
+separate patched/unpatched GPU benchmark before merge.
 ---
- aten/src/ATen/native/cuda/TensorTopK.cpp | 15 +++++++++++++++
- 1 file changed, 15 insertions(+)
+ aten/src/ATen/native/cuda/TensorTopK.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
 
 diff --git a/aten/src/ATen/native/cuda/TensorTopK.cpp b/aten/src/ATen/native/cuda/TensorTopK.cpp
 index 2bfb69114ee..6d5e2d4b198 100644
 --- a/aten/src/ATen/native/cuda/TensorTopK.cpp
 +++ b/aten/src/ATen/native/cuda/TensorTopK.cpp
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,7 @@
  #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
  #include <ATen/native/cuda/TensorTopK.h>
  
-+#include <cstring>
-+#include <ATen/cuda/CUDAContext.h>
++#include <ATen/detail/CUDAHooksInterface.h>
  #include <ATen/core/Tensor.h>
  #include <ATen/TensorMeta.h>
  #include <ATen/TensorUtils.h>
-@@ -33,7 +34,20 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
+@@ -33,7 +34,14 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
  #if defined(USE_ROCM)
    if (self.dtype() == kBool) return false; // Bool sort not supported in ROCm: https://github.com/pytorch/pytorch/issues/139972
  
-+  // gfx803 faults in both WarpMergeSortTopK and sbtopk::gatherTopK for a
-+  // float32 [2, 4], k=2 input. The existing sort-backed TopK
-+  // path is a separate GPU implementation.  gcnArchName may have feature
-+  // suffixes, so match the architecture token alone.
-+  const auto* properties = at::cuda::getCurrentDeviceProperties();
-+  constexpr char gfx803[] = "gfx803";
-+  if (properties != nullptr &&
-+      std::strncmp(properties->gcnArchName, gfx803, sizeof(gfx803) - 1) == 0 &&
-+      (properties->gcnArchName[sizeof(gfx803) - 1] == '\0' ||
-+       properties->gcnArchName[sizeof(gfx803) - 1] == ':')) {
++  // GFX803_TOPK_SORT_FALLBACK_PATCH: on gfx803, WarpMergeSortTopK and
++  // sbtopk::gatherTopK fault for a float32 [2, 4], k=2 input.
++  // Preserve the proven sort fallback pending the large-row benchmark:
++  // do not silently route unassayed shapes back to selection kernels.
++  if (at::detail::getCUDAHooks().isGPUArch({"gfx803"})) {
 +    return true;
 +  }
 +
