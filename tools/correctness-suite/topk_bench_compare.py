@@ -50,14 +50,16 @@ def main():
     a=p.parse_args()
     if a.out.exists():p.error("refusing to overwrite benchmark result")
     rows=compare(load(a.unpatched),load(a.patched))
+    large=[x for x in rows if int(x["shape"].split("x")[-1])>=151936]
+    all_measured=all(x["slowdown_pct"] is not None for x in large)
     report={"schema":1,"source":"Schaka PR #8 request",
             "results":rows,"total_cases":len(rows),
             "both_arms_correct":sum(x["slowdown_pct"] is not None for x in rows),
             "performance_regression_gate":"request review if any correct case >10pct",
-            "all_large_input_performance_acceptable":all(
-                x["over_10pct"] is False for x in rows
-                if x["slowdown_pct"] is not None and
-                (int(x["shape"].split("x")[-1])>=151936)),
+            "large_input_all_measured":all_measured,
+            "all_large_input_performance_acceptable":(
+                all(x["over_10pct"] is False for x in large)
+                if all_measured and large else None),
             "release_admitted":False}
     a.out.parent.mkdir(parents=True,exist_ok=True)
     a.out.write_text(json.dumps(report,sort_keys=True,indent=2)+"\n")
