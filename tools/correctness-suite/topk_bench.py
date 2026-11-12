@@ -100,7 +100,11 @@ def main():
     if args.out is None:parser.error("--out required")
     if args.out.exists():parser.error("refuse overwriting a prior CSV")
     rows=[]
-    # Run long-row benchmarks before the already-known short-row VM fault.\n    # The original input still runs, but if it faults we retain useful prior\n    # measurements and halt without testing on a potentially wedged device.\n    for i in list(range(1,len(CASES)))+[0]:\n        row=base(i)
+    # Run long-row benchmarks before the already-known short-row VM fault.
+    # The original input still runs, but if it faults we retain useful prior
+    # measurements and halt without testing on a potentially wedged device.
+    for i in list(range(1,len(CASES)))+[0]:
+        row=base(i)
         cmd=[sys.executable,str(Path(__file__).resolve()),"--case",str(i),
              "--warmup",str(args.warmup),"--iterations",str(args.iterations)]
         try:
