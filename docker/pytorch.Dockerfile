@@ -57,8 +57,7 @@ RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
 # float32 input. TensorTopK already carries an independent GPU-sort path;
 # restrict gfx803 to it for non-Boolean data.
 RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
-    git -C /pytorch apply --check /patches/pytorch/gfx803-topk-sort-fallback.patch \
-    && git -C /pytorch apply /patches/pytorch/gfx803-topk-sort-fallback.patch
+    bash /patches/pytorch/apply-gfx803-topk-sort-fallback.sh /pytorch
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
