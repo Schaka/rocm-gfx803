@@ -63,3 +63,49 @@ benchmarks are claimed here.
 
 This report is deliberately compact and attributable; raw test
 journals and kernel logs stay on the host, bound by original receipts.
+
+
+## 14 November: independent backend and stability assay progress
+
+These are **separate scoped RX 580/gfx803 hardware qualifications** on the
+staged Schaka ROCm 10.1 closure; not evidence that the TopK patch itself
+fixes MIOpen, HIP, KFD, or all PyTorch operations:
+
+| Original assay | Hardware outcome | Unclosed scope |
+| --- | --- | --- |
+| Original Schaka FP16 GEMM/batched-GEMM/convolution | **27/27 source-verified numerical passes** | Broad BLAS, backend algorithms/dtypes |
+| Original Schaka Triton dot `bf16/fp16/fp32/i8` | **4/4 executed**; max errors respectively `4.77e-7`, `9.02e-7`, `1.57e-6`, `0` | No upstream numerical tolerance defined; execution-only |
+| Original Schaka MIOpen direct C++ suite | **23 entries**: 18 pass; 2 zero-applicable solver lists; pool GPU page-not-present; activation OOM; groupnorm intentionally rejected boundary shapes conservatively marked failed | Pool root cause, activation memory, groupnorm negative controls |
+| Source-preserving pooling isolation | **42/42** individual cases pass; **10/10** in-process prefix lengths pass, including all 42 in one process | Original full-sweep page fault not reproduced; original exact binary/loader and intermittent/cross-workload state unresolved |
+| ELF ABI inventory | All 10 expected shared-library families found (including MIOpen/rocSOLVER) | Symbol availability is not GPU function qualification |
+
+Source-owned local original receipts on the investigator's RX 580 host
+(prefix `/mnt/truenas/comet-net/experiments/`):
+`gfx803_schaka_fp16_20261113/matrix.json`,
+`gfx803_schaka_triton_20261113/matrix.json`,
+`gfx803_schaka_miopen_20261113/matrix.json`,
+`gfx803_pool_isolation_20261113_v3/matrix.json`,
+`gfx803_pool_prefix_20261113/matrix.json`,
+and `gfx803_rocm_abi_20261113_v2/matrix.json`.
+Retain per-run hashes/environment in the original artifacts; do not
+present unuploaded matrix paths as review-attached binaries.
+
+**Existing stability/RCA baseline:** 2026-03-27/30 WhisperX
+transcribe/align GPU hang and reset incident notes retain D2H copy →
+host wait → H2D/copy activity → GPU hang, `ring gfx timeout`, BACO
+reset and VRAM loss. Older gfx7/8 KFD SDMA doorbell callback and
+queue-validation fixes are distinct from the November MIOpen GPU
+VM fault. The running-kernel patch provenance and causal overlap remain open.
+
+**Next highest-value work:** direct original HIP runtime, ROCr/HSA,
+KFD/SDMA queue/copy/signal and memory-pressure tests, plus exact
+original-binary pooling A/B and loader/journal correlation. The factory
+plan is to reuse original component test suites, retain source/runtime
+identities and separate function conformance from sustained host
+reliability. Current roadmap:
+https://github.com/chboishabba/gfx803_compat_graph/blob/master/docs/GFX803_PHASE_DELIVERABLES_RECONCILIATION_20261114.md
+
+**PR scope stays unchanged:** source-level gfx803 TopK selection.
+The reviewed-wheel rebuild, original OpInfo TopK failures,
+and paired large-input before/after performance benchmarks remain
+separate open review gates. No universal ROCm release or stability claim.
