@@ -18,8 +18,8 @@ documented tie-index non-guarantee. RX 580 selected-shape semantic coverage
 is complete; larger-input performance and dispatch behavior require a
 separate patched/unpatched GPU benchmark before merge.
 ---
- aten/src/ATen/native/cuda/TensorTopK.cpp | 9 +++++++++
- 1 file changed, 9 insertions(+)
+ aten/src/ATen/native/cuda/TensorTopK.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
 
 diff --git a/aten/src/ATen/native/cuda/TensorTopK.cpp b/aten/src/ATen/native/cuda/TensorTopK.cpp
 index 2bfb69114ee..6d5e2d4b198 100644
@@ -33,14 +33,12 @@ index 2bfb69114ee..6d5e2d4b198 100644
  #include <ATen/core/Tensor.h>
  #include <ATen/TensorMeta.h>
  #include <ATen/TensorUtils.h>
-@@ -34,7 +35,15 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
+@@ -34,7 +35,13 @@ bool should_use_sort(const Tensor& self, int64_t dim) {
  #if defined(USE_ROCM)
    if (self.dtype() == kBool) return false; // Bool sort not supported in ROCm: https://github.com/pytorch/pytorch/issues/139972
  
 +  // GFX803_TOPK_SORT_FALLBACK_PATCH: on gfx803, WarpMergeSortTopK and
 +  // sbtopk::gatherTopK fault for a float32 [2, 4], k=2 input.
-+  // Preserve the proven sort fallback pending the large-row benchmark:
-+  // do not silently route unassayed shapes back to selection kernels.
 +  if (at::detail::getCUDAHooks().isGPUArch({"gfx803"})) {
 +    return true;
 +  }
