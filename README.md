@@ -37,10 +37,12 @@ and patch history.
 
 The link between the two repos runs one way. The mainline docs point here for
 gfx803. This repo does not track or copy the mainline per-architecture matrix.
-The versions do follow the mainline release track. Every pinned ref here matches
-what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
-`release/rocm-rel-<major.minor>`, ORT `v1.29.0`, and PyTorch `2.14.0` /
+The versions do follow the mainline release track. The MIGraphX and PyTorch pins
+match what the mainline repo's `release.yml` ships for the same ROCm line:
+MIGraphX `release/rocm-rel-<major.minor>`, and PyTorch `2.14.0` /
 `release/2.14`. So gfx803 does not silently lag the supported line it came from.
+ORT is `v1.31.1`, from the `rel-1.31.1` branch of ROCm's fork, because
+`github.com/microsoft/onnxruntime` does not exist any more.
 
 ## Status
 

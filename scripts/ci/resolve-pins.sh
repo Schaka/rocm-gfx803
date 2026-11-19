@@ -79,7 +79,7 @@ MIGRAPHX_REF       MIGRAPHX_SHA       https://github.com/ROCm/AMDMIGraphX.git
 PYTORCH_REF        PYTORCH_SHA        https://github.com/ROCm/pytorch.git
 TORCHVISION_REF    TORCHVISION_SHA    https://github.com/pytorch/vision.git
 TORCHAUDIO_REF     TORCHAUDIO_SHA     https://github.com/ROCm/audio.git
-ORT_VERSION        ORT_SHA            https://github.com/microsoft/onnxruntime.git
+ORT_REF            ORT_SHA            https://github.com/ROCm/onnxruntime.git
 PINS
 
 # TRITON_REF takes no _SHA counterpart: docker-bake.hcl already pins it to an
