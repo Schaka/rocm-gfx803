@@ -58,6 +58,13 @@ ENV ROC_ENABLE_PRE_VEGA=1
 ENV TORCH_BLAS_PREFER_HIPBLASLT=0
 ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim.so
 
+# MIOpen's LightGBM solver ranker picks immediate-mode convolution solvers from
+# a model trained on no gfx8 card, and its solver list lacks six solvers that
+# run on gfx8, the restored Winograd ones among them. With it off, immediate
+# mode ranks by MIOpen's built-in WTI estimates, which is how the
+# hardware-tested ROCm 10.1 image chose.
+ENV MIOPEN_ENABLE_LGBM_SELECTOR=0
+
 # The vLLM ROCm platform plugin is gated on `import amdsmi`, and without it
 # vLLM resolves to UnspecifiedPlatform and fails with an error that names
 # nothing related to the cause. See tools/vllm-bench/env.sh for the same
