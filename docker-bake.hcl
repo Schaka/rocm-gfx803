@@ -131,13 +131,13 @@ variable "ROCM_LIBRARIES_SHA" { default = "" }
 variable "MIGRAPHX_REF" { default = "92f34981c5fdf2bb6ced168404193b216aab8afe" }
 variable "MIGRAPHX_SHA" { default = "" }
 
-# release/2.14 is the newest release branch ROCm/pytorch has and matches what
-# the mainline repo pins. The two companion refs come from that repo's own
-# from-source fallback logic for torch 2.14, which is the path gfx803 always
-# takes.
-variable "PYTORCH_REF"     { default = "release/2.14" }
-variable "TORCHVISION_REF" { default = "release/0.28" }
-variable "TORCHAUDIO_REF"  { default = "release/2.11.0.2" }
+# release/2.15 is the newest release branch ROCm/pytorch has, and its CI
+# preview job builds against ROCm 10.2. torchvision 0.29 is the release that
+# builds against torch 2.15. ROCm/audio's release/2.11.1 is upstream
+# torchaudio's release for the torch 2.15 train, plus ROCm build support.
+variable "PYTORCH_REF"     { default = "release/2.15" }
+variable "TORCHVISION_REF" { default = "release/0.29" }
+variable "TORCHAUDIO_REF"  { default = "release/2.11.1" }
 variable "PYTORCH_SHA"     { default = "" }
 variable "TORCHVISION_SHA" { default = "" }
 variable "TORCHAUDIO_SHA"  { default = "" }
@@ -153,10 +153,10 @@ variable "ORT_SHA" { default = "" }
 # commit per release for the same reason rocBLAS and MIOpen were pinned to a
 # commit before the rocm-libraries monorepo restructure -- inductor's compiled
 # extension API has to match exactly, not "close enough". This value is
-# ROCm/pytorch release/2.14's own triton pin
+# ROCm/pytorch release/2.15's own triton pin
 # (.ci/docker/ci_commit_pins/triton.txt); bump it only together with
 # PYTORCH_REF, to whatever that file names for the new ref.
-variable "TRITON_REF" { default = "675c59878aa2280b31f722aaf42b825fcee21de8" }
+variable "TRITON_REF" { default = "0a6e13e6e31f18fa75a17ac72dee0dd1bcb507b8" }
 
 # "auto" sizes the compile job count from MemAvailable. See
 # scripts/lib/build-jobs.sh.

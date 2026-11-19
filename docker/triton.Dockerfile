@@ -1,18 +1,17 @@
 # syntax=docker/dockerfile:1
 #
-# Triton built from source for gfx803, with a self-built LLVM/MLIR (triton's
-# setup.py otherwise downloads a prebuilt one that carries none of these fixes).
+# Triton built from source for gfx803, with a self-built LLVM/MLIR and a
+# self-built AMD code-generation library on its own LLVM (triton's setup.py
+# otherwise downloads prebuilt ones).
 #
-# Triton has never targeted pre-RDNA/pre-CDNA GCN. Four patches make it work on
+# Triton has never targeted pre-RDNA/pre-CDNA GCN. Three patches make it work on
 # gfx803: an ISA-family entry (Triton's AMD backend hard-rejects any arch whose
-# family is Unknown), a DPP lowering fix (the fallback path Triton picks for
-# non-CDNA/non-RDNA targets uses an instruction gfx803 does not have), an
-# unrelated compiler miscompile that hangs the GPU on a specific loop shape, and a
-# gate on the packed v_dot intrinsics (without it an fp16 dot with f32
-# accumulation is a fatal LLVM abort, because gfx803 has no v_dot to select -- and
-# that is the shape of the ROCm attention backend's prefill kernel, so no vLLM
-# engine starts). See patches/triton/README.md for the hardware verification each
-# one carries.
+# family is Unknown), an unrelated compiler miscompile that hangs the GPU on a
+# specific loop shape, and a gate on the packed v_dot intrinsics (without it an
+# fp16 dot with f32 accumulation is a fatal LLVM abort, because gfx803 has no
+# v_dot to select -- and that is the shape of the ROCm attention backend's
+# prefill kernel, so no vLLM engine starts). See patches/triton/README.md for the
+# hardware verification each one carries.
 #
 # Needs no other component's /opt/rocm: it links no ROCm library at build time,
 # only ROCm C headers it vendors itself, and it resolves libamdhip64 and
@@ -20,8 +19,8 @@
 # provides.
 #
 # Named "builder": final only ever takes /wheels/*.whl from it (see the "wheels"
-# stage below). Everything else here -- apt build tools and, above all, the
-# self-built LLVM/MLIR tree triton.sh compiles from source -- exists only to
+# stage below). Everything else here -- apt build tools and, above all, the two
+# LLVM trees triton.sh compiles from source -- exists only to
 # produce that one wheel and is easily this component's largest published
 # content otherwise.
 FROM python-base AS builder
@@ -29,16 +28,18 @@ FROM python-base AS builder
 ARG TRITON_REF
 ARG BUILD_PARALLEL_LEVEL
 
-# clang and lld build LLVM itself, not just link against it -- LLVM/MLIR's own
-# Release build is the expensive part of this stage, and clang is
-# meaningfully faster at it than gcc.
+# gcc builds both LLVM trees and the AMD codegen library (triton.sh says why),
+# and clang builds triton itself.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git cmake ninja-build clang lld gcc g++ ccache python3-pybind11 \
+        git cmake ninja-build clang lld gcc g++ ccache \
     && rm -rf /var/lib/apt/lists/*
 
+# triton.sh builds with --no-isolation, so this venv is all the build gets: the
+# pins mirror the build-system requirements in triton's pyproject.toml, and
+# triton's setup.py imports nanobind before it does anything else.
 RUN uv venv /build-venv --python 3.12 --seed \
     && /build-venv/bin/pip install --no-cache-dir \
-        setuptools wheel "cmake>=3.20,<4.0" "ninja>=1.11.1" "pybind11>=2.13.1" build
+        setuptools wheel "cmake>=3.20,<4.0" "ninja>=1.11.1" "nanobind==2.10.2" build
 ENV PATH=/build-venv/bin:$PATH
 ENV CC=clang
 ENV CXX=clang++
@@ -51,6 +52,7 @@ COPY scripts/git-pin.sh /git-pin
 # takes only /wheels/*.whl from it. There is no tree whose lineage needs
 # recording.
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-triton-llvm \
+    --mount=type=cache,target=/root/.ccache-amd-codegen,id=gfx803-rocm10-triton-amd-codegen \
     --mount=type=bind,source=scripts/lib,target=/scripts/lib \
     --mount=type=bind,source=scripts/build/triton.sh,target=/scripts/build/triton.sh \
     --mount=type=bind,source=patches/triton,target=/patches/triton \

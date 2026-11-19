@@ -1,100 +1,153 @@
 # Triton patches for gfx803 (Polaris)
 
-Hardware-verified support for running Triton on AMD Polaris (gfx803). Triton
-upstream has never targeted pre-RDNA GCN. This is the wiring that makes it
-work, measured on a real RX 470.
+Support for running Triton on AMD Polaris (gfx803). Triton upstream has never
+targeted pre-RDNA GCN. These patches are the wiring that makes it work. Each one
+applies to triton-lang/triton `0a6e13e6e31f18fa75a17ac72dee0dd1bcb507b8`
+(release/3.9.x). None of them ran on real hardware at that commit yet. See
+"Verification" below.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `gfx803-isa-family.patch` | Adds `ISAFamily::GCN3` (gfx801-gfx810) to triton's AMD backend: enum, family deduction, and wave64 warp size. |
+| `gfx803-isa-family.patch` | Adds `ISAFamily::GCN3` (gfx801-gfx810) to triton's AMD backend: the enum value, the family mapping, and the wave64 warp size. |
 | `apply-gfx803-isa-family.sh` | Applies the patch and verifies it. |
-| `gfx803-dpp-broadcast-warpreduce.patch` | Routes GCN3 to the DPP row_bcast warpReduce path instead of the GFX10+-only `v_permlanex16` intrinsic. 1-line condition change. |
-| `apply-gfx803-dpp-broadcast-warpreduce.sh` | Applies the patch and verifies it. Requires `gfx803-isa-family.patch` first. |
-| `fold-true-cmpi-while-nested-in-for-hang.patch` | Fixes a real GPU hang (BACO reset, hardware-verified). A `while` loop nested inside a `for`-loop with trip count 1 gets its own exit condition folded to a constant by `TritonAMDFoldTrueCmpI`. This produces an infinite loop, or a zero-iteration loop. The bug is not gfx803-specific in mechanism, only proven on gfx803 hardware. |
+| `fold-true-cmpi-while-nested-in-for-hang.patch` | Fixes a GPU hang. When a `while` loop sits inside a `for` loop with trip count 1, `TritonAMDFoldTrueCmpI` folds the exit condition of the `while` loop to a constant. The result is an infinite loop or a zero-iteration loop. The mechanism is not gfx803-specific. Only gfx803 hardware showed it. |
 | `apply-fold-true-cmpi-while-nested-in-for-hang.sh` | Applies the patch and verifies it. Independent of the other two patches. |
-| `gfx803-vdot-gate.patch` | Emissions of `llvm.amdgcn.fdot2`/`sdot4` are gated on the target actually having v_dot. Without it an fp16 `tl.dot` is a fatal LLVM abort on gfx803, and no vLLM engine can start. |
+| `gfx803-vdot-gate.patch` | Emits `llvm.amdgcn.fdot2`/`sdot4` only on targets that have v_dot. Without it, an fp16 or i8 `tl.dot` is a fatal LLVM abort on gfx803, and no vLLM engine can start. |
 | `apply-gfx803-vdot-gate.sh` | Applies the patch and verifies it. Requires `gfx803-isa-family.patch` first. |
 
-Apply order: apply `gfx803-isa-family.patch` before
-`gfx803-dpp-broadcast-warpreduce.patch` and before `gfx803-vdot-gate.patch`,
-because both of those patches' context assumes `ISAFamily::GCN3` already
-exists. Apply `fold-true-cmpi-while-nested-in-for-hang.patch` in any order,
-because it is independent of the other three.
+Apply order: apply `gfx803-isa-family.patch` before `gfx803-vdot-gate.patch`,
+because the vdot gate's context keeps a line of the ISA-family patch. Apply
+`fold-true-cmpi-while-nested-in-for-hang.patch` in any order.
 
 This repo pins triton to one exact commit, not a branch. See `TRITON_REF` in
-`docker-bake.hcl` for why. It mirrors PyTorch's own triton pin. All four
-patches are re-diffed against that exact commit. Each patch header's RE-DIFF
-section says what moved since the patch was first written and
-hardware-verified. Check that the header's WHY still holds before you trust a
-future re-diff. Apply the same check to any other patch in this repo.
+`docker-bake.hcl` for why. It mirrors PyTorch's own triton pin. All three patches
+are diffed against that exact commit. Each header names the commit, states its
+hardware verification status, and gives the repro that settles it. When the
+pin moves, check that a header's WHY still holds in the new source before you
+trust a re-diff that applies. Apply the same check to any other patch in this
+repo.
 
-## What the patch does
+## What the ISA-family patch does
 
-Triton's AMD backend rejects any arch whose `TargetFeatures::getISAFamily()`
-returns `Unknown` with a hard "unsupported target" error
-(TritonGPUToLLVM.cpp, ConvertWarpPipeline.cpp). gfx803 is pre-RDNA/pre-CDNA,
-so it was Unknown. The patch:
+Triton's AMD backend rejects any arch whose ISA family is Unknown with a hard
+"unsupported target" error (TritonGPUToLLVM.cpp, ConvertWarpPipeline.cpp,
+Membar.cpp). gfx803 is pre-RDNA and pre-CDNA, so it is Unknown. The patch:
 
 1. `TargetFeatures.h`: adds `GCN3` to the `ISAFamily` enum.
-2. `TargetFeatures.cpp`: `getISAFamily()` maps every `gfx8xx` arch
-   (GCN3/GCN4: Tonga/Fiji/Polaris) to `GCN3`.
-3. `TargetFeatures.cpp`: `getWarpSize()` returns 64 for `GCN3` (wave64).
-   Without this, the default of 32 is used, and kernels run half-dead.
-4. `TargetFeatures.cpp`: `supportDppBroadcast()` returns true for `GCN3`, so
-   warpReduce's cross-row broadcast step uses the DPP `row_bcast:15/31`
-   lowering instead of the GFX10+-only `v_permlanex16` intrinsic (see
-   `gfx803-dpp-broadcast-warpreduce.patch`'s own header).
+2. `TargetFeatures.cpp`: `computeISAFamily()` maps every `gfx8xx` arch
+   (GCN3/GCN4: Tonga, Fiji, Polaris) to `GCN3`.
+3. `TargetFeatures.cpp`: `getWarpSize()` returns 64 for `GCN3` (wave64). Without
+   this, the default of 32 is used, and kernels run half-dead.
 
-Feature flags are already correct by default for GCN3. `isCDNA()` and
-`isRDNA()` return false, so GCN3 gets no MFMA, and the `v_dot`-gated choices
-that do ask the family stay off. What does not stay off by itself is the packed
-intrinsic emission: `lm.amdgcn.fdot2` and `llvm.amdgcn.sdot4` are emitted
-whenever a dot takes the FMA path, whatever the family, and on a target without
-v_dot that is not a slow path but a fatal one -- LLVM finds no instruction to
-select and aborts codegen, taking the whole compile with it. So triton does not
-lower every `tl.dot` to FMA on this arch by default: an fp16 dot with f32
-accumulation goes to those intrinsics, and `gfx803-vdot-gate.patch` is what puts
-it back on the FMA path. See that patch's header for the hardware measurements.
+Everything else follows from the defaults:
 
-## Build requirements (triton's LLVM must be built a specific way)
+- `isCDNA()` and `isRDNA()` return false for `GCN3`, so it gets no MFMA and no
+  WMMA lowering. Every `tl.dot` takes the FMA path.
+- Buffer atomics, direct-to-LDS loads, permlane swaps and the other newer-arch
+  features are off, because their predicates name only the families that have
+  them.
+- Warp reductions lower through triton's generic shuffle loop.
+  `TargetInfo::warpReduce` uses its DPP sequence only on gfx90a and newer and on
+  gfx11 and newer. For `GCN3`, the shuffle uses `ds_bpermute`, which GCN3 has.
 
-`scripts/build/triton.sh` builds triton's own pinned LLVM commit from source.
-The pin comes from `cmake/llvm-info.json` in the triton checkout. This is the
-same pin that triton's own `python/build_helpers.py` uses to download a
-prebuilt LLVM for `setup.py`. The script builds that commit from source
-instead of downloading it, using the same project set and distribution
-component list as triton's own `.github/workflows/llvm-build.yml` recipe.
+The one emission that does not follow from the family is the packed v_dot cell
+of the FMA path. Triton emits `llvm.amdgcn.fdot2` and `llvm.amdgcn.sdot4`
+whenever a dot takes that path, whatever the family. On a target without v_dot,
+that is not a slow path but a fatal one: LLVM finds no instruction to select and
+aborts codegen, taking the whole compile with it. `gfx803-vdot-gate.patch` puts
+those dots back on the plain FMA path. Its header states what that costs for i8
+dots.
 
-Do not read the LLVM hash from `cmake/llvm-build-info.json`. That file holds a
-separate, newer pin. Triton uses it only to pre-build its next LLVM version
-ahead of a future release. A build against that newer commit produced a real
-compile error, not a stale patch. Its
-`mlir/Interfaces/SideEffectInterfaces.h` had already dropped
-`Resource::getName() const` and `Resource::getParent()`. This triton commit's
-own `Dialect.h` still needs both methods.
+## Build requirements
 
-Two flags are added on top of the llvm-build.yml recipe. Three rebuilds found
-both, and neither one is optional:
+`scripts/build/triton.sh` builds everything triton needs from source. Without
+it, triton's own setup downloads a prebuilt LLVM and a prebuilt AMD
+code-generation library.
 
-- `LLVM_ENABLE_RTTI=ON`: triton's pybind module compiles WITHOUT `-fno-rtti`
+### Two LLVMs
+
+Triton links two separate LLVMs, and each pin comes from the triton checkout:
+
+- `cmake/llvm-info.json` is the LLVM/MLIR that `libtriton` links. This is the
+  same pin that triton's own `python/build_helpers.py` uses to download a
+  prebuilt LLVM.
+- `cmake/amd-llvm-info.json` is an LLVM that only the AMD code-generation
+  library `libtriton_amd_codegen.so` links. The AMD backend hands its finished
+  LLVM IR to that library through ctypes, and the library turns it into gfx ISA.
+  gfx803's instruction selection, and so the LLVM abort that the vdot gate
+  prevents, happens in this second LLVM.
+
+Do not read either hash from `cmake/llvm-build-info.json` or
+`cmake/amd-llvm-build-info.json`. Those files name what triton's own
+`.github/workflows/llvm-build.yml` pre-builds. That can be the candidate for the
+next LLVM bump, not the commit this source tree is written against. A build
+against such a newer candidate failed with a real compile error in triton's MLIR
+dialect headers.
+
+The first LLVM follows the "llvm" package recipe of triton's `llvm-build.yml`:
+the same project set, target list and distribution components, minus `not` and
+`split-file`. Two flags are added on top, and neither one is optional:
+
+- `LLVM_ENABLE_RTTI=ON`: triton's Python module compiles WITHOUT `-fno-rtti`
   (the flag applies only to `add_triton_library` targets). Without RTTI,
   `libLLVMSupport.a` lacks `llvm::cl::GenericOptionValue` typeinfo, and
   libtriton.so fails to import.
 - `LLVM_ABI_BREAKING_CHECKS=FORCE_OFF`: with assertions ON, LLVM otherwise
-  auto-enables ABI-breaking checks and emits `EnableABIBreakingChecks`.
-  Triton expects the `Disable` symbol instead.
+  auto-enables ABI-breaking checks and emits `EnableABIBreakingChecks`. Triton
+  expects the `Disable` symbol instead.
 
 `LLVM_TARGETS_TO_BUILD` must include `NVPTX`, even though this stack has no
-NVIDIA card. Triton's root CMakeLists links `LLVMNVPTXCodeGen` and MLIR's
-NVVM dialect into the core triton library unconditionally. This is confirmed
-by reading CMakeLists.txt at the pinned commit. The link is not only into the
-nvidia backend, which is also always built and here unused. An earlier
-version of this note said
-`X86;AMDGPU` was sufficient. That was accurate for whatever triton commit was
-pinned at the time, not for the one pinned now. Read the pinned source before
-you trust this list again.
+NVIDIA card. Triton's root CMakeLists links `LLVMNVPTXCodeGen` and MLIR's NVVM
+dialect into the core triton library unconditionally, next to
+`LLVMAMDGPUCodeGen`. That link is not only into the nvidia backend, which is
+also always built and here unused. Read the pinned source before you trust this
+list again.
+
+The second LLVM follows the "amd-codegen" package recipe: no extra projects, the
+AMDGPU target only, and headers, static libraries and CMake exports as the whole
+distribution. The codegen library's CMake refuses any LLVM library that is not
+static. The library links LLVM into itself and hides it, so that the two LLVMs
+can live in one process. Neither of the two extra flags above applies to it: the
+library compiles against this LLVM's headers alone and picks `-fno-rtti` and
+`-fno-exceptions` to match how this LLVM was built.
+
+### The AMD code-generation library
+
+`triton.sh` builds `third_party/amd/backend/codegen` against the second LLVM,
+with the same revision string triton's own build gives it
+(`<amd llvm hash>-<build number>`). The AMD backend folds that string into every
+kernel cache key. The script copies the library to
+`third_party/amd/backend/lib/`, the path where triton's build helper puts its own
+copy. Then it sets `TRITON_AMD_CODEGEN_PATH` for the wheel build. With that set,
+the helper neither downloads nor copies a library, so the wheel packages the
+self-built one.
+
+Two checks make sure of it. The wheel build runs with an empty `TRITON_HOME`.
+Setup keeps every AMD codegen download or bootstrap build under `.triton/amd`
+in that directory. If anything is there after the build, the script stops. The
+library inside the wheel must also match the self-built file byte for byte and
+carry its revision string.
+
+### Wheel verification
+
+The end of `triton.sh` checks that each patch reached the wheel. All three
+patches compile into `triton/_C/libtriton.so`. None reaches
+`libtriton_amd_codegen.so`, whose only sources are `amdgpu_codegen.cc` and
+`lib/Tools/LLVMOptions.cpp`.
+
+| Patch | Marker in `libtriton.so` |
+| --- | --- |
+| `gfx803-isa-family.patch` | `GCN3` |
+| `fold-true-cmpi-while-nested-in-for-hang.patch` | `isOwnWhileConditionOperand` |
+| `gfx803-vdot-gate.patch` | `supportsVDot` |
+
+Each marker is a name that exists only in the patched sources. It reaches the
+.so through the debug info of triton's default build type (`-O2 -g`). The check
+matches it as a whole line of `strings` output. A substring match is not enough,
+because the LLVM AMDGPU code linked into libtriton carries symbols such as
+`isGCN3Encoding` that contain the bare name.
 
 ## Runtime notes
 
@@ -102,95 +155,42 @@ you trust this list again.
   (hand-copied installs), set `TRITON_BACKENDS_IN_TREE=1`. Make sure
   `triton/backends/amd` and `triton/language/extra/hip` are real directories,
   not the editable-install's symlinks into the build tree.
+- Leave `TRITON_AMD_CODEGEN_PATH` unset at runtime. When set, triton loads the
+  code-generation library from that path instead of the one in
+  `triton/backends/amd/lib/`.
 - `torch.cuda.get_device_properties(0).gcnArchName` returns `gfx803` on real
   Polaris, so triton picks the right arch automatically.
 
-## Verification (real hardware, 2026-08-21)
+## Verification
 
-- Add kernel JIT-compiled for gfx803, ran, allclose PASS.
-- GEMM kernels (tl.dot, 3 shapes) ran with exact match (maxerr=0.0000).
-- Naive BLOCK=64 fp32 GEMM: 0.589 TFLOPS vs rocBLAS torch.matmul's 0.518
-  TFLOPS. Triton is slightly ahead, at about 12% of gfx803's ~5 TFLOPS peak.
-  The remaining headroom is vLLM's card-specific tuning work: tile sizes and
-  wave64-aware configs.
+NOT YET RE-VERIFIED ON REAL HARDWARE on triton 3.9
+(`0a6e13e6e31f18fa75a17ac72dee0dd1bcb507b8`). The patches apply exactly at that
+commit, and nothing more is known there. Each patch header gives the repro that
+must run on gfx803 against a build of this commit.
 
-## Verification (real hardware, 2026-08-23): while-nested-in-for hang fix
+The last hardware results come from triton 3.8 (`675c59878`), on an RX 470 and
+an RX 570, from the published `final` image:
 
-- vLLM's `_topk_topp_kernel` (the kernel that surfaced the bug) went from
-  a 100%-confirmed hardware hang (dmesg `ring gfx timeout` -> BACO reset)
-  to running correctly on every tested grid/batch combination.
-- Minimal structural repro (trivial 5-iteration while nested in a
-  `tl.range` for-loop, no data dependency) went from hang to correct
-  output.
-- Full vLLM end-to-end generation with the triton top-k/top-p path
-  enabled (no pytorch-fallback stopgap): coherent output, clean shutdown.
-
-See `fold-true-cmpi-while-nested-in-for-hang.patch`'s own header for the
-full root-cause writeup.
-
-## Verification (real hardware, 2026-09-07): re-diffed patches, shipped image
-
-The two passes above predate the 2026-09-07 re-diff and ran against the
-original file layout. This pass closes that gap. The `triton` Docker Bake
-stage built the re-diffed patches, and the `final` image shipped them.
-Every test below ran from that `final` image on the real RX 470.
-
-- Add kernel JIT-compiled for gfx803, ran, allclose PASS.
-- GEMM kernels (tl.dot, 3 shapes: 256x256x256, 512x512x512, 1024x1024x1024)
-  ran with exact match (maxerr=0.0000) on every shape.
-- `torch.cuda.get_device_properties(0).gcnArchName` reported `gfx803` inside
-  the `final` image's own venv. Triton saw the same arch string as the rest
-  of the stack.
-- The while-nested-in-for minimal structural repro (5-iteration while, no
-  data dependency, nested in a `tl.range` for-loop with trip count 1) ran
-  to completion with the correct output. No hang.
-
-This closes the re-diff gap for the three patches re-diffed at that
-point, including the while-nested-in-for fix.
-
-## Verification (real hardware, 2026-09-12): v_dot gate on the pinned triton
-
-Found while validating the published `final` image on the card: `vllm
-0.20.1+gfx803` could not start an engine at all, because the ROCm attention
-backend's prefill kernel is an fp16 dot with f32 accumulation and triton emitted
-`llvm.amdgcn.fdot2` for it. LLVM has no instruction to select, and aborts instead
-of falling back:
-
-    LLVM ERROR: Cannot select: t1002: f32 = AMDGPUISD::FDOT2
-    In function: _fwd_kernel
-
-Per-dtype 16x16 `tl.dot`, compiled and run on the RX 570, GPU result against a
-float64 CPU reference, before and after `gfx803-vdot-gate.patch`:
-
-| dtype | before | after |
-| --- | --- | --- |
-| fp16 | LLVM abort (`FDOT2`) | OK, max_err 1.19e-06 |
-| i8 | LLVM abort (`sdot4`) | OK, max_err 0.0 |
-| fp32 | OK | OK, max_err 1.69e-06 |
-| bf16 | OK | OK, max_err 4.77e-07 |
-
-That table also states what the 2026-09-07 pass above did not cover: its `tl.dot`
-GEMM shapes cannot have been fp16, because an fp16 dot on that image aborts.
-fp32 and bf16 dots both reach the f32 FMA path, so both passed. fp16 is the one
-every attention and prefill kernel uses.
-
-End to end, on the same image with only triton replaced by the build carrying
-this patch: the engine starts and generates coherent text (greedy, 64 tokens,
-46.6 tok/s) where it previously died in core init with "Engine core
-initialization failed".
-
-Two limits on this pass. The wheel was built against triton's prebuilt LLVM for
-the same `cmake/llvm-info.json` pin and with gcc, not through CI's self-built
-LLVM and clang, so only a CI rebuild of the `triton` and `final` images makes a
-published `latest-gfx803` carry a verified version of this patch. And a bf16 run
-of the same model, prompt and settings produced incoherent output, identically
-before and after this patch -- a separate, still unidentified problem that this
-patch neither causes nor fixes.
+- An add kernel JIT-compiled for gfx803, ran, and passed allclose.
+- fp32 `tl.dot` GEMMs at 256x256x256, 512x512x512 and 1024x1024x1024 ran with
+  exact results (maxerr 0.0). At BLOCK=64 the fp32 GEMM reached 0.589 TFLOPS
+  against 0.518 TFLOPS for rocBLAS `torch.matmul`, about 12% of gfx803's
+  ~5 TFLOPS peak.
+- A 16x16 `tl.dot` per dtype against a float64 CPU reference, with the v_dot
+  gate: fp16 max_err 1.19e-06, i8 max_err 0.0, fp32 max_err 1.69e-06, bf16
+  max_err 4.77e-07. Without the gate, fp16 and i8 abort in LLVM.
+- vLLM's `_topk_topp_kernel`, and a minimal 5-iteration `while` inside a
+  `tl.range` loop with trip count 1, ran to completion with correct output,
+  where they hang without the fold-true-cmpi patch.
+- `vllm 0.20.1+gfx803` started an engine on Qwen3-0.6B and generated coherent
+  text (greedy, 64 tokens, 46.6 tok/s).
 
 ## Known limitations
 
-- The GCN3 family is grouped for feature purposes (all of gfx801-gfx810 are
-  wave64/no-vdot/no-MFMA, so one family suffices). gfx803 itself is the
+- The GCN3 family is grouped for feature purposes. All of gfx801-gfx810 are
+  wave64, with no v_dot and no MFMA, so one family suffices. gfx803 itself is the
   only target tested.
-- Direct-to-LDS, vectorized-atomic, and other newer-arch features are
-  correctly disabled by the Unknown-equivalent defaults.
+- An i8 `tl.dot` on gfx803 accumulates in f32 and rounds once its accumulator
+  exceeds 2^24 in magnitude. `gfx803-vdot-gate.patch` explains why.
+- On triton 3.8, a bf16 run of Qwen3-0.6B produced incoherent output, identically
+  with and without the v_dot gate. The cause is unidentified.
