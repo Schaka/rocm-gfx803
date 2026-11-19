@@ -103,7 +103,7 @@ variable "NO_CACHE" { default = "false" }
 # The one value a move to another ROCm release changes. The base image, the
 # three ROCm release branches, RELEASE_TAG and the versioned /opt/rocm/core-*
 # directory all derive from it, so they cannot drift apart.
-variable "ROCM_VERSION" { default = "10.1.0" }
+variable "ROCM_VERSION" { default = "10.2.0" }
 
 # "10.1" out of "10.1.0": AMD names release branches and /opt/rocm/core-* after
 # major.minor only.
