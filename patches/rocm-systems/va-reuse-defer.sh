@@ -1,11 +1,10 @@
+#!/bin/sh
+# Apply va-reuse-defer.patch with `git apply`, then make sure that the hunks
+# landed. That patch file gives the reason and the change. SRC is the
+# rocm-systems monorepo root, a real git checkout, so `git apply` works here.
+# The rocblas, miopen, migraphx and pytorch patches in this tree target sparse
+# checkouts and use `patch -p1` instead (see small-gemm-assembly-miscompute.sh).
 set -eu
-
-# See va-reuse-defer.patch (re-diffed from the shipped
-# rocm6.4.4/patches/rocr/va-reuse-defer.patch) for the full WHY/WHAT and the
-# 7.14 re-diff notes. Uses `git apply` -- SRC here is the rocm-systems
-# monorepo root, a real git checkout, unlike the rocblas/miopen/migraphx/
-# pytorch patches in this tree (see small-gemm-assembly-miscompute.sh for
-# why those use `patch` instead).
 
 SRC="${1:-/rocm-systems-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

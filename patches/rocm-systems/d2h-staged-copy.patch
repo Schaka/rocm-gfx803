@@ -48,13 +48,19 @@ engine write is ever outstanding against the host buffer's lifetime. This
 costs an extra copy, which is the correct trade -- the direct host write
 is broken on gfx803.
 
-Applies AFTER graph-replay-batch-chunk-deadlock.patch (the rocvirtual.cpp
-hunk offsets assume its chunk-size change is present).
+Applies to: rocm-systems release/therock-10.2, commit
+43fa692e568e65a1fb84f2d1c74415b042839f10. d2h-null-dsthost.patch edits the
+copyMemory branch that this patch adds, so it applies after this one.
 
-VERIFIED ON REAL HARDWARE (gfx803 box, 2026-08-30): spliced into a
-10.0 image -- dblcpu churn 8/8 clean (was 5/5 faults), regchurn (the
-hipHostRegister minimal repro) 8/8 clean (was 10/10 faults), dcheck 8/8
-data-correct, GEMM numerics ~1e-6, correctness sweeps unchanged.
+VERIFIED ON REAL HARDWARE (gfx803 box, 2026-08-30) on ROCm 10.0, in an
+image: dblcpu churn 8/8 clean (5/5 faults without this patch), regchurn
+(the hipHostRegister minimal repro) 8/8 clean (10/10 faults without it),
+dcheck 8/8 data-correct, GEMM numerics ~1e-6, correctness sweeps unchanged.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE on ROCm 10.2. To verify, in an image
+built from the commit above: the torch `x.double().cpu()` alloc/free churn
+loop and the hipHostRegister minimal repro above must run without a GPU page
+fault, and the copied data must match the device data.
 diff --git a/projects/clr/rocclr/device/rocm/rocblit.cpp b/projects/clr/rocclr/device/rocm/rocblit.cpp
 --- a/projects/clr/rocclr/device/rocm/rocblit.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocblit.cpp

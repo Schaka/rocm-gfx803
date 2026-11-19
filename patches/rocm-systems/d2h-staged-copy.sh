@@ -1,8 +1,8 @@
 #!/bin/sh
 # Apply d2h-staged-copy.patch (see that file for the full WHY/WHAT).
 # gfx803 D2H churn page fault: force the GPU-staging path for D2H copies to
-# host memory. Must run AFTER graph-replay-batch-chunk-deadlock.sh (the
-# rocvirtual.cpp hunk offsets assume its chunk-size change).
+# host memory. Must run before d2h-null-dsthost.sh, which edits the copyMemory
+# branch this patch adds.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

@@ -1,4 +1,4 @@
-ROCR-Runtime: issue _mm_sfence() in SdmaQueue::RingDoorbell before the
+ROCR-Runtime: issue store_fence() in SdmaQueue::RingDoorbell before the
 doorbell store, the same fence that AqlQueue::StoreRelaxed issues before its
 own doorbell store.
 
@@ -7,8 +7,9 @@ WHY
 SdmaQueue::RingDoorbell publishes a submission with a release store to the
 write pointer, a release thread fence, and the doorbell store. On x86 a
 release fence orders ordinary write-back stores but not write-combining
-stores. The AQL doorbell path fences with _mm_sfence(), so it does not
-depend on the memory type of the ring. The SDMA path has no such fence.
+stores. The AQL doorbell path fences with store_fence(), the runtime's
+portable store fence from core/util/utils.h (an SFENCE on x86), so it does
+not depend on the memory type of the ring. The SDMA path has no such fence.
 
 On gfx803 the ring is write-back memory. amdgpu sets no
 AMDGPU_GEM_CREATE_CPU_GTT_USWC on the KFD path (amdgpu_amdkfd_gpuvm.c uses
@@ -24,27 +25,29 @@ in README.md.
 
 WHAT
 ----
-- amd_sdma_queue.cpp: _mm_sfence() between the release thread fence and the
+- amd_sdma_queue.cpp: store_fence() between the release thread fence and the
   doorbell store in SdmaQueue::RingDoorbell.
 
-Applies to: rocm-systems release/therock-10.1, commit
-7da43026e4f2ef7600433c38c820732f7a205d22. The change is not gated on the
+Applies to: rocm-systems release/therock-10.2, commit
+43fa692e568e65a1fb84f2d1c74415b042839f10. The change is not gated on the
 architecture, so it affects every SDMA queue.
 
-NOT YET RE-VERIFIED ON REAL HARDWARE against this commit.
+NOT YET RE-VERIFIED ON REAL HARDWARE on ROCm 10.2. The fence changes no
+result on gfx803, so the check is that nothing regresses: run
+tools/imgvalidate.sh on an image built from the commit above.
 
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
-index 91a0804..b2ea694 100644
+index 260660c1f2..1a12c23db3 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_sdma_queue.cpp
-@@ -239,6 +239,10 @@ hsa_status_t SdmaQueue::RingDoorbell(uint64_t write_index) {
+@@ -241,6 +241,10 @@ hsa_status_t SdmaQueue::RingDoorbell(uint64_t write_index) {
    // canonical write pointer and packet stores are visible before the doorbell.
    atomic::Store(queue_wptr_, write_index, std::memory_order_release);
    std::atomic_thread_fence(std::memory_order_release);
 +  // Same fence as AqlQueue::StoreRelaxed issues before its doorbell write, so
 +  // that the doorbell never depends on the ring being mapped write-back for the
 +  // packet stores to reach memory first.
-+  _mm_sfence();
++  store_fence();
    *queue_doorbell_ = write_index;
  
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDXG() ||

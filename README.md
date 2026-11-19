@@ -97,8 +97,7 @@ restores the AQL ring's double mapping for GFXIP 7 and 8. It raises the queue
 from 64 packets to 131072, which is 2048 times the unpatched cap, and the build
 applies it automatically, so there is no host action to take. It requires a
 kernel that does NOT carry `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and it
-must not be combined with `graph-replay-queue-size-cap.patch`. With it,
-`graph-replay-batch-chunk-deadlock.patch` is not needed.
+must not be combined with `graph-replay-queue-size-cap.patch`.
 
 ### vLLM on gfx803
 
