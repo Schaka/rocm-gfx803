@@ -1,15 +1,11 @@
 #!/bin/sh
-# Apply the gfx803 patches and build MIGraphX from source into /opt/rocm.
-#
-# Every patch file carries its own WHY header.
+# Build MIGraphX from source into /opt/rocm.
 set -eu
 
 SRC=/migraphx-src
 ARCH="${ROCM_ARCH:?ROCM_ARCH is required}"
 REF="${MIGRAPHX_REF:?MIGRAPHX_REF is required}"
 . /scripts/lib/build-jobs.sh
-
-sh /patches/migraphx/gfx-default-rocblas-hipblaslt-off-build-failure.sh "$SRC"
 
 # Neither composable_kernel nor rocMLIR has ever supported gfx8, and rbuild would
 # otherwise spend hours building both. The match ignores case because MIGraphX
@@ -53,8 +49,6 @@ PATH="${py312_bin}:/rbuild-venv/bin:$PATH" \
     -DBUILD_TESTING=Off \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-    -DCMAKE_C_FLAGS=-I/patches/migraphx/mlir-stub \
-    -DCMAKE_CXX_FLAGS=-I/patches/migraphx/mlir-stub \
     -T install
 rm -rf /migraphx-deps
 

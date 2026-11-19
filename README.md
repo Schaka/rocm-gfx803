@@ -41,6 +41,8 @@ The versions do follow the mainline release track. Every pinned ref here matches
 what the mainline repo's `release.yml` ships for the same ROCm line: MIGraphX
 `release/rocm-rel-<major.minor>`, ORT `v1.29.0`, and PyTorch `2.14.0` /
 `release/2.14`. So gfx803 does not silently lag the supported line it came from.
+If AMD cuts no MIGraphX branch for a release, the pin is the exact commit that
+AMD's MIGraphX package names.
 
 ## Status
 

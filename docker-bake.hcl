@@ -100,9 +100,10 @@ variable "NO_CACHE" { default = "false" }
 # and says so on stderr.
 # ---------------------------------------------------------------------------
 
-# The one value a move to another ROCm release changes. The base image, the
-# three ROCm release branches, RELEASE_TAG and the versioned /opt/rocm/core-*
-# directory all derive from it, so they cannot drift apart.
+# The one value a move to another ROCm release changes, apart from MIGRAPHX_REF
+# below. The base image, the rocm-systems and rocm-libraries release branches,
+# RELEASE_TAG and the versioned /opt/rocm/core-* directory all derive from it,
+# so they cannot drift apart.
 variable "ROCM_VERSION" { default = "10.2.0" }
 
 # "10.1" out of "10.1.0": AMD names release branches and /opt/rocm/core-* after
@@ -122,9 +123,12 @@ variable "ROCM_LIBRARIES_REF" { default = "release/therock-${rocm_release()}" }
 variable "ROCM_SYSTEMS_SHA"   { default = "" }
 variable "ROCM_LIBRARIES_SHA" { default = "" }
 
-# MIGraphX is still a standalone repo and still cuts its own
-# release/rocm-rel-<major.minor> branch.
-variable "MIGRAPHX_REF" { default = "release/rocm-rel-${rocm_release()}" }
+# An exact commit, not a branch: AMD built ROCm 10.2's MIGraphX 2.19.0 from
+# develop and cut no release/rocm-rel-10.2 branch and no rocm-10.2 tag. This is
+# "Bump ROCm version to 2.19.0 for ROCm 10.2 (#5508)", the commit that the
+# version.h of AMD's amdrocm10-migraphx 2.19.0 package names. When AMD cuts the
+# branch, go back to "release/rocm-rel-${rocm_release()}".
+variable "MIGRAPHX_REF" { default = "92f34981c5fdf2bb6ced168404193b216aab8afe" }
 variable "MIGRAPHX_SHA" { default = "" }
 
 # release/2.14 is the newest release branch ROCm/pytorch has and matches what
