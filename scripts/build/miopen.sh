@@ -9,6 +9,8 @@ SRC=/miopen-src-root/projects/miopen
 ARCH="${ROCM_ARCH:?ROCM_ARCH is required}"
 . /scripts/lib/build-jobs.sh
 
+# The restore creates conv_bin_winoRxS_fused.cpp, which the Winograd fix edits.
+sh /patches/miopen/restore-gfx803-winograd.sh "$SRC"
 sh /patches/miopen/winograd-fused-conv-miscompute.sh "$SRC"
 sh /patches/miopen/reduce-prod-wrong-identity.sh "$SRC"
 
