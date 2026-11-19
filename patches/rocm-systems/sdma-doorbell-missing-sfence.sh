@@ -18,8 +18,8 @@ fi
 
 git -C "$SRC" apply --verbose "$PATCH"
 
-if ! grep -q "_mm_sfence();" "$SDMA_FILE" || ! grep -q "\*queue_doorbell_ = write_index;" "$SDMA_FILE"; then
-    echo "FATAL: _mm_sfence() not found before doorbell write in $SDMA_FILE after git apply reported success" >&2
+if ! grep -A1 "store_fence();" "$SDMA_FILE" | grep -q "\*queue_doorbell_ = write_index;"; then
+    echo "FATAL: store_fence() not found directly before the doorbell write in $SDMA_FILE after git apply reported success" >&2
     exit 1
 fi
 echo "sdma-doorbell-missing-sfence patch applied and verified in $SDMA_FILE"

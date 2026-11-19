@@ -22,7 +22,6 @@ for p in \
     va-reuse-defer-mapping \
     va-reuse-defer-noremap \
     pinned-release-system-scope \
-    graph-replay-batch-chunk-deadlock \
     d2h-staged-copy \
     d2h-null-dsthost \
     aql-ring-queue-full-workaround \

@@ -2,9 +2,11 @@
 #
 # MIOpen built from source for gfx803, installed over /opt/rocm.
 #
-# MIOpen still lists gfx803 in ALL_GPU_DATABASES and keeps its Polaris
-# device-name gating, so it builds for the architecture. Two gfx803 patches on
-# top of that fix real miscomputes. See patches/miopen/.
+# MIOpen keeps its Polaris device-name mapping and lists gfx8 in its asm direct
+# and multipass Winograd weight-gradient solvers, so it builds for the
+# architecture. The pinned release carries no gfx803 Winograd solvers for
+# forward or backward data, and one patch restores them from the previous
+# release. Two more patches fix real miscomputes. See patches/miopen/.
 #
 # This starts from rocr-clr, not from rocblas, so its /opt/rocm carries the
 # patched runtime but no rocBLAS. Only the library file is taken forward

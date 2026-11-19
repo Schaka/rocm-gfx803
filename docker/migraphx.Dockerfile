@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # MIGraphX built from source into /opt/rocm. No prebuilt package exists for
-# gfx803. Two gfx803 patches fix build breaks that only appear with hipBLASLt and
-# MLIR off, both of which are required here. See patches/migraphx/.
+# gfx803.
 #
 # pytorch, ort and final all inherit this target's whole /opt/rocm, so it has to
 # carry every earlier component's fix.
@@ -51,7 +50,6 @@ RUN uv venv /rbuild-venv --python 3.12 --seed \
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-migraphx \
     --mount=type=bind,source=scripts/lib,target=/scripts/lib \
     --mount=type=bind,source=scripts/build/migraphx.sh,target=/scripts/build/migraphx.sh \
-    --mount=type=bind,source=patches/migraphx,target=/patches/migraphx \
     /scripts/build/migraphx.sh
 
 ARG GFX803_SOURCE_REV GFX803_PINS

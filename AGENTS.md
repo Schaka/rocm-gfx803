@@ -264,12 +264,14 @@ runner that it does not fit.
 Every upstream component that this repo builds from source is pinned to a named
 release branch. On the 10.x line the pins are variables in `docker-bake.hcl`:
 `ROCM_SYSTEMS_REF`, `ROCM_LIBRARIES_REF`, `MIGRAPHX_REF` and `PYTORCH_REF`.
-`docker buildx bake --print pins` lists all of them. The three ROCm refs, the
-base image, the release tag, the line and the `/opt/rocm/core-<major.minor>`
-path all derive from the one `ROCM_VERSION` variable, so a move to another 10.x
-release changes that value and nothing else in the build files. The derived
-values are `release/therock-<major.minor>`, `release/rocm-rel-<major.minor>`,
-and similar. Do not pin a frozen commit SHA, and do not resolve `develop` or
+`docker buildx bake --print pins` lists all of them. The one `ROCM_VERSION`
+variable sets the rocm-systems and rocm-libraries refs and the base image. It
+also sets the release tag, the line and the `/opt/rocm/core-<major.minor>` path.
+The derived values are `release/therock-<major.minor>` and similar. When AMD
+cuts a `release/rocm-rel-<major.minor>` branch, `MIGRAPHX_REF` follows it. For
+ROCm 10.2, AMD cut no branch and built MIGraphX from `develop`. `MIGRAPHX_REF`
+is therefore the exact commit that AMD's package names. This is the
+no-release-branch case at the end of this section. Do not pin a frozen commit SHA, and do not resolve `develop` or
 `main` per run. The mainline repo (`rocm-migraphx-ort-builder`) uses the same
 convention in its `release.yml`. The archived `rocm7.14/` line uses `release/therock-7.14` and
 `release/rocm-rel-7.14`.

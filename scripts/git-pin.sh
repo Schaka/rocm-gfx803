@@ -23,6 +23,12 @@ url="$2"
 ref="$3"
 sha="${4:-}"
 
+# A component without a release branch pins a bare commit as its ref, and
+# ls-remote below can only look up branches and tags.
+if [ -z "$sha" ] && printf '%s' "$ref" | grep -qE '^[0-9a-fA-F]{40}$'; then
+    sha="$ref"
+fi
+
 git init -q "$dest"
 git -C "$dest" remote add origin "$url"
 

@@ -114,15 +114,17 @@ def _index_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
 
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, head_dim),
-        order=(1, 0),
+    o_q = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    o_d = tl.arange(0, head_dim)
+    m_q = o_q < q_len
+    q_ptrs = (
+        q_ptr
+        + seq_start.to(tl.int64) * stride_q_n
+        + pid_h.to(tl.int64) * stride_q_h
+        + o_q[:, None].to(tl.int64) * stride_q_n
+        + o_d[None, :].to(tl.int64) * stride_q_d
     )
-    q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
+    q = tl.load(q_ptrs, mask=m_q[:, None], other=0.0)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
