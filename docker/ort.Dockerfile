@@ -16,7 +16,7 @@
 FROM python-base AS builder
 
 ARG ROCM_ARCH
-ARG ORT_VERSION
+ARG ORT_REF
 ARG ORT_SHA
 ARG GFX803_LINE
 
@@ -49,7 +49,7 @@ RUN uv venv /build-venv --python 3.12 --seed \
 ENV PATH=/build-venv/bin:$PATH
 
 RUN --mount=type=bind,source=scripts/git-pin.sh,target=/git-pin \
-    /git-pin /onnxruntime https://github.com/microsoft/onnxruntime.git "${ORT_VERSION}" "${ORT_SHA}" \
+    /git-pin /onnxruntime https://github.com/ROCm/onnxruntime.git "${ORT_REF}" "${ORT_SHA}" \
     && git -C /onnxruntime submodule sync --recursive \
     && git -C /onnxruntime submodule update --init --recursive --jobs 4
 

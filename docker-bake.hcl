@@ -142,8 +142,11 @@ variable "PYTORCH_SHA"     { default = "" }
 variable "TORCHVISION_SHA" { default = "" }
 variable "TORCHAUDIO_SHA"  { default = "" }
 
-variable "ORT_VERSION" { default = "v1.29.0" }
-variable "ORT_SHA"     { default = "" }
+# ROCm's fork, because github.com/microsoft/onnxruntime does not exist any
+# more (HTTP 404, also over git). The fork's rel-1.31.1 branch is exactly
+# upstream v1.31.1, and none of the fork's branches or tags carries v1.29.0.
+variable "ORT_REF" { default = "rel-1.31.1" }
+variable "ORT_SHA" { default = "" }
 
 # Pinned to an exact commit, not a branch: triton has no release branch that
 # tracks a given PyTorch version, and PyTorch itself pins triton to one exact
@@ -293,7 +296,7 @@ target "pins" {
     PYTORCH_REF        = PYTORCH_REF
     TORCHVISION_REF    = TORCHVISION_REF
     TORCHAUDIO_REF     = TORCHAUDIO_REF
-    ORT_VERSION        = ORT_VERSION
+    ORT_REF            = ORT_REF
     TRITON_REF         = TRITON_REF
   }
 }
@@ -523,7 +526,7 @@ target "ort" {
   }
   args = {
     ROCM_ARCH   = ROCM_ARCH
-    ORT_VERSION = ORT_VERSION
+    ORT_REF     = ORT_REF
     ORT_SHA     = ORT_SHA
   }
   labels     = labels("ort")
