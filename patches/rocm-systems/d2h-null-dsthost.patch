@@ -1,54 +1,70 @@
-CLR (rocclr) D2H copy destination address (gfx803, ROCm 10.x): a D2H copy
-whose destination is a host-accessible *device* allocation (large-BAR
-gfx803) crashed writing to address 0x0 -- `memcpy(dst=0x0, ...)` inside
-KernelBlitManager::readBuffer's staging path.
+CLR (rocclr) D2H copy destination address (gfx803, ROCm 10.x): the staged
+D2H branch that d2h-staged-copy.patch adds to VirtualGPU::copyMemory hands
+readBuffer the wrong host address in two ways. This patch computes the
+destination address correctly.
 
 WHY
 ---
-vLLM 10.0 (torch 2.14) on gfx803 faults in hipMemcpyAsync during
-inference. Root-caused with the 10.0 symbols build under gdb (crash
-backtrace: readBuffer -> VirtualGPU::copyMemory -> submitCopyMemory, fault
-address 0): the d2h-staged-copy routing added in this tree hands the
-host-visible destination address to readBuffer via `dstMem.getHostMem()`.
-For a *host-origin* allocation (hipHostMalloc/hipHostRegister) the owner's
-HostMemoryReference holds the host pointer, so that path was clean; for a
-*device* allocation that happens to be host-accessible (deviceLocalAlloc
-on large-BAR), getHostMem() is NULL and readBuffer then memcpy()s into
-address 0. Fix: pass the destination device memory's VA -- for a
-host-accessible memory the device VA *is* the host-visible address, and
-for host-origin memories it aliases the same location. Verified on real
-hardware: with this + the va-reuse-defer-noremap change, the full vLLM
-10.0 Qwen3.5-2B bench (qwen35_2b_bench_v3.py) completes with
-EXIT=0 (prefill 311.0 tok/s, decode 30.2 tok/s, 2101-token prompt /
-128 decode; 7.14 record for the same bench: 331.7 / 24.4).
+1. NULL destination. The branch took the host address from
+   `dstMem.getHostMem()`. For a host-origin allocation (hipHostMalloc,
+   hipHostRegister) the owner's HostMemoryReference holds the host pointer,
+   so that address is correct. For a *device* allocation that is
+   host-accessible (deviceLocalAlloc on large-BAR gfx803), getHostMem() is
+   NULL. readBuffer then calls memcpy(dst=0x0, ...) inside
+   KernelBlitManager::readBuffer's staging path, and the process crashes.
+   vLLM (torch 2.14) on gfx803 hits this in hipMemcpyAsync during
+   inference. The gdb backtrace on a symbols build is readBuffer ->
+   VirtualGPU::copyMemory -> submitCopyMemory, with fault address 0.
 
-The re-map removal (va-reuse-defer-noremap.patch) must be applied for
-the same workload to get past the code-object load; this patch is the second
-half -- without it the no-re-map state reaches the D2H phase and faults
-here instead.
+2. Destination offset dropped. readBuffer applies its `origin` argument to
+   the source only. Its host pointer is the exact address the data lands
+   at. HIP builds a CopyMemoryCommand from the base amd::Memory of each
+   pointer plus that pointer's offset inside it, so copyMemory receives the
+   destination offset in `dstOrigin`. The branch passed the base address
+   of the destination and ignored `realDstOrigin`. A D2H copy into an offset
+   inside a pinned or host-accessible buffer therefore wrote to the start of
+   that buffer. The copy returned success, so the result was silent wrong
+   data in the target range and silent corruption at the buffer's start.
+   For example, in torch:
+
+     pinned = torch.empty(2 * n, pin_memory=True)
+     pinned[n:].copy_(gpu_tensor)   # data lands in pinned[:n]
+
+WHAT
+---
+In VirtualGPU::copyMemory's host-direct-access D2H branch, take the
+destination address from the destination device memory's VA, plus
+`realDstOrigin[0]`. For a host-accessible memory the device VA is the
+host-visible address. For a host-origin memory it aliases the same
+location.
 
 Applies AFTER d2h-staged-copy.patch (it edits the branch that patch
 introduced).
 
-WHAT
----
-In VirtualGPU::copyMemory's host-direct-access D2H branch, derive the
-readBuffer destination from the destination device memory's VA instead of the
-owner's hostMemRef.
+VERIFIED ON REAL HARDWARE for defect 1: with this patch and
+va-reuse-defer-noremap.patch, the vLLM 10.0 Qwen3.5-2B bench
+(qwen35_2b_bench_v3.py) completes with EXIT=0 (prefill 311.0 tok/s, decode
+30.2 tok/s, 2101-token prompt, 128 decode tokens). The 7.14 record for the
+same bench is 331.7 / 24.4. That workload needs va-reuse-defer-noremap.patch
+to get past the code-object load.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE for defect 2. To reproduce it, copy a
+device tensor into the second half of a pinned host tensor as above, then
+compare both halves of `pinned` with the expected values.
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -3238,7 +3238,13 @@
+@@ -3456,7 +3456,13 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
          // GFX803: same as submitReadMemory -- a D2H copy into a
          // registered/locked host buffer must go through the staged
          // readBuffer, not the copy engine writing the host buffer directly.
 -        result = blitMgr().readBuffer(*srcDevMem, dstMem.getHostMem(), realSrcOrigin,
 +        // The host-visible address of a host-accessible destination is its
-+        // device VA; the owner's hostMemRef is only set for host-origin
-+        // allocations and is NULL for a device allocation that happens to be
-+        // host-accessible, so getHostMem() alone would hand readBuffer a NULL
-+        // destination.
-+        void* dstHost = dstDevMem->getDeviceMemory();
++        // device VA: getHostMem() is NULL for a device allocation that is
++        // host-accessible. readBuffer applies its origin to the source only,
++        // so the destination origin is added here, or a copy into an offset
++        // inside the buffer lands at the buffer's start.
++        address dstHost = dstDevMem->getDeviceMemory() + realDstOrigin[0];
 +        result = blitMgr().readBuffer(*srcDevMem, dstHost, realSrcOrigin,
                                        realSize, entire, copyMetadata);
        } else {
