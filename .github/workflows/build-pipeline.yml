@@ -104,6 +104,11 @@ on:
         description: 'Override TORCHAUDIO_REF. Leave empty for the docker-bake.hcl default.'
         required: false
         default: ''
+      pr-number:
+        description: 'Publish this run as a test build of this pull request number: built components get a -pr<N> tag and the final image is rocm<major.minor>-gfx803-pr<N>, not latest. Run it on the PR branch. Leave empty for a normal release build.'
+        type: string
+        required: false
+        default: ''
       no-cache:
         description: 'Force a fully fresh build, ignoring the registry build cache'
         type: boolean
