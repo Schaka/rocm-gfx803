@@ -2,8 +2,10 @@
 # Apply d2h-null-dsthost.patch with `git apply`, then make sure that the hunk
 # landed. That patch file gives the reason and the change. In short: for a device
 # allocation that is also host-accessible, getHostMem() returns NULL, so a D2H copy
-# passed address 0 to memcpy and crashed vLLM on ROCm 10.x during inference. The change
-# passes the destination device VA instead.
+# passed address 0 to memcpy and crashed vLLM on ROCm 10.x during inference. The
+# branch also dropped the destination offset, so a copy into the middle of a host
+# buffer landed at its start. The change passes the destination device VA plus the
+# destination origin.
 #
 # Run this after d2h-staged-copy.sh, because it edits the branch that patch adds.
 set -eu
@@ -20,15 +22,15 @@ FILE="$SRC/projects/clr/rocclr/device/rocm/rocvirtual.cpp"
 # Marker check, not `apply --check --reverse`: later chain drivers touch the
 # same file, so a clean reverse only holds on a tree that contains nothing
 # past this patch.
-if grep -q 'void\* dstHost = dstDevMem->getDeviceMemory();' "$FILE"; then
+if grep -q 'address dstHost = dstDevMem->getDeviceMemory() + realDstOrigin\[0\];' "$FILE"; then
     echo "already patched, skipping"
     exit 0
 fi
 
 git -C "$SRC" apply --verbose "$PATCH"
 
-grep -q 'void\* dstHost = dstDevMem->getDeviceMemory();' "$FILE" || {
-    echo "FATAL: dstDevMem->getDeviceMemory() marker not found in $FILE after git apply reported success" >&2
+grep -q 'address dstHost = dstDevMem->getDeviceMemory() + realDstOrigin\[0\];' "$FILE" || {
+    echo "FATAL: destination VA + realDstOrigin marker not found in $FILE after git apply reported success" >&2
     exit 1
 }
 grep -q 'readBuffer(\*srcDevMem, dstMem.getHostMem(), realSrcOrigin' "$FILE" && {
