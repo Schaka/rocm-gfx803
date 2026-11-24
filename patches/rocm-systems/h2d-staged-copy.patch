@@ -1,0 +1,83 @@
+CLR (rocclr) H2D copy routing (gfx803): mirror of d2h-staged-copy.patch
+for Host-to-Device transfers. Never pin pageable host memory for direct
+SDMA transfer on gfx803 -- force the GPU-staging path for H2D copies.
+
+WHY
+---
+Under PyTorch Host-to-Device copies (e.g. model.cuda() / tensor.to('cuda')),
+HIP pins pageable host memory (userptr BOs) for transfers above
+GPU_PINNED_MIN_XFER_SIZE. On gfx803 (Polaris), when that host buffer is
+freed or unmapped, the Linux KFD MMU notifier evicts all user queues,
+causing queue hangs, stuck packets, and "Memory access fault ... Page not present"
+(read from TC0).
+
+Disabling host pinning (forcing the staging path via kEnablePin = false and
+routing registered hostMemory transfers through staged writeBuffer instead of
+copyBuffer) keeps the MMU notifier idle and completely eliminates queue evictions
+and in-flight page faults on H2D transfers.
+
+Applies on top of d2h-staged-copy.patch.
+
+diff --git a/projects/clr/rocclr/device/rocm/rocblit.cpp b/projects/clr/rocclr/device/rocm/rocblit.cpp
+--- a/projects/clr/rocclr/device/rocm/rocblit.cpp
++++ b/projects/clr/rocclr/device/rocm/rocblit.cpp
+@@ -140,7 +140,11 @@ bool DmaBlitManager::writeBuffer(const void* srcHost, device::Memory& dstMemory,
+   if (copySize > 0) {
+     address dstAddr = gpuMem(dstMemory).getDeviceMemory() + origin[0];
+     const_address srcAddr = reinterpret_cast<const_address>(srcHost);
+     constexpr bool kHostToDev = true;
+-    constexpr bool enablePin = true;
++    // GFX803: never pin the host source for an H2D copy -- pinning pageable
++    // host memory causes KFD MMU notifier queue evictions and in-flight
++    // page faults on gfx803. Force the GPU-staging path.
++    constexpr bool enablePin = false;
+     if (!hsaCopyStagedOrPinned(srcAddr, dstAddr, copySize, kHostToDev, copyMetadata, enablePin)) {
+       LogError("DmaBlitManager:: writeBuffer copy failure!");
+       return false;
+@@ -176,8 +180,9 @@ bool DmaBlitManager::writeBufferRect(const void* srcHost, device::Memory& dstMemory,
+         // Copy data from host to device - line by line
+         const_address src = reinterpret_cast<const_address>(srcHost) + srcOffset;
+         constexpr bool kHostToDev = true;
++        constexpr bool enablePin = false;
+         bool retval =
+-            hsaCopyStagedOrPinned(src, dst + dstOffset, size[0], kHostToDev, copyMetadata);
++            hsaCopyStagedOrPinned(src, dst + dstOffset, size[0], kHostToDev, copyMetadata, enablePin);
+         if (!retval) {
+           return retval;
+         }
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -3266,8 +3266,13 @@ void VirtualGPU::submitWriteMemory(amd::WriteMemoryCommand& cmd) {
+         size.c[0] *= elemSize;
+       }
+       if (hostMemory != nullptr) {
+-        // Accelerated transfer without pinning
+-        amd::Coord3D srcOrigin(offset);
+-        result = blitMgr().copyBuffer(*hostMemory, *devMem, srcOrigin, origin, size,
+-                                      cmd.isEntireMemory(), cmd.copyMetadata());
++        // GFX803: do NOT read the (registered/locked) host buffer directly
++        // from the copy engine via copyBuffer. Route through the staged
++        // writeBuffer to prevent MMU notifier queue evictions and in-flight
++        // page faults on gfx803.
++        const char* hostSrc = static_cast<const char*>(cmd.source());
++        result = blitMgr().writeBuffer(hostSrc, *devMem, origin, size,
++                                       cmd.isEntireMemory(), cmd.copyMetadata());
+       } else {
+         result = blitMgr().writeBuffer(src, *devMem, origin, size, cmd.isEntireMemory(),
+                                        cmd.copyMetadata());
+@@ -3520,8 +3525,14 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
+         void* dstHost = dstDevMem->getDeviceMemory();
+         result = blitMgr().readBuffer(*srcDevMem, dstHost, realSrcOrigin,
+                                       realSize, entire, copyMetadata);
++      } else if (srcDevMem->isHostMemDirectAccess()) {
++        // GFX803: same as submitWriteMemory -- an H2D copy from a
++        // registered/locked host buffer must go through the staged
++        // writeBuffer, not the copy engine reading the host buffer directly.
++        const void* srcHost = srcDevMem->getDeviceMemory();
++        result = blitMgr().writeBuffer(srcHost, *dstDevMem, realDstOrigin,
++                                       realSize, entire, copyMetadata);
+       } else {
+         result = blitMgr().copyBuffer(*srcDevMem, *dstDevMem, realSrcOrigin, realDstOrigin,
+                                       realSize, entire, copyMetadata);
+       }

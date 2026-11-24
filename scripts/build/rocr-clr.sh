@@ -25,6 +25,7 @@ for p in \
     graph-replay-batch-chunk-deadlock \
     d2h-staged-copy \
     d2h-null-dsthost \
+    h2d-staged-copy \
     aql-ring-queue-full-workaround \
     gfx803-tc-invalidate-acquire-mem
 do
