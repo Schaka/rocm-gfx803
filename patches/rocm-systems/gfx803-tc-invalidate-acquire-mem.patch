@@ -399,7 +399,7 @@ index 4d154037d6..111b911202 100644
      ClearStateFlag(kHasPendingDispatch);
      skippedDispatches_ = 0;
      ClearStateFlag(kRetainExternalSignals);
-@@ -5368,6 +5465,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+@@ -5386,6 +5483,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
      SetCoalesceWindow(0, nullptr);
    } else {
      profilingBegin(vcmd);
