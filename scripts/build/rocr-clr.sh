@@ -9,11 +9,12 @@ set -eu
 SRC=/rocm-systems-src
 . /scripts/lib/build-jobs.sh
 
-# This order is load-bearing in three places. The three va-reuse-defer patches
+# This order is load-bearing in four places. The three va-reuse-defer patches
 # build on each other. d2h-null-dsthost fixes a destination address that
-# d2h-staged-copy introduces. aql-ring-queue-full-workaround multiplies the legacy
-# doorbell mask that hsa-agent-rejects-legacy-doorbell restores, so it has to see
-# that mask already in place.
+# d2h-staged-copy introduces, and h2d-staged-copy extends the copyMemory branch
+# that d2h-null-dsthost rewrites. aql-ring-queue-full-workaround multiplies the
+# legacy doorbell mask that hsa-agent-rejects-legacy-doorbell restores, so it has
+# to see that mask already in place.
 for p in \
     hsa-agent-rejects-legacy-doorbell \
     opencl-gfx8-hardcoded-rejection \

@@ -390,7 +390,7 @@ index 7d3e394..0195d0c 100644
      hasPendingDispatch_ = false;
      skippedDispatches_ = 0;
      retainExternalSignals_ = false;
-@@ -5307,6 +5405,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+@@ -5325,6 +5423,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
      SetCoalesceWindow(0, nullptr);
    } else {
      profilingBegin(vcmd);
