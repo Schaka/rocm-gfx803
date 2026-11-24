@@ -69,6 +69,16 @@ variable "RELEASE_TAG" { default = "rocm${rocm_release()}" }
 # invalid ":-gfx803".
 variable "DATE" { default = "" }
 
+# A test build of a pull request. PR_NUMBER is the PR, and PR_COMPONENTS is a
+# comma-separated list of the components that this run builds. Each listed
+# component publishes under its normal tag plus "-pr<N>", and every target that
+# consumes it pulls that tag. A component that is not listed was not rebuilt, so
+# its consumers pull its normal published tag. The final image publishes only
+# rocm<major.minor>-gfx803-pr<N>. None of the tags that people pull change, so a
+# PR build can go to people for testing before it merges.
+variable "PR_NUMBER"     { default = "" }
+variable "PR_COMPONENTS" { default = "" }
+
 # ---------------------------------------------------------------------------
 # Build cache
 # ---------------------------------------------------------------------------
@@ -203,14 +213,26 @@ function "pkg" {
   result = "${REGISTRY}/${OWNER}/${PACKAGES[component]}"
 }
 
+function "pr_suffix" {
+  params = [component]
+  result = PR_NUMBER != "" && contains(split(",", PR_COMPONENTS), component) ? "-pr${PR_NUMBER}" : ""
+}
+
 function "image" {
   params = [component]
-  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}"
+  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}${pr_suffix(component)}"
 }
 
 function "cache_ref" {
   params = [component]
   result = "${pkg(component)}:cache-${ROCM_ARCH}-${LINE}"
+}
+
+# A PR build reads the main cache and writes its own, so that its layers never
+# replace the cache that the next main build reads.
+function "pr_cache_ref" {
+  params = [component]
+  result = "${cache_ref(component)}-pr${PR_NUMBER}"
 }
 
 # pytorch, torchvision, torchaudio, ort, triton and vllm each carry a full build
@@ -226,18 +248,23 @@ function "cache_ref" {
 # it, so what final pulls has to be the wheel-only image.
 function "wheels_image" {
   params = [component]
-  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}-wheels"
+  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}${pr_suffix(component)}-wheels"
 }
 
 function "cache_from" {
   params = [component]
-  result = REGISTRY_CACHE == "true" && NO_CACHE != "true" ? ["type=registry,ref=${cache_ref(component)}"] : []
+  result = REGISTRY_CACHE == "true" && NO_CACHE != "true" ? concat(
+    ["type=registry,ref=${cache_ref(component)}"],
+    PR_NUMBER != "" ? ["type=registry,ref=${pr_cache_ref(component)}"] : [],
+  ) : []
 }
 
 # mode=max for the intermediates, because the next component's job imports them.
 function "cache_to" {
   params = [component]
-  result = REGISTRY_CACHE == "true" && CACHE_TARGET == component ? ["type=registry,ref=${cache_ref(component)},mode=max"] : []
+  result = REGISTRY_CACHE == "true" && CACHE_TARGET == component ? [
+    "type=registry,ref=${PR_NUMBER != "" ? pr_cache_ref(component) : cache_ref(component)},mode=max"
+  ] : []
 }
 
 # "target:<name>" builds the component here. "docker-image://<ref>" pulls the
@@ -646,7 +673,7 @@ target "final" {
     ROCM_CORE = rocm_core()
   }
   labels = labels("final")
-  tags = concat(
+  tags = PR_NUMBER != "" ? ["${pkg("final")}:${RELEASE_TAG}-${ROCM_ARCH}-pr${PR_NUMBER}"] : concat(
     [
       "${pkg("final")}:latest-${ROCM_ARCH}",
       "${pkg("final")}:${RELEASE_TAG}-${ROCM_ARCH}",
