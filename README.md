@@ -176,6 +176,18 @@ works: it follows the branch, and `git-pin.sh` says so on stderr.
 A run that cannot resolve a pin fails after three retries, rather than producing
 an image that cannot say what it holds.
 
+A pull request can be published for testing before it merges. Run the workflow
+on the PR's branch, with `pr-number` set to the PR's number. Each component that
+the run builds publishes under its normal tag plus `-pr<N>`, for example
+`:gfx803-rocm10.1-pr13`, and the other targets in the run consume that tag. A
+component that the run skips is consumed under its normal published tag. The
+final image publishes only `rocm<major.minor>-gfx803-pr<N>`. The PR build reads
+the main build cache and writes its own `cache-gfx803-rocm<major.minor>-pr<N>`.
+`latest-gfx803`, `rocm<major.minor>-gfx803`, the dated tag, and the main build
+cache do not change. A change that touches only ROCR-Runtime or CLR needs only
+the `rocr-clr` and `final` jobs, because `final` installs the HIP runtime
+libraries from the `rocr-clr` image.
+
 ## Building
 
 The build applies its patches per project before that component compiles from

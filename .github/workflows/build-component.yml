@@ -138,6 +138,11 @@ jobs:
           TORCHVISION_REF_IN: ${{ inputs.torchvision-ref }}
           TORCHAUDIO_REF_IN: ${{ inputs.torchaudio-ref }}
           TENSOR_TOPK_OPT_LEVEL_IN: ${{ inputs.tensor-topk-opt-level }}
+          # A called workflow sees its caller's dispatch event, so the PR number
+          # and the build-* checkboxes come from build-pipeline.yml's own inputs
+          # instead of one more input on every job there.
+          PR_NUMBER: ${{ github.event.inputs.pr-number }}
+          DISPATCH_INPUTS: ${{ toJSON(github.event.inputs) }}
         run: |
           set -euo pipefail
           # ghcr package paths are case sensitive and always lower.
@@ -154,6 +159,22 @@ jobs:
               export "$name=${!value}"
             fi
           done
+
+          if [ -n "$PR_NUMBER" ]; then
+            if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::pr-number must be a pull request number, got '$PR_NUMBER'."
+              exit 1
+            fi
+            # Only the components that this run builds publish a -pr tag. Every
+            # other component is consumed under its normal published tag.
+            PR_COMPONENTS="$(jq -r 'to_entries[]
+                | select((.key | startswith("build-")) and (.value == true or .value == "true"))
+                | .key | ltrimstr("build-")' <<<"$DISPATCH_INPUTS" | paste -sd, -)"
+            export PR_NUMBER PR_COMPONENTS
+            echo "PR test build #$PR_NUMBER, components with a -pr$PR_NUMBER tag: ${PR_COMPONENTS:-none}"
+          else
+            unset PR_NUMBER
+          fi
 
           source scripts/ci/resolve-pins.sh
 
