@@ -68,9 +68,9 @@ pool allocator.
 
 REASON 2: THE EXTERNAL-READER DIRECTION
 ---------------------------------------
-Symptom, after (1) landed: `tools/correctness-suite/torch_op_suite.py` still
-failed 3 to 5 `conv2d [torch.float32]` cases (fan-in 1152, 2880, and 5760) with
-1.2 to 2.5 absolute error. It is not a convolution accuracy problem. The
+With site (1) alone, `tools/correctness-suite/torch_op_suite.py` fails 3 to 5
+`conv2d [torch.float32]` cases (fan-in 1152, 2880, and 5760) with 1.2 to 2.5
+absolute error. It is not a convolution accuracy problem. The
 convolution is correct, and only the host copy of it is wrong.
 `tools/tc-staleness/conbrace3.py` reduces the suite to one conv per shape with an
 immediate host read against a CPU fp64 reference, and classifies each anomaly by
@@ -108,17 +108,16 @@ toggled: 0/240 on, 90/240 off, and the op suite goes from 197-199/202 to 202/202
 
 REASON 3: THE CROSS-QUEUE HANDOFF
 ---------------------------------
-Symptom after (1) and (2) were in: `tools/tc-staleness/multistream2.py`, a producer
+With sites (1) and (2) only, `tools/tc-staleness/multistream2.py`, a producer
 conv on a `torch.cuda.Stream` side stream, an event record, `wait_event` on the
-default stream, then a host copy of the side stream's result, still returns stale
-bytes on roughly 1 copy in 50. `tools/tc-staleness/ms3.py` (checked in with this
-change) is the same shape with each anomaly classified, and it says where the loss
-is: the first host copy is wrong, a *kernel* clone taken immediately afterwards is
+default stream, then a host copy of the side stream's result, returns stale bytes
+on roughly 1 copy in 50. `tools/tc-staleness/ms3.py` is the same shape with each
+anomaly classified, and it says where the loss is: the first host copy is wrong, a *kernel* clone taken immediately afterwards is
 right, and a second host copy after a sync is right too. So nothing is destroyed;
 the copy engine read DRAM before the producer's dirty lines reached it.
 
-Two obvious fixes measured as no help at all, and one that measured as worse than
-nothing, all on one binary with knobs:
+The writeback has to come from the producer's queue. Three placements on the
+consumer's side leave the fault in place, each measured on one binary with knobs:
 
   * Attaching the producer's completion signal to the barrier in front of the (2)
     writeback, on the consumer's ring, in one place or in both: 11/960 with the
@@ -131,12 +130,12 @@ nothing, all on one binary with knobs:
     `gfx_v8_0_ring_emit_pipeline_sync`) in front of the writeback: it does not
     execute in an AQL ring. It stalls the queue for every comparison value tested,
     including the one that means "do not wait", and the stall is real (the debug
-    kernel logged `Resetting wave fronts (cpsch)`). ROCr only ever emits this
-    packet on its legacy PM4 ring. Reverted.
+    kernel logs `Resetting wave fronts (cpsch)`). ROCr emits this packet only on
+    its legacy PM4 ring.
   * Routing the cross-stream copy through the shader instead of the copy engine:
-    13/960, i.e. no better than the control, because the blit that was redirected
-    is not the transfer that was exposed. Reverted. It also would have cost the
-    copy bandwidth of every such transfer for nothing.
+    13/960, no better than the control, because the redirected blit is not the
+    exposed transfer. It would also cost the copy bandwidth of every such
+    transfer.
 
 What does close it is the producer-side flush, which is the place the caches can
 actually be pushed from: `VirtualGPU::submitMarker()`, on the queue that is about
@@ -165,8 +164,9 @@ D2H and H2D keep the copy engine. Measured bandwidth is unchanged inside noise
 
 WHAT
 ----
-`rocclr/utils/flags.hpp`: new `CLR_GFX8_TC_INVALIDATE` (default on), so the
-behavior can be measured both ways without a rebuild.
+`rocclr/utils/flags.hpp`: new `CLR_GFX8_TC_INVALIDATE` and
+`CLR_GFX8_TC_RECORD_FENCE` (both default on), so the behavior can be measured both
+ways without a rebuild.
 
 `rocclr/device/rocm/rocvirtual.{hpp,cpp}`: `VirtualGPU::insertTcFence()` reserves
 one 64-byte AQL slot and fills it with ACQUIRE_MEM (full address range,
@@ -178,8 +178,9 @@ so the CP never sees a half-built packet, and the packet that follows rings the
 doorbell at a higher ring index, which covers this slot too. The slot publishes no
 completion signal of its own.
 
-The slot takes its ring index from `ReserveAqlSlots()` and is closed with
-`CompleteAqlSubmission()`, like every other packet the stream submits. HIP streams
+The slot takes its ring index from `ReserveAqlSlots()`, which claims the slot only
+once the ring has room for it, and is closed with `CompleteAqlSubmission()`, like
+every other packet the stream submits. HIP streams
 that share one hardware queue drop a requested barrier bit
 (`OptimizeStreamOrderingBarrier()`, on by default through `DEBUG_CLR_AQL_BARRIER_OPT`)
 when a barrier packet already sits after the stream's latest packet. If the slot
@@ -193,44 +194,44 @@ records nothing in the shared barrier state. Three call sites:
   * `dispatchGenericAqlPacket()`, for the kernel-dispatch packet types only.
   * `releaseGpuMemoryFence()`, between its barrier and a second barrier, which
     covers every non-shader reader of GPU memory, because both
-    `DmaBlitManager::readBuffer` and `writeBuffer` fence there before SDMA.
+    `DmaBlitManager::readBuffer` and `writeBuffer` fence there before SDMA. The
+    `kHasPendingDispatch` state flag is cleared after the second barrier.
   * `submitMarker()`, when the marker is an event record
     (`vcmd.coalesceEvent() != 0`), which is the point where this queue's results
     become readable by whoever waits on that event. It is the raw slot only: no
     barrier, no completion signal, so it takes no part in the marker's own signal
     bookkeeping.
 
-CAVEAT FOR THE NEXT PERSON: the HIP graph replay path
+OPEN: the HIP graph replay path
 (`VirtualGPU::dispatchAqlPacketBatchFlat`) copies captured packets into the ring in
 bulk and is not covered, so those dispatches carry no ACQUIRE_MEM. A graph that
 reads a VA recycled inside its own replay is exposed in principle. Measured: a
 torch `CUDAGraph` capture of exactly the poisoned sequence (bmm x2 + bmm(a,b) +
 `z.copy_(y)`, 40 replays, destination read after each) came out 0/40 poisoned with
 the knob off as well as on, so the hole is unproven rather than known broken.
-Closing it needs the slot inserted per dispatch inside the batch assembly, which
-touches signal attachment and metadata indexing, and it is deliberately left undone
-here rather than half done.
+Covering it needs the slot inserted per dispatch inside the batch assembly, which
+touches signal attachment and metadata indexing.
 
 COST: one extra 64-byte ring slot plus a full-range TC invalidate per dispatch, on
-gfx7 and gfx8 only. That is half the ring's usable depth, which matters on this
-part, because the queue cap is 64 packets (see
-graph-replay-batch-chunk-deadlock.patch). The slot-stall wait in
-`WaitForQueueSlot()` keeps it correct when the ring fills. (2) adds
+gfx7 and gfx8 only, which halves the ring depth available to dispatches. With
+aql-ring-queue-full-workaround.patch the compute queue holds 16384 packets.
+`ReserveAqlSlots()` claims a slot only once the ring has room, so a full ring
+stalls the submitter and never overwrites a slot the CP has not consumed. (2) adds
 barrier, slot, and barrier per pre-copy fence. A fence happens per host-visible
 transfer and per device sync, not per kernel. (3) adds one slot per event record
 and nothing at all to a copy path's choice of engine, so D2H and H2D keep SDMA. Measured on the card: D2H +2.7%,
 H2D +1.5%, one-element sync 3.6 to 4.2 us, and compute unchanged (fp16 2048^3 GEMM
 +0.04%, conv and GPU-to-GPU clone unchanged).
 
-Applies to: rocm-systems release/therock-10.1, commit
-7da43026e4f2ef7600433c38c820732f7a205d22, on top of the chain up to
+Applies to: rocm-systems release/therock-10.2, commit
+43fa692e568e65a1fb84f2d1c74415b042839f10, on top of the chain up to
 aql-ring-queue-full-workaround. It touches the same file as
 d2h-staged-copy, d2h-null-dsthost, and pinned-release-system-scope, but different
 functions. Apply with
 patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.sh.
 
-MEASURED ON REAL HARDWARE (gfx803 RX 470, 2026-09-05)
------------------------------------------------------
+VERIFIED ON REAL HARDWARE (gfx803 RX 470, 2026-09-05) on ROCm 10.0
+------------------------------------------------------------------
 Reader direction, one binary with the knob toggled: the bmm and copy probe 15/40
 to 0/40 (also 25/40 to 0/40 and 22/40 to 0/40). A 527-check soak across bmm,
 conv+silu+groupnorm, linear+layernorm+softmax, `scaled_dot_product_attention`,
@@ -248,30 +249,39 @@ Same binary, other probes: `xprobe2.py` 0/40, `pinnedhost.py` 0/60, `conbrace3.p
 pinned 4.83 to 4.76 GiB/s), because no copy is moved off the copy engine.
 Torch op suite on the box stack: 202/202 PASS, 0 BAD, 0 NONFINITE, both with a
 hand-built library and with `libamdhip64` taken from the image this chain produces.
-Inside the image the suite reports 118 PASS, 0 BAD, 0 NONFINITE and 84 ERRORs that
-are all `/ INDUCTOR`: the image ships no Triton, so inductor cannot compile, which
+Inside that image the suite reports 118 PASS, 0 BAD, 0 NONFINITE and 84 ERRORs that
+are all `/ INDUCTOR`: that image has no Triton, so inductor cannot compile, which
 is a content question about the image and not a wrong answer. sd1.5
 txt2img x6 with no GPU resets, and dmesg clean of resets and VM faults
 throughout. `tools/tc-staleness/README.md` holds the harnesses and the expected
 numbers.
 
-Not measured, and open: HIP graph replay (see the caveat).
+Not measured, and open: HIP graph replay (see OPEN above).
 
-The measurements above ran on ROCm 10.0. On rocm-systems commit
-7da43026e4f2ef7600433c38c820732f7a205d22, where the slot goes through the
-barrier-bit bookkeeping described in WHAT, `tools/imgvalidate.sh` measured on the
-card (gfx803 RX 470, 2026-10-06): `ms3.py` 0 anomalies in 480 checks with the
+VERIFIED ON REAL HARDWARE (gfx803 RX 470, 2026-10-06) on ROCm 10.1 (rocm-systems
+release/therock-10.1, commit 7da43026e4f2ef7600433c38c820732f7a205d22), with
+`tools/imgvalidate.sh`: `ms3.py` 0 anomalies in 480 checks with the
 event-record site on and 2 in 480 with it off, `ms4.py` 0 in 960,
 `multistream2.py` 0 in 480, `conbrace3.py` 0, `xprobe2.py` 0 in 60,
 `pinnedhost.py` 0 in 60, `graphprobe.py` 0 in 120, and the torch op suite 202
 of 202. The bmm and copy probe of the reader direction did not run on that
 commit.
 
+NOT YET RE-VERIFIED ON REAL HARDWARE on ROCm 10.2. To verify, run
+`tools/imgvalidate.sh <image>` on the card with an image built from the commit
+above. It runs `ms3.py`, `ms4.py`, `multistream2.py`, `conbrace3.py`, `xprobe2.py`,
+`pinnedhost.py` and `graphprobe.py`, plus an `ms3.py` control with
+`CLR_GFX8_TC_RECORD_FENCE=0` that must reproduce stale copies. Also run the reader
+direction, `tools/tc-staleness/probe.py --trials 40`, once with
+`CLR_GFX8_TC_INVALIDATE=0` (must show stale reads) and once with the default (must
+be clean), and the torch op suite (`tools/correctness-suite/torch_op_suite.py`,
+202 of 202 expected).
+
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-index 7d3e394..0195d0c 100644
+index 4d154037d6..111b911202 100644
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -1520,6 +1520,82 @@ void VirtualGPU::CompleteAqlSubmission(const AqlSlotReservation& reservation) {
+@@ -1537,6 +1537,81 @@ void VirtualGPU::CompleteAqlSubmission(const AqlSlotReservation& reservation) {
    last_aql_packet_slot_ = reservation.start_slot + reservation.packet_count - 1;
  }
  
@@ -339,7 +349,6 @@ index 7d3e394..0195d0c 100644
 +  const AqlSlotReservation reservation = ReserveAqlSlots(1);
 +  const uint64_t index = reservation.start_slot;
 +  CompleteAqlSubmission(reservation);
-+  WaitForQueueSlot(index, queueMask);
 +
 +  uint32_t* dst = reinterpret_cast<uint32_t*>(gpu_queue_->base_address) +
 +                  ((index & queueMask) * kSlotDwords);
@@ -354,9 +363,9 @@ index 7d3e394..0195d0c 100644
  // ================================================================================================
  template <typename AqlPacket>
  bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, uint16_t rest,
-@@ -1528,6 +1604,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
+@@ -1544,6 +1619,11 @@ bool VirtualGPU::dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header, ui
+   const uint32_t queueSize = gpu_queue_->size;
    const uint32_t queueMask = queueSize - 1;
-   const uint32_t sw_queue_size = queueMask;
  
 +  if constexpr (std::is_same_v<AqlPacket, hsa_kernel_dispatch_packet_t> ||
 +                std::is_same_v<AqlPacket, hsa_amd_ext_kernel_dispatch_packet_t>) {
@@ -366,8 +375,8 @@ index 7d3e394..0195d0c 100644
    const bool header_requested_barrier = (header & kBarrierBit) != 0;
    AqlSlotReservation reservation = ReserveAqlSlots(1);
    const uint64_t index = reservation.start_slot;
-@@ -2358,6 +2439,23 @@ bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
-   if (hasPendingDispatch_ || isFenceDirty() || !Barriers().IsExternalSignalListEmpty()) {
+@@ -2374,6 +2454,23 @@ bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
+   if (GetStateFlag(kHasPendingDispatch) || isFenceDirty() || !Barriers().IsExternalSignalListEmpty()) {
      // Dispatch barrier packet into the queue
      dispatchBarrierPacket(kBarrierPacketHeader);
 +
@@ -387,10 +396,10 @@ index 7d3e394..0195d0c 100644
 +    // once the flush has.
 +    if (!insertTcFence()) return false;
 +    dispatchBarrierPacket(kBarrierPacketHeader);
-     hasPendingDispatch_ = false;
+     ClearStateFlag(kHasPendingDispatch);
      skippedDispatches_ = 0;
-     retainExternalSignals_ = false;
-@@ -5325,6 +5423,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+     ClearStateFlag(kRetainExternalSignals);
+@@ -5386,6 +5483,18 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
      SetCoalesceWindow(0, nullptr);
    } else {
      profilingBegin(vcmd);
@@ -410,7 +419,7 @@ index 7d3e394..0195d0c 100644
      hsa_signal_t ipc_s{0};
      if (vcmd.ipcCompletionSignal() != nullptr) {
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.hpp b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
-index f0c2aa0..29b580d 100644
+index fc09498f5f..ac1d27852b 100644
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
 @@ -740,6 +740,14 @@ class VirtualGPU : public device::VirtualDevice {
@@ -429,7 +438,7 @@ index f0c2aa0..29b580d 100644
                                                                uint16_t rest, bool blocking,
                                                                bool attach_signal = false);
 diff --git a/projects/clr/rocclr/utils/flags.hpp b/projects/clr/rocclr/utils/flags.hpp
-index 5caf9d7..981f4c8 100644
+index f8cad26828..80791bcd8b 100644
 --- a/projects/clr/rocclr/utils/flags.hpp
 +++ b/projects/clr/rocclr/utils/flags.hpp
 @@ -171,6 +171,17 @@ release(uint, HIP_HOST_COHERENT, 0,                                           \

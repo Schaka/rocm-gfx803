@@ -1,10 +1,10 @@
 #!/bin/sh
 # Apply va-reuse-defer-noremap.patch (see that file for the full WHY/WHAT).
-# Drop the va-reuse-defer park branch's _fmm_map_to_gpu re-map: it leaves a
-# kernel GPUVM mapping behind that the fmm allocator then re-hands out, so
-# every code-object load on gfx803 fails with the kernel rejecting the VA
-# (EINVAL -> HSA_STATUS_ERROR_OUT_OF_RESOURCES -> vLLM SIGSEGV on ROCm 10.x).
-# Must run AFTER va-reuse-defer.sh.
+# Take the _fmm_map_to_gpu re-map out of the va-reuse-defer park branch: it
+# leaves a kernel GPUVM mapping behind that the fmm allocator then hands out
+# again, so every code-object load on gfx803 fails with the kernel rejecting
+# the VA (EINVAL -> HSA_STATUS_ERROR_OUT_OF_RESOURCES -> vLLM SIGSEGV).
+# Must run after va-reuse-defer-mapping.sh, whose re-map call this removes.
 set -eu
 
 SRC="${1:-/rocm-systems-src}"

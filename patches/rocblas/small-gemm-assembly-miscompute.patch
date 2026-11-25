@@ -39,8 +39,8 @@ findAllSolutions, and use it instead of whatever findBestSolution would
 have picked. Falls through to the normal findBestSolution path if no
 source solution applies.
 
-Applies to: rocBLAS @ rocm-libraries release/therock-10.1, commit
-39d8d60365d2272a5366f76ccb3bfba24b219eaf. NOT YET RE-VERIFIED ON REAL
+Applies to: rocBLAS @ rocm-libraries release/therock-10.2, commit
+8faffed0f978198ccf6fcfbd57e8db6afc83f35f. NOT YET RE-VERIFIED ON REAL
 HARDWARE against this commit. The 6.4.4 measurements (onnxruntime_test_all
 failure counts, the 1x1x1 isolation, the source-vs-assembly timing
 comparison) are the check to rerun on an image built from it. See
@@ -48,7 +48,7 @@ small-gemm-assembly-miscompute.sh for how this patch is applied and
 verified at build time.
 
 diff --git a/library/src/tensile_host.cpp b/library/src/tensile_host.cpp
-index 60168f2..7f64978 100644
+index a0bf6c8167..6351fbdcec 100644
 --- a/library/src/tensile_host.cpp
 +++ b/library/src/tensile_host.cpp
 @@ -52,6 +52,8 @@
@@ -60,7 +60,7 @@ index 60168f2..7f64978 100644
  #include <complex>
  #include <exception>
  #include <future>
-@@ -1375,7 +1377,107 @@ rocblas_status runContractionProblem(const RocblasContractionProblem<Ti, To, Tc>
+@@ -1414,7 +1416,107 @@ rocblas_status runContractionProblem(const RocblasContractionProblem<Ti, To, Tc>
              }
              else
              {

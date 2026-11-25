@@ -54,7 +54,7 @@ compare both halves of `pinned` with the expected values.
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -3427,7 +3427,13 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
+@@ -3456,7 +3456,13 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
          // GFX803: same as submitReadMemory -- a D2H copy into a
          // registered/locked host buffer must go through the staged
          // readBuffer, not the copy engine writing the host buffer directly.

@@ -1,124 +1,109 @@
-libhsakmt (fmm) deferred-free re-map (gfx803, ROCm 10.x): the va-reuse-defer
-patch's re-map of parked objects makes libhsakmt's GPUVM aperture
-allocator hand out virtual addresses that the kernel still has mapped,
-turning every code-object load into `HSA_STATUS_ERROR_OUT_OF_RESOURCES`.
+libhsakmt fmm.c, gfx803: take out the mapping that
+va-reuse-defer-mapping.patch restores for a parked object, and unmap a
+parked object before fmm_do_release() frees its BO. A parked object that is
+still GPU-mapped when it ages out leaves a kernel mapping behind at a VA
+that the fmm hands out again, and every code-object load placed there then
+fails with HSA_STATUS_ERROR_OUT_OF_RESOURCES.
 
 WHY
 ---
-vLLM 10.0 (torch 2.14) SIGSEGVs on its very first kernel launch on gfx803.
-Root-caused end to end on the 10.0 line: the torch add kernel is
-registered and found (the earlier "HIP functions_ map race" hypothesis
-was wrong); GetStatFunc -> program.load() -> setKernels ->
-executable_load_agent_code_object fails because the code BO's GPUVM map is
-rejected by the kernel with EINVAL (`amdgpu_vm_bo_map`: "va ... conflict
-with ...", verified in dmesg), which surfaces as
-HSA_STATUS_ERROR_OUT_OF_RESOURCES; GetFunc then returns
-hipErrorNoBinaryForGpu and ihipLaunchKernel's fallback
-reinterpret_cast's the host stub as a hipFunction_t, whose "map" is the
-stub's own code -> SIGSEGV in amd::Kernel::getDeviceKernel.
+amdgpu_amdkfd_gpuvm_free_memory_of_gpu refuses to free a BO that is still
+GPU-mapped and returns EBUSY. When fmm_do_release() frees a parked object
+that is still mapped, the BO and its kernel mapping survive, while
+fmm_do_release() still returns the area to the aperture free-list and drops
+the vm_object. The fmm then places a new allocation in that range, and the
+kernel rejects the new map as an overlap (dmesg: amdgpu_vm_bo_map
+"va ... conflict with ..."). The restored mapping of
+va-reuse-defer-mapping.patch makes every parked object such a case.
 
-The colliding kernel mapping belongs to a freed buffer parked on the
-va-reuse-defer FIFO. The defer park branch RE-MAPS the object
-(_fmm_map_to_gpu) so a lagging reader of a freed buffer keeps hitting a
-valid page; that re-established mapping stays in the kernel's GPUVM
-interval tree, and the fmm aperture allocator then hands the same VA range
-out again -> the kernel rejects the overlap. HSA-side changes only shift
-the failure (HSA swaps, AllocateUncached reverts, deferred-FIFO length)
-because the leak is the re-map itself. Removing the re-map eliminates the
-collision. The freed object still keeps its VA reserved in the aperture
-(the defer's whole point), so the only behavioral loss is the stale-reader
-tolerance -- which this 10.0 line no longer needs because the
-va-reuse-defer-mapping patch's re-map was the thing creating the stale
-kernel state in the first place.
+vLLM (torch 2.14) on gfx803 shows it as a SIGSEGV on its first kernel
+launch. executable_load_agent_code_object fails, because the kernel rejects
+the GPUVM map of the code BO with EINVAL, and that surfaces as
+HSA_STATUS_ERROR_OUT_OF_RESOURCES. GetFunc then returns
+hipErrorNoBinaryForGpu, and the launch fallback in ihipLaunchKernel
+reinterpret_casts the host stub as a hipFunction_t, which crashes in
+amd::Kernel::getDeviceKernel.
 
-Also unmap before free in fmm_do_release: the kernel's
-amdgpu_amdkfd_gpuvm_free_memory_of_gpu refuses to free a BO that is
-still GPU-mapped (returns EBUSY). With the re-map gone, a parked object
-still carries its original, still-live mapping from allocation time (the
-park branch never tears it down), so fmm_do_release must unmap it before
-freeing or every deferred free hits EBUSY: the kernel-level BO survives
-even though libhsakmt's own VA and vm_object bookkeeping releases it,
-orphaning the BO until process exit. This is a real, separate correctness
-bug: a plain hipMalloc/hipFree loop (no PyTorch, no framework) never
-returns memory to hipMemGetInfo/mem_info_vram_used, reported at
-https://github.com/Schaka/rocm-gfx803/issues/2#issuecomment-5569269314.
+The same EBUSY orphans each such BO until process exit. A plain
+hipMalloc/hipFree loop, with no framework, then never returns memory to
+hipMemGetInfo or mem_info_vram_used
+(https://github.com/Schaka/rocm-gfx803/issues/2#issuecomment-5569269314).
 
-The unmap uses the existing, correct `_fmm_unmap_from_gpu()` helper
-(same file), which builds the real kfd_ioctl_unmap_memory_from_gpu_args
-(handle plus object->mapped_device_id_array /
-object->mapped_device_id_array_size, populated at the object's original
-map) that AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU is macro-sized for, and checks
-the ioctl's return value per handle. A hand-rolled
-kfd_ioctl_free_memory_of_gpu_args (8 bytes: one handle) is the wrong
-struct for that ioctl (kfd_ioctl_unmap_memory_from_gpu_args is 24 bytes:
-handle, device_ids_array_ptr, n_devices, n_success -- confirmed against
-/usr/include/linux/kfd_ioctl.h) and gets rejected by the kernel's own
-handler (kfd_ioctl_unmap_memory_from_gpu in kfd_chardev.c: n_devices==0
--> -EINVAL, or garbage read past the 8-byte struct -> -EFAULT on
-copy_from_user), silently, unless the caller checks the return value.
+Without the restored mapping, a parked object keeps its VA reserved and the
+collision is gone. The cost is the tolerance that the restored mapping gives
+a late GPU access to a parked VA. The unmap in fmm_do_release() covers any
+parked object that is still mapped when it ages out, however it got there.
 
-A correctly freed BO still only shows up as reclaimed VRAM if
-`reserved_aperture_release()` (fmm.c) actually drops the CPU mapping on
-that VA range on its own release path -- upstream's stock behavior.
-A box with a full Resizable BAR maps every local-VRAM allocation as
-CPU-accessible, so hipMalloc's own aperture goes through that same
-function.
-
-Verified on real hardware: with this + d2h-null-dsthost, the full vLLM
-10.0 Qwen3.5-2B bench (qwen35_2b_bench_v3.py) completes with EXIT=0
-(prefill 311.0 tok/s, decode 30.2 tok/s, 2101-token prompt / 128 decode;
-7.14 record for the same bench: 331.7 / 24.4). Every deferred BO unmaps
-and frees successfully (AMDKFD_IOC_FREE_MEMORY_OF_GPU returns 0 for
-every handle, confirmed via strace and debug instrumentation).
-
-Applies AFTER va-reuse-defer.patch (it edits the park branch and the
-release path that patch introduced).
+Freed VRAM shows up as reclaimed only if reserved_aperture_release() drops
+the CPU mapping of that VA range on its own release path, as stock does. With
+a full Resizable BAR every local-VRAM allocation is CPU-accessible, so
+hipMalloc's aperture goes through that function too.
 
 WHAT
----
-Remove the _fmm_map_to_gpu re-map from __fmm_release's park branch, and
-unmap a parked object's still-live mapping through _fmm_unmap_from_gpu()
-before its BO free in fmm_do_release, so an aged-out parked object never
-leaves a stale kernel mapping behind and its free never hits EBUSY.
+----
+- Remove the _fmm_map_to_gpu() call and its comment from the park branch of
+  __fmm_release_locked().
+- In fmm_do_release(), unmap the object through _fmm_unmap_from_gpu()
+  before the BO free. That helper builds kfd_ioctl_unmap_memory_from_gpu_args
+  from the handle and object->mapped_device_id_array, checks the ioctl
+  result per handle, and issues no ioctl for an object that has no mapped
+  devices.
+
+Applies to: rocm-systems release/therock-10.2, commit
+43fa692e568e65a1fb84f2d1c74415b042839f10, after
+va-reuse-defer-mapping.patch, whose _fmm_map_to_gpu() call it removes.
+
+VERIFIED ON REAL HARDWARE (gfx803 box, 2026-09-02) on ROCm 10.0: with this
+patch and d2h-null-dsthost.patch, the vLLM Qwen3.5-2B bench
+(qwen35_2b_bench_v3.py) completes with EXIT=0, prefill 311.0 tok/s and
+decode 30.2 tok/s, on a 2101-token prompt and 128 decode tokens. Every
+deferred BO unmaps and frees: AMDKFD_IOC_FREE_MEMORY_OF_GPU returns 0 for
+every handle, checked with strace.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE on ROCm 10.2. To verify, in an image
+built from the commit above: qwen35_2b_bench_v3.py must complete with
+EXIT=0; a hipMalloc/hipFree loop must bring mem_info_vram_used back to its
+starting value; dmesg must show no amdgpu_vm_bo_map conflict; and the torch
+`x.double().cpu()` alloc/free churn loop from va-reuse-defer-mapping.patch
+must run without a GPU page fault.
 
 diff --git a/projects/rocr-runtime/libhsakmt/src/fmm.c b/projects/rocr-runtime/libhsakmt/src/fmm.c
+index a9a9e95992..0d4f029a83 100644
 --- a/projects/rocr-runtime/libhsakmt/src/fmm.c
 +++ b/projects/rocr-runtime/libhsakmt/src/fmm.c
-@@ -209,6 +209,10 @@ static const manageable_aperture_ops_t mmap_aperture_ops = {
- };
-
- static void fmm_defer_release(HsaKFDContext *ctx, manageable_aperture_t *aperture, vm_object_t *object);
-+static int _fmm_unmap_from_gpu(HsaKFDContext *ctx,
-+		manageable_aperture_t *aperture, void *address,
-+		uint32_t *device_ids_array, uint32_t device_ids_array_size,
-+		vm_object_t *obj);
- static HSAKMT_STATUS _fmm_map_to_gpu(HsaKFDContext *ctx,
- 			manageable_aperture_t *aperture,
- 			void *address, uint64_t size, vm_object_t *obj,
-@@ -1009,6 +1013,16 @@ static void fmm_do_release(HsaKFDContext *ctx, struct deferred_release *e)
+@@ -1214,6 +1214,16 @@ static void fmm_do_release(HsaKFDContext *ctx, struct deferred_release *e)
  	struct kfd_ioctl_free_memory_of_gpu_args args = {0};
  	uint32_t i;
-
-+	/* The defer window keeps the object mapped from allocation time (the
-+	 * park branch below no longer re-maps it, so this is its original,
-+	 * still-live mapping). free_memory_of_gpu refuses a mapped BO with
-+	 * EBUSY, so unmap first -- through the existing _fmm_unmap_from_gpu
-+	 * helper, which builds the real kfd_ioctl_unmap_memory_from_gpu_args
-+	 * (handle plus object->mapped_device_id_array) that
-+	 * AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU is macro-sized for.
+ 
++	/* free_memory_of_gpu refuses a BO that is still GPU-mapped with EBUSY,
++	 * which orphans the BO until process exit while this function still
++	 * returns its VA to the free-list. Unmap first, through
++	 * _fmm_unmap_from_gpu(), which builds the real
++	 * kfd_ioctl_unmap_memory_from_gpu_args (handle plus
++	 * object->mapped_device_id_array) and issues no ioctl for an object that
++	 * has no mapped devices.
 +	 */
 +	_fmm_unmap_from_gpu(ctx, e->aperture, e->object->start, NULL, 0, e->object);
 +
  	for (i = 0; i < e->object->handle_num; i++) {
  		args.handle = e->object->handles[i];
  		if (!args.handle)
-@@ -2433,9 +2447,6 @@ static int __fmm_release(HsaKFDContext *ctx,
- 		 * fault. fmm_do_release() tears the mapping down for real when
- 		 * the object ages out of the window.
- 		 */
+@@ -3321,18 +3331,6 @@ static int __fmm_release_locked(HsaKFDContext *ctx,
+ 	    !object->is_svm_paged &&
+ 	    aperture->ops != &mmap_aperture_ops) {
+ 		object->deferred = true;
+-		/* KfdDriver::FreeMemory (the hsa-runtime) calls
+-		 * hsaKmtUnmapMemoryToGPU before it calls hsaKmtFreeMemory, so
+-		 * by the time a free reaches the defer here its GPU mapping is
+-		 * already gone (mapping_count == 0, PTEs removed). Re-establish
+-		 * it, so that a lagging GPU access to the freed buffer hits the
+-		 * parked pages instead of faulting on a reserved but unmapped VA
+-		 * (stock tolerates such an access through near-instant VA+phys
+-		 * reuse).
+-		 */
 -		if (object->mapping_count == 0)
 -			_fmm_map_to_gpu(ctx, aperture, object->start,
 -					object->size, object, NULL, 0);
  		fmm_defer_release(ctx, aperture, object);
+ 		return 0;
  	}
-

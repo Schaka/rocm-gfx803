@@ -24,10 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install CppHeaderParser
 
+# projects/hrr holds the HRR wire-format header that CLR compiles into amdhip64,
+# included from projects/hrr/include as "hrr/hrr_api_args.h".
 RUN --mount=type=bind,source=scripts/clone-sparse.sh,target=/scripts/clone-sparse.sh \
     /scripts/clone-sparse.sh https://github.com/ROCm/rocm-systems.git /rocm-systems-src \
         "${ROCM_SYSTEMS_SHA:-${ROCM_SYSTEMS_REF}}" \
-        projects/rocr-runtime projects/clr projects/hip
+        projects/rocr-runtime projects/clr projects/hip projects/hrr
 
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocm10-rocr-clr \
     --mount=type=bind,source=scripts/lib,target=/scripts/lib \

@@ -18,7 +18,7 @@ if [[ -z "$SRC" || ! -d "$SRC" ]]; then
     exit 1
 fi
 
-# 2.14 defines C10_WARP_SIZE in torch/headeronly/macros/Macros.h (c10/macros/
+# 2.14 and later define C10_WARP_SIZE in torch/headeronly/macros/Macros.h (c10/macros/
 # Macros.h just includes it); older lines carry it directly in c10/macros/Macros.h.
 TARGET=""
 if [[ -f "$SRC/torch/headeronly/macros/Macros.h" ]] \

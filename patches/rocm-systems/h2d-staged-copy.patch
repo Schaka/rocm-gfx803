@@ -68,9 +68,9 @@ throughput cost yet.
 Applies AFTER d2h-null-dsthost.patch (the copyMemory hunk extends the
 branch that patch rewrites).
 
-NOT YET RE-VERIFIED ON REAL HARDWARE. This file is re-generated against
-the pinned 10.1 tree. An earlier version of the same change ran on an
-RX 580 2048SP with torch 2.14. Without it, the layer loop above hung or
+NOT YET RE-VERIFIED ON REAL HARDWARE. This file is generated against the
+pinned 10.2 tree. An earlier version of the same change ran on the ROCm
+10.1 stack, on an RX 580 2048SP with torch 2.14. Without it, the layer loop above hung or
 faulted on layer 13 (net.blocks.0.mlp.layer2.weight, [2048, 8192]). With
 it, all 515 layers ran clean, round trips of float32, float16, bfloat16,
 int32 and int8 up to 134 MB were correct, and 50 alloc/copy/free cycles of
@@ -97,7 +97,7 @@ diff --git a/projects/clr/rocclr/device/rocm/rocblit.cpp b/projects/clr/rocclr/d
 diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 --- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
 +++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
-@@ -3171,10 +3171,17 @@ void VirtualGPU::submitWriteMemory(amd::WriteMemoryCommand& cmd) {
+@@ -3191,10 +3191,17 @@ void VirtualGPU::submitWriteMemory(amd::WriteMemoryCommand& cmd) {
          size.c[0] *= elemSize;
        }
        if (hostMemory != nullptr) {
@@ -119,7 +119,7 @@ diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/roccl
        } else {
          result = blitMgr().writeBuffer(src, *devMem, origin, size, cmd.isEntireMemory(),
                                         cmd.copyMetadata());
-@@ -3435,6 +3442,17 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
+@@ -3464,6 +3471,17 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
          address dstHost = dstDevMem->getDeviceMemory() + realDstOrigin[0];
          result = blitMgr().readBuffer(*srcDevMem, dstHost, realSrcOrigin,
                                        realSize, entire, copyMetadata);

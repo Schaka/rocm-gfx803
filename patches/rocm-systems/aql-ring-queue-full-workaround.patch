@@ -1,26 +1,8 @@
-ROCR-Runtime (pinned commit 2b22ab0195cc1461cd9abf3b969e9dd7c10af350,
-therock-7.14 / ROCm 7.14.0): restore the GFXIP 7/8 double-mapped AQL ring
-buffer ("queue_full_workaround_"), deleted upstream along with the rest of
-gfx7/8 support.
-
-STATUS: VERIFIED ON REAL HARDWARE for what it actually fixes -- the
-64-packet `hsa_queue_create` floor. Measured on the gfx803 box 2026-08-28:
-max queue size 64 -> 131072 packets, and rocclr's live compute queue
-64 -> 16384. That is a real 2048x increase and removes the constraint
-`graph-replay-batch-chunk-deadlock.patch` exists to work around.
-
-This patch was written believing it was also the root cause of the silent
-dispatch hang (problem 1 in RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md). **That was tested
-and is false.** The hang reproduces unchanged with this patch applied, on
-attempt 2 of a repeat-until-hung loop, matching the historical baseline
-exactly -- and it reproduced with a 16384-packet ring, where the mechanism
-this patch addresses (ring exactly full) is unreachable for a sweep that
-hung after 3 of 120 tiny cases. The hang is not this. See
-RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md problem 1 for the falsification and the
-measurements.
-
-Kept and shipped anyway: the missing double map is a genuine bug, this is
-the correct fix for it, and it is what the kernel has always expected.
+ROCR-Runtime, GFXIP 7/8: restore the double-mapped AQL ring buffer
+("queue_full_workaround_") that upstream removed along with the rest of
+gfx7/8 support. Without it hsa_queue_create fails on gfx803 for every queue
+larger than 64 packets, and a producer that fills a ring exactly parks the
+CP for good.
 
 WHY
 ---
@@ -49,8 +31,8 @@ Doubling the *virtual* allocation over the same backing store gives the
 masked index one more bit than the ring holds, which is what makes the full
 case distinguishable from the empty one.
 
-The kernel still implements its entire half of this and still expects
-userspace to ask for it. amdgpu_amdkfd_gpuvm.c:
+The kernel implements its entire half of this and expects userspace to ask
+for it. amdgpu_amdkfd_gpuvm.c:
 
     /* Workaround for AQL queue wraparound bug. Map the same
      * memory twice. That means we only actually allocate half the memory. */
@@ -65,77 +47,64 @@ kfd_queue.c's queue-buffer validation carries the matching assumption:
     /* AQL queues on GFX7 and GFX8 appear twice their actual size */
     expected_queue_size = PAGE_ALIGN(properties->queue_size / 2);
 
-Only the ROCR half went away. In 7.14, MemoryRegion::AllocateDoubleMap
-still exists but is commented "Deprecated:" and is referenced by exactly one
-file -- core/driver/virtio/amd_kfd_virtio_driver.cpp. The KFD driver path
-(core/driver/kfd/amd_kfd_driver.cpp, KfdDriver::AllocateMemory) no longer
-translates it, so HsaMemFlags.AQLQueueMemory is never set on any real KFD
-allocation, and AqlQueue::AllocRegisteredRingBuffer allocates a plain
-single-mapped ring of exactly its packet capacity.
+ROCR does not ask. MemoryRegion::AllocateDoubleMap is commented
+"Deprecated:", and only core/driver/virtio/amd_kfd_virtio_driver.cpp reads
+it. KfdDriver::AllocateMemory does not translate it, so
+HsaMemFlags.ui32.AQLQueueMemory is never set on a KFD allocation, and
+AqlQueue::AllocRegisteredRingBuffer allocates a plain single-mapped ring of
+exactly its packet capacity.
 
-How this was found, and the evidence that it is the right answer
-----------------------------------------------------------------
-The 64-packet queue-size floor this repo has been working around for months
-is this bug announcing itself, not a separate quirk. `hsa_queue_create`
-fails on gfx803 for every requested size except 64 packets -- documented in
-graph-replay-batch-chunk-deadlock.patch and root-caused there only as far as
-"EINVAL from somewhere past set_queue_properties_from_user". It is the
-kernel check quoted above: reporting the real size N instead of the doubled
-2N makes PAGE_ALIGN(N/2) equal N only when N is exactly one page. Every
-larger queue fails the exact-match test in kfd_queue_buffer_get(). One
-missing flag explains both the cap and the hang.
+That one missing flag explains the 64-packet floor. For a ring of N bytes,
+kfd_queue_buffer_get() expects a mapping of PAGE_ALIGN(N/2), which equals a
+single-mapped N only when N is one page, 64 packets. Every larger queue
+fails that exact-match test, and hsa_queue_create returns an error. The
+two halves of the flag do not work apart: reporting 2N without the mirror
+lets hsa_queue_create succeed at full size and then faults the GPU under
+load ("Memory access fault ... Page not present", "HW Exception ... reason:
+GPU Hang"), because the CP addresses a 2N span whose upper half is not
+mapped, and forcing the HQD back to N (REFERENCE-amdkfd-gfx7-8-queue-size-
+writeback) removes the fault together with the workaround.
 
-It also explains, exactly, the two halves of the experiment recorded in
-graph-replay-queue-size-cap.patch: reporting 2N *without* allocating the
-mirror let hsa_queue_create succeed at full size and then faulted the GPU
-under load ("Memory access fault... Page not present", "HW Exception ...
-reason: GPU Hang") -- the CP was told to address a 2N span whose upper half
-was never mapped. That patch's kernel companion "fixed" the fault by
-forcing the HQD back to N, which also removed the workaround and returned
-the box to the hang. Both results are what this bug predicts; neither is
-what a size-reporting bug alone would produce.
+The full-ring park is not a store-ordering bug. On gfx803 the ring's CPU
+mapping is write-back: amdgpu sets no AMDGPU_GEM_CREATE_CPU_GTT_USWC on the
+KFD path (amdgpu_amdkfd_gpuvm.c: `alloc_flags = 0` for GTT), and gmc_v8 does
+not read AMDGPU_GEM_CREATE_UNCACHED. x86 store order already puts the
+packet stores ahead of the doorbell store, so the store fences before the
+doorbell writes in StoreRelaxed and SdmaQueue::RingDoorbell add no ordering
+on this card.
 
-And it matches the one hard hardware observation on record. The MQD dump
-taken during a live graph-replay hang (/sys/kernel/debug/kfd/mqds,
-cross-checked against /proc/<pid>/mem) showed cp_hqd_pq_wptr advancing
-correctly while cp_hqd_pq_rptr sat frozen on a slot whose AQL header still
-read HSA_PACKET_TYPE_INVALID -- a CP that believes it has nothing to fetch,
-parked, with a ring software considers full.
+WHAT
+----
+- memory_region.h: drop the "Deprecated:" comment on AllocateDoubleMap.
+- amd_kfd_driver.cpp: KfdDriver::AllocateMemory translates
+  AllocateDoubleMap to HsaMemFlags.ui32.AQLQueueMemory, as ROCm 6.4.4's
+  KfdDriver::AllocateMemory did.
+- amd_aql_queue.h: add queue_full_workaround_.
+- amd_aql_queue.cpp: set it for GFXIP 7/8; request AllocateDoubleMap for the
+  system-memory ring next to the AllocateNonPaged it already requests;
+  publish the doubled VA span in ring_buf_alloc_bytes_ so CreateQueue and
+  UpdateQueue describe the real span to the CP; raise the minimum ring to
+  one page and halve the maximum (the alias is not usable capacity); mask
+  the legacy type-0 doorbell against the doubled size; and reject the
+  device-memory ring path on GFXIP 7/8, which cannot be double-mapped.
 
-What this displaces
--------------------
-Two earlier explanations in this repo are wrong and are corrected by their
-own patch headers now:
+The ring is NonPaged, because kfd_queue_buffer_get() resolves it through
+amdgpu_vm_bo_lookup_mapping() and needs a BO. libhsakmt's
+fmm_allocate_host_gpu() therefore allocates it as a GTT BO through
+__fmm_allocate_device(). With AQLQueueMemory set it reserves twice the VA,
+fmm_translate_hsa_to_ioc_flags() adds KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM,
+and the kernel halves the BO and maps it at `va` and `va + bo_size`. The CPU
+mapping covers the first half, which is the whole real ring.
 
-- "Lost EOP interrupt" (blit-kernel-eop-interrupt-retry.patch) cannot be the
-  mechanism. BlitKernel::SubmitLinearCopyCommand waits with
-  HSA_WAIT_STATE_ACTIVE, and both BusyWaitSignal::WaitRelaxed and
-  InterruptSignal::WaitRelaxed treat ACTIVE as a pure spin on signal_.value
-  -- hsaKmtWaitOnEvent_Ext is only reached on the passive path. The hung
-  process pinned at 99% CPU confirms it never blocked on an event. No
-  interrupt is involved; the signal value was never written because the
-  packet was never fetched.
+CLR requests a device-memory ring only on gfx94x and gfx125x
+(Settings::setKernelArgImpl in rocsettings.cpp), so the GFXIP 7/8 rejection
+of that path does not trigger for HIP on gfx803.
 
-- "Missing _mm_sfence() / write-combining" (sdma-doorbell-missing-sfence.
-  patch, and this repo's 2026-08-24 addition to
-  hsa-agent-rejects-legacy-doorbell.patch) rests on a false premise. The AQL
-  ring is GTT/userptr and amdgpu never sets AMDGPU_GEM_CREATE_CPU_GTT_USWC
-  on the KFD path (amdgpu_amdkfd_gpuvm.c: `alloc_flags = 0` for GTT), so
-  ttm caching stays ttm_cached: the CPU mapping is write-back, not
-  write-combining, and the PTEs carry AMDGPU_PTE_SNOOPED.
-  KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED becomes AMDGPU_GEM_CREATE_UNCACHED,
-  which gmc_v8 does not read at all (only gmc_v9/10/11/12 do, for PTE
-  MTYPE). On write-back memory x86 TSO already orders the packet stores
-  ahead of the doorbell store; those SFENCEs are inert, not fixes.
-
-Validation, and one trap worth knowing: this must be built against a kernel
-WITHOUT REFERENCE-amdkfd-gfx7-8-queue-size-writeback (that patch forces the
-HQD back to the single ring size and cancels the double map), and must never
-be combined with graph-replay-queue-size-cap.patch. The latter was hit for
-real during validation -- a dev tree still carrying that patch doubled the
-reported size twice, and KFD rejected every queue with `expected size 0x2000
-not equal to mapping addr ... size 0x1000` in dmesg. That dmesg line means
-something is doubling twice.
+Build it against a kernel WITHOUT REFERENCE-amdkfd-gfx7-8-queue-size-writeback,
+which forces the HQD back to the single ring size and cancels the double
+map, and never combine it with graph-replay-queue-size-cap.patch. A tree
+that doubles the reported size twice makes KFD reject every queue with
+`expected size 0x2000 not equal to mapping addr ... size 0x1000` in dmesg.
 
 Depends on: hsa-agent-rejects-legacy-doorbell.patch (applies on top of it;
 queue_full_workaround_ multiplies the legacy type-0 doorbell mask that patch
@@ -145,25 +114,29 @@ Supersedes: graph-replay-queue-size-cap.patch and its out-of-tree kernel
 companion REFERENCE-amdkfd-gfx7-8-queue-size-writeback.patch. Neither may be
 applied alongside this one -- see their headers.
 
-WHAT
-----
-- memory_region.h: AllocateDoubleMap is live again, not "Deprecated:".
-- amd_kfd_driver.cpp: translate AllocateDoubleMap to
-  HsaMemFlags.ui32.AQLQueueMemory, as ROCm 6.4.4's KfdDriver::AllocateMemory
-  did.
-- amd_aql_queue.h: add queue_full_workaround_.
-- amd_aql_queue.cpp: set it for GFXIP 7/8; request AllocateDoubleMap for the
-  ring; publish the doubled VA span in ring_buf_alloc_bytes_ so CreateQueue/
-  UpdateQueue describe the real span to the CP; raise the minimum ring to one
-  page and halve the maximum (the alias is not usable capacity); mask the
-  legacy type-0 doorbell against the doubled size; and reject the
-  device-memory ring path on GFXIP 7/8, which cannot be double-mapped.
+Applies to: rocm-systems release/therock-10.2, commit
+43fa692e568e65a1fb84f2d1c74415b042839f10.
+
+VERIFIED ON REAL HARDWARE (gfx803 box, 2026-08-28) on ROCm 7.14, where the
+ring was a userptr BO: the maximum queue size goes from 64 to 131072
+packets, and rocclr's live compute queue from 64 to 16384. This patch does
+not fix the silent dispatch hang: that hang reproduces with this patch and a
+16384-packet ring, and it comes from VRAM clocked above its rating (see
+"Required host setup" in README.md).
+
+NOT YET RE-VERIFIED ON REAL HARDWARE on ROCm 10.2, where the ring is a GTT
+BO. To verify, on a kernel without REFERENCE-amdkfd-gfx7-8-queue-size-writeback
+and in an image built from the commit above: hsa_queue_create must succeed
+for every power of two from 64 packets up to the agent's
+HSA_AGENT_INFO_QUEUE_MAX_SIZE (131072 on this card); dmesg must show no
+`expected size ... not equal to mapping` line and no VM fault; and a
+producer that fills a 64-packet queue exactly must keep draining.
 
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp
-index f9558506ff..a9948f5bc1 100644
+index 5c80e8cc70..e941d197b3 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp
-@@ -233,6 +233,8 @@ KfdDriver::AllocateMemory(const core::MemoryRegion &mem_region,
+@@ -284,6 +284,8 @@ hsa_status_t KfdDriver::AllocateMemory(const core::MemoryRegion& mem_region,
  
    kmt_alloc_flags.ui32.ExecuteAccess =
        (alloc_flags & core::MemoryRegion::AllocateExecutable ? 1 : 0);
@@ -173,10 +146,10 @@ index f9558506ff..a9948f5bc1 100644
    if (m_region.IsSystem() &&
        (alloc_flags & core::MemoryRegion::AllocateNonPaged)) {
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-index 7685bcc5c3..ee6e022140 100644
+index 60687176d2..5dfcd04968 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-@@ -334,6 +334,10 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
+@@ -337,6 +337,10 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
    // Cached value of HsaNodeProperties.HSA_CAPABILITY.DoorbellType
    int doorbell_type_;
  
@@ -188,10 +161,10 @@ index 7685bcc5c3..ee6e022140 100644
    GpuAgent* agent_;
  
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/memory_region.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/memory_region.h
-index 41ddb9a202..94e326032f 100644
+index 7b595f4c9d..d8714d82d3 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/memory_region.h
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/memory_region.h
-@@ -92,7 +92,7 @@ class MemoryRegion : public Checked<0x9C961F19EE175BB3> {
+@@ -93,7 +93,7 @@ class MemoryRegion : public Checked<0x9C961F19EE175BB3> {
      AllocateNoFlags = 0,
      AllocateRestrict = (1 << 0),    // Don't map system memory to GPU agents
      AllocateExecutable = (1 << 1),  // Set executable permission
@@ -201,10 +174,10 @@ index 41ddb9a202..94e326032f 100644
      AllocateIPC = (1 << 4),         // System memory that can be IPC-shared
      AllocateNonPaged = (1 << 4),    // Non-paged system memory (AllocateIPC alias)
 diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-index dafa9092b0..22b8d92444 100644
+index 39cd53d13b..fe553056b5 100644
 --- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 +++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-@@ -155,6 +155,16 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
+@@ -105,6 +105,16 @@ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_
    // Identify doorbell semantics for this agent.
    doorbell_type_ = agent->properties().Capability.ui32.DoorbellType;
  
@@ -221,7 +194,7 @@ index dafa9092b0..22b8d92444 100644
    // Queue size is a function of several restrictions.
    const uint32_t min_pkts = ComputeRingBufferMinPkts();
    const uint32_t max_pkts = ComputeRingBufferMaxPkts();
-@@ -582,7 +592,8 @@ void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+@@ -532,7 +542,8 @@ void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
                    legacy_dispatch_id, std::memory_order_release);
  
      if (doorbell_type_ == 0) {
@@ -231,7 +204,7 @@ index dafa9092b0..22b8d92444 100644
  
        atomic::Store(signal_.legacy_hardware_doorbell_ptr,
                      uint32_t((legacy_dispatch_id & queue_size_mask) *
-@@ -686,6 +697,10 @@ uint32_t AqlQueue::ComputeRingBufferMinPkts() {
+@@ -641,6 +652,10 @@ uint32_t AqlQueue::ComputeRingBufferMinPkts() {
    //   Min Size is 7 (2^8 = 256 DWs) and max size is 29 (2^30 = 1 G-DW)
    uint32_t min_bytes = 0x400;
  
@@ -242,7 +215,7 @@ index dafa9092b0..22b8d92444 100644
    return uint32_t(min_bytes / sizeof(core::AqlPacket));
  }
  
-@@ -695,6 +710,9 @@ uint32_t AqlQueue::ComputeRingBufferMaxPkts() {
+@@ -650,6 +665,9 @@ uint32_t AqlQueue::ComputeRingBufferMaxPkts() {
    //   Min Size is 7 (2^8 = 256 DWs) and max size is 29 (2^30 = 1 G-DW)
    uint64_t max_bytes = 0x100000000;
  
@@ -252,7 +225,7 @@ index dafa9092b0..22b8d92444 100644
    return uint32_t(max_bytes / sizeof(core::AqlPacket));
  }
  
-@@ -713,6 +731,14 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
+@@ -668,6 +686,14 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
    }
  
    if (IsDeviceMemRingBuf()) {
@@ -267,17 +240,17 @@ index dafa9092b0..22b8d92444 100644
      if (!agent_->LargeBarEnabled()) {
        throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_QUEUE_CREATION,
                                  "Trying to allocate an AQL ring buffer in device memory without "
-@@ -726,7 +752,8 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
-   } else {
+@@ -690,7 +716,8 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
+     // NonPaged: kfd_queue_buffer_get() needs a BO mapping, it has no SVM fallback.
      ring_buf_ = agent_->system_allocator()(
          ring_buf_alloc_bytes_ + ring_buf_metadata_alloc_bytes_, 0x1000,
--        core::MemoryRegion::AllocateExecutable);
-+        core::MemoryRegion::AllocateExecutable |
+-        core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateNonPaged);
++        core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateNonPaged |
 +            (queue_full_workaround_ ? core::MemoryRegion::AllocateDoubleMap : 0));
    }
  
    assert(ring_buf_ != NULL && "AQL queue memory allocation failure");
-@@ -746,6 +773,13 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
+@@ -710,6 +737,13 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
        ((((core::AqlMetadataPrefetchPacket*)ring_buf_metadata_)[pkt_id]).packet.header3).type = HSA_PACKET_TYPE_INVALID;
      }
    }
