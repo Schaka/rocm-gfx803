@@ -53,6 +53,12 @@ RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
 RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
     bash /patches/pytorch/apply-gfx803-int8-gemm-rocblas.sh /pytorch
 
+# RX 580 tests show that both TensorTopK selection kernels fault for a small
+# float32 input. TensorTopK already carries an independent GPU-sort path;
+# restrict gfx803 to it for non-Boolean data.
+RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
+    bash /patches/pytorch/apply-gfx803-topk-sort-fallback.sh /pytorch
+
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py
