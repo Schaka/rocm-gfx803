@@ -1,0 +1,139 @@
+CLR (rocclr) H2D copy routing (gfx803): never read a pinned or
+registered/locked host source directly from the copy engine, and never pin
+a pageable host source. Force the GPU-staging path (CPU memcpy into a GPU
+staging buffer, then a copy from that buffer) for every H2D copy. This is
+the Host-to-Device mirror of d2h-staged-copy.patch.
+
+WHY
+---
+For an H2D copy above GPU_PINNED_MIN_XFER_SIZE from pageable memory,
+DmaBlitManager::writeBuffer pins the source. That creates a userptr buffer
+object (BO). When the process later frees or unmaps that memory, the KFD
+MMU notifier evicts every user queue of the process and restores them
+afterwards. On gfx803 this shows up in two ways:
+
+- The process hangs on its next GPU command with no amdgpu or kfd error in
+  dmesg. /sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms, sampled every
+  2 ms, shows dozens of evict/restore cycles during model.cuda(). A hung run
+  has one more eviction while the queue is idle, and the next packet then
+  never completes. Ringing the doorbell again from gdb does not help, so the
+  queue itself is lost. Kernel 7.0.0 hangs 10 of 12 short torch runs. The
+  root cause is not identified. The evidence points at the kernel's
+  evict/restore of an idle gfx8 queue or at the gfx8 CP firmware, and this
+  repo builds neither. Later kernels have not shown the hang.
+- A torch weight-processing loop that moves large layers to the GPU one at
+  a time (33.5 MB and up) and runs `.abs().max()` on each faults with
+  "Memory access fault ... Page not present" (read from TC0).
+
+Setting GPU_PINNED_MIN_XFER_SIZE=4096 (staging for every copy) keeps
+evicted_ms at 0, and the hang rate drops from 10/12 to 0/12. See
+https://github.com/Schaka/rocm-gfx803/issues/9 for the measurements.
+
+A pinned or registered source (hipHostMalloc, hipHostRegister) is not
+pinned by CLR, so it does not create a userptr BO here. It goes through
+the staging path as well, so that H2D takes the same route as D2H and no
+engine access to host memory can be outstanding when the host buffer goes
+away. d2h-staged-copy.patch measured that fault for engine writes to host
+memory. Nobody has measured it for engine reads.
+
+WHAT
+---
+- DmaBlitManager::writeBuffer: pass enablePin=false, so a pageable source
+  is copied into a GPU staging buffer by the CPU and never pinned.
+  KernelBlitManager::writeBuffer already passes kEnablePin=false for its
+  shader-copy path and calls DmaBlitManager::writeBuffer for its SDMA path,
+  so it needs no change.
+- submitWriteMemory (WriteMemoryCommand): when the source resolves to a
+  registered/locked host buffer (hostMemory != nullptr), route through the
+  staged writeBuffer instead of the accelerated copyBuffer. The staged path
+  reads the source on the CPU when the copy is submitted, and for an H2D
+  copy it does not wait for earlier queue work. A releaseGpuMemoryFence()
+  wait first keeps queue order: an earlier GPU write to the pinned buffer
+  has landed before the CPU reads it, as it had with copyBuffer.
+- copyMemory (CopyMemoryCommand): when the source is
+  host-memory-direct-access, route through the staged writeBuffer instead
+  of copyBuffer. writeBuffer applies its origin to the destination only, so
+  the source address is the source VA plus `realSrcOrigin[0]`. Without that
+  offset, a copy from the middle of a pinned buffer uploads from its start.
+  The same queue-order wait comes first.
+
+COST
+---
+Each H2D copy gets an extra CPU memcpy, done by the submitting thread. A
+copy from a pinned source also waits on the CPU for earlier work in its
+queue, so a `non_blocking=True` upload from pinned memory no longer
+overlaps with the kernels queued before it. Nobody has measured the
+throughput cost yet.
+
+Applies AFTER d2h-null-dsthost.patch (the copyMemory hunk extends the
+branch that patch rewrites).
+
+NOT YET RE-VERIFIED ON REAL HARDWARE. This file is re-generated against
+the pinned 10.1 tree. An earlier version of the same change ran on an
+RX 580 2048SP with torch 2.14. Without it, the layer loop above hung or
+faulted on layer 13 (net.blocks.0.mlp.layer2.weight, [2048, 8192]). With
+it, all 515 layers ran clean, round trips of float32, float16, bfloat16,
+int32 and int8 up to 134 MB were correct, and 50 alloc/copy/free cycles of
+33.5 MB unpinned tensors passed.
+diff --git a/projects/clr/rocclr/device/rocm/rocblit.cpp b/projects/clr/rocclr/device/rocm/rocblit.cpp
+--- a/projects/clr/rocclr/device/rocm/rocblit.cpp
++++ b/projects/clr/rocclr/device/rocm/rocblit.cpp
+@@ -141,7 +141,14 @@ bool DmaBlitManager::writeBuffer(const void* srcHost, device::Memory& dstMemory,
+     address dstAddr = gpuMem(dstMemory).getDeviceMemory() + origin[0];
+     const_address srcAddr = reinterpret_cast<const_address>(srcHost);
+     constexpr bool kHostToDev = true;
+-    constexpr bool enablePin = true;
++    // GFX803: never pin the host source for an H2D copy -- pinning a pageable
++    // source creates a userptr BO, and its teardown fires the KFD MMU
++    // notifier, which evicts every user queue of the process. On gfx803 an
++    // idle queue can fail to come back from that eviction (the next packet
++    // never completes), and an in-flight copy can fault on the unmapped
++    // source (page not present, read from TC). Force the GPU-staging path:
++    // the CPU memcpy below fills a staging buffer that the copy reads.
++    constexpr bool enablePin = false;
+     if (!hsaCopyStagedOrPinned(srcAddr, dstAddr, copySize, kHostToDev, copyMetadata, enablePin)) {
+       LogError("DmaBlitManager:: writeBuffer copy failure!");
+       return false;
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -3171,10 +3171,17 @@ void VirtualGPU::submitWriteMemory(amd::WriteMemoryCommand& cmd) {
+         size.c[0] *= elemSize;
+       }
+       if (hostMemory != nullptr) {
+-        // Accelerated transfer without pinning
+-        amd::Coord3D srcOrigin(offset);
+-        result = blitMgr().copyBuffer(*hostMemory, *devMem, srcOrigin, origin, size,
+-                                      cmd.isEntireMemory(), cmd.copyMetadata());
++        // GFX803: do NOT read the (registered/locked) host buffer directly
++        // from the copy engine. Route through the staged writeBuffer, the
++        // mirror of submitReadMemory: the CPU memcpy reads the host buffer
++        // and the copy reads only a GPU staging buffer, so no engine access
++        // is ever outstanding against the host buffer's lifetime. The staged
++        // path reads the source on the CPU at submit time, so wait for earlier
++        // work in this queue first: copyBuffer read the source in queue order,
++        // after any earlier GPU write to this buffer had landed.
++        releaseGpuMemoryFence();
++        result = blitMgr().writeBuffer(src, *devMem, origin, size,
++                                       cmd.isEntireMemory(), cmd.copyMetadata());
+       } else {
+         result = blitMgr().writeBuffer(src, *devMem, origin, size, cmd.isEntireMemory(),
+                                        cmd.copyMetadata());
+@@ -3435,6 +3442,17 @@ bool VirtualGPU::copyMemory(cl_command_type type, amd::Memory& srcMem, amd::Memo
+         address dstHost = dstDevMem->getDeviceMemory() + realDstOrigin[0];
+         result = blitMgr().readBuffer(*srcDevMem, dstHost, realSrcOrigin,
+                                       realSize, entire, copyMetadata);
++      } else if (srcDevMem->isHostMemDirectAccess()) {
++        // GFX803: same as submitWriteMemory -- an H2D copy from a
++        // registered/locked host buffer must go through the staged
++        // writeBuffer, not the copy engine reading the host buffer directly.
++        // writeBuffer applies its origin to the destination only, so the
++        // source origin is added here. Wait for earlier queue work first, for
++        // the queue-order reason given in submitWriteMemory.
++        releaseGpuMemoryFence();
++        const_address srcHost = srcDevMem->getDeviceMemory() + realSrcOrigin[0];
++        result = blitMgr().writeBuffer(srcHost, *dstDevMem, realDstOrigin,
++                                       realSize, entire, copyMetadata);
+       } else {
+         result = blitMgr().copyBuffer(*srcDevMem, *dstDevMem, realSrcOrigin, realDstOrigin,
+                                       realSize, entire, copyMetadata);
